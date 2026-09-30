@@ -97,6 +97,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     # Optional flags for target_verify support (default False for decode)
     DISABLE_STATE_UPDATE: tl.constexpr = False,
     CACHE_INTERMEDIATE_STATES: tl.constexpr = False,
+    QUANTIZE_STATE_EACH_STEP: tl.constexpr = False,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr = False,
     # ReplaySSM fused ring-write. Pointers stay None and CACHE_RING False for
     # decode / flag-off -> byte-identical. The gate ring layout follows IS_KDA
@@ -362,6 +363,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
                     + o_k[:, None]
                 )
                 tl.store(cache_ptr, b_h.to(cache_ptr.dtype.element_ty), mask=mask_h)
+                if QUANTIZE_STATE_EACH_STEP:
+                    b_h = tl.load(cache_ptr, mask=mask_h, other=0).to(tl.float32)
 
         step_idx += 1
 

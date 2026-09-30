@@ -2020,6 +2020,27 @@ class OpenAIServingChat(OpenAIServingBase):
                         ).model_dump()
                     n_prev_tokens[index] = total_output_logprobs
 
+                if request.return_timing_metrics:
+                    meta = content["meta_info"]
+                    if "server_ttft" in meta or "stream_decode_throughput" in meta:
+                        keys = (
+                            "prompt_tokens",
+                            "cached_tokens",
+                            "completion_tokens",
+                            "server_ttft",
+                            "stream_decode_throughput",
+                        )
+                        timing_chunk = ChatCompletionStreamResponse(
+                            id=meta["id"],
+                            created=int(time.time()),
+                            choices=[],
+                            model=request.model,
+                            sglext=SglExt(
+                                timing_metrics={k: meta[k] for k in keys if k in meta}
+                            ),
+                        )
+                        yield f"data: {timing_chunk.model_dump_json()}\n\n"
+
                 # Track finish_reason for each index
                 if finish_reason_type:
                     # Abort with an explicit error status_code is a system error

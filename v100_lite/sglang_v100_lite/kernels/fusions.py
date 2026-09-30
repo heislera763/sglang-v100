@@ -1,0 +1,21 @@
+"""Native SM70 split-attention merge."""
+
+import torch
+from .utils import cache_once, load_jit
+
+
+@cache_once
+def _combine_module():
+    return load_jit(
+        "sm70_qsa_combine",
+        cuda_files=["elementwise/sm70_qsa_combine.cuh"],
+        cuda_wrappers=[("combine", "sglang::sm70_qsa_combine::combine")],
+    )
+
+
+def combine(partial, lse, lengths, selected_tokens, tokens_per_split=32):
+    output = torch.empty(
+        (partial.shape[0], 6, 256), dtype=partial.dtype, device=partial.device
+    )
+    _combine_module().combine(partial, lse, lengths, output, selected_tokens, tokens_per_split)
+    return output
