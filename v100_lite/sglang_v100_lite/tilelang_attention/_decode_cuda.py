@@ -206,7 +206,7 @@ def sm70_cuda_qsa_decode(
         and torch.cuda.get_device_capability(q.device) == (7, 0)
         and os.environ.get("SGLANG_SM70_QSA_COMBINE", "1") == "1"
     ):
-        from sglang_v100_lite.kernels.sm70_qsa_combine import combine
+        from sglang_v100_lite.kernels.fusions import combine
 
         return combine(
             partial_o,

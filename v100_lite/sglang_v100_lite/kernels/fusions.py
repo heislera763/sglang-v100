@@ -1,10 +1,10 @@
-"""Measured small-batch FP16 fusions for Qwen3.8 on Volta."""
+"""Opt-in SM70 fusions support."""
 
 import os
 
 import torch
 
-from sglang_v100_lite.kernels.sm70_dense_gemv import supported as gemv_supported
+from sglang_v100_lite.kernels.gemm import supported as gemv_supported
 from sglang_v100_lite.kernels.utils import cache_once, load_jit
 
 
@@ -145,3 +145,24 @@ def qkvzba(x, weight, tail):
     a = torch.empty_like(b)
     _gdn_module(rows).run(x, weight, tail, qkv, z, b, a)
     return qkv, z.view(rows, 12, 128), b, a
+
+import torch
+
+from sglang_v100_lite.kernels.utils import cache_once, load_jit
+
+
+@cache_once
+def _combine_module():
+    return load_jit(
+        "sm70_qsa_combine",
+        cuda_files=["elementwise/sm70_qsa_combine.cuh"],
+        cuda_wrappers=[("combine", "sglang::sm70_qsa_combine::combine")],
+    )
+
+
+def combine(partial, lse, lengths, selected_tokens, tokens_per_split=32):
+    output = torch.empty(
+        (partial.shape[0], 6, 256), dtype=partial.dtype, device=partial.device
+    )
+    _combine_module().combine(partial, lse, lengths, output, selected_tokens, tokens_per_split)
+    return output

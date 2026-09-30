@@ -6,6 +6,6 @@ import os
 def register():
     if os.environ.get("SGLANG_V100_LITE") != "1":
         return
-    from .bootstrap import install
+    from .runtime import install
 
     install()

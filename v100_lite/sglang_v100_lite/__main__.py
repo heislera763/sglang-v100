@@ -11,9 +11,9 @@ from sglang.srt.utils import kill_process_tree
 if os.environ.get("SGLANG_V100_LITE") != "1":
     raise RuntimeError("Use SGLANG_V100_LITE=1 to select the compatibility runtime")
 load_plugins()
-from . import bootstrap
+from . import runtime
 
-required = getattr(bootstrap, "REQUIRED_HOOKS", None)
+required = getattr(runtime, "REQUIRED_HOOKS", None)
 if not required or required - HookRegistry._patched:
     raise RuntimeError(
         f"V100 compatibility installation incomplete: {required - HookRegistry._patched if required else 'registration failed'}"

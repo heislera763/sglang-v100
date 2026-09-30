@@ -1,4 +1,4 @@
-"""Native FP16 projections for the measured Qwen3.8 TP4 shapes."""
+"""Opt-in SM70 gemm support."""
 
 import os
 
@@ -23,7 +23,7 @@ _DENSE_CONFIGS = {
 
 
 def supported(x: torch.Tensor, weight: torch.Tensor, bias=None) -> bool:
-    from sglang_v100_lite.kernels.sm70_small_gemm import shape_supported
+    from sglang_v100_lite.kernels.gemm import shape_supported
 
     return (
         os.environ.get("SGLANG_SM70_DENSE_GEMV", "0") == "1"
@@ -70,10 +70,70 @@ def _dense_module(threads: int, lanes: int, vector: int):
 
 def linear_dense(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     if x.shape[0] != 1:
-        from sglang_v100_lite.kernels.sm70_small_gemm import linear_small as small_linear
+        from sglang_v100_lite.kernels.gemm import linear_small as small_linear
 
         return small_linear(x, weight)
     config = _DENSE_CONFIGS.get(tuple(weight.shape), (64, 32, 8))
     out = torch.empty((1, weight.shape[0]), dtype=x.dtype, device=x.device)
     _dense_module(*config).gemv(x, weight, out)
+    return out
+
+import os
+
+import torch
+
+from sglang_v100_lite.kernels.utils import cache_once, load_jit
+
+# (rows, output features, input features) -> (threads, lanes per output).
+# Shapes where cuBLAS is faster deliberately stay on the existing path.
+_SMALL_CONFIGS = {
+    (2, 24, 2560): (64, 32),
+    (2, 640, 2560): (256, 32),
+    (2, 1, 2560): (64, 32),
+    (2, 2560, 2560): (128, 32),
+    (4, 24, 2560): (64, 32),
+    (4, 640, 2560): (128, 32),
+    (4, 2560, 2560): (64, 32),
+    (2, 4096, 2560): (256, 32),
+    (4, 4096, 2560): (64, 32),
+    (2, 3584, 2560): (64, 32),
+    (4, 3584, 2560): (64, 32),
+    (2, 2560, 1536): (64, 32),
+    (4, 2560, 1536): (128, 16),
+    (2, 320, 2560): (256, 32),
+    (4, 320, 2560): (256, 32),
+    (2, 2560, 160): (128, 8),
+    (4, 2560, 160): (128, 8),
+    (2, 512, 2560): (256, 32),
+    (4, 512, 2560): (256, 32),
+    (2, 62080, 2560): (128, 32),
+    (4, 62080, 2560): (128, 32),
+}
+
+
+def shape_supported(x, weight):
+    return (
+        os.environ.get("SGLANG_SM70_MTP_SMALL_GEMM", "1") == "1"
+        and (x.shape[0], *weight.shape) in _SMALL_CONFIGS
+    )
+
+
+@cache_once
+def _small_module(rows, threads, lanes):
+    return load_jit(
+        "sm70_small_gemm",
+        rows,
+        threads,
+        lanes,
+        cuda_files=["elementwise/sm70_small_gemm.cuh"],
+        cuda_wrappers=[
+            ("run", f"sglang::sm70_small_gemm::run<{rows},{threads},{lanes}>")
+        ],
+    )
+
+
+def linear_small(x, weight):
+    threads, lanes = _SMALL_CONFIGS[(x.shape[0], *weight.shape)]
+    out = torch.empty((x.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device)
+    _small_module(x.shape[0], threads, lanes).run(x, weight, out)
     return out

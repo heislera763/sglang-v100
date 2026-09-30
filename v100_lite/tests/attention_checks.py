@@ -9,7 +9,7 @@ from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
 )
 
 from sglang.srt.plugins.hook_registry import HookRegistry, HookType
-from sglang_v100_lite.linear_attention import round_verify_state
+from sglang_v100_lite.runtime import round_verify_state
 
 HookRegistry.register(
     "sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent.fused_sigmoid_gating_delta_rule_update_kernel.run",
