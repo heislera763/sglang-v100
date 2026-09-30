@@ -1,179 +1,68 @@
-"""Opt-in SM70 runtime support."""
+"""Opt-in SM70 integration using mainline plugin hooks."""
 
 import os
-from functools import wraps
+import torch
+import msgspec
+from sgl_kernel.sampling import (
+    _top_k_renorm_probs_internal,
+    _top_p_renorm_probs_internal,
+)
+from sgl_kernel.utils import _to_tensor_scalar_tuple
 
 
 def install():
-    from .runtime import redact_logs
-
     redact_logs()
-    import torch
-
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
         raise RuntimeError("SGLANG_V100_LITE=1 requires an SM70 CUDA device")
-    # Prefer the built SM70 norm ops and Triton LayerNorm over FlashInfer's
-    # SM75+ JIT. These modules retain their mainline public signatures.
     import sgl_kernel.elementwise as norm_ops
     import sglang.srt.layers.layernorm as norms
+    from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
+    from sglang.srt.arg_groups.choices import add_linear_attn_kernel_backend_choices
+    from sglang.srt.plugins.hook_registry import HookRegistry, HookType
+    from .quantization import prepare_nvfp4_moe, minimum_capability, marlin_gemm, moe_runner
 
     norm_ops._has_flashinfer = False
     norms._flashinfer_layernorm_available = False
     norms._flashinfer_rmsnorm_quant_available = False
-    # Fused indexer kernels use the model's FP16 type for pending/compressed keys.
-    from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
-
     QSATokenToKVPool.index_state_dtype = torch.float16
-    from sglang.srt.arg_groups.choices import add_linear_attn_kernel_backend_choices
-
     add_linear_attn_kernel_backend_choices(["tilelang_v100"])
+    from .qsa import QwenSparseAttnBackend, project_qk, mqa_decode
+    from .mqa import qsa_mqa_prefill
+    from .ple import _gather_ple_embedding_from_pinned_kernel, Qwen4ExpPinnedHostEmbedding
 
-    from sglang.srt.plugins.hook_registry import HookRegistry, HookType
-    from .runtime import top_k_renorm_probs, top_p_renorm_probs
-
-    # EAGLE imports these functions inside verification, independently of the
-    # ordinary sampler backend. Keep its algorithm and use our SM70 AOT ops.
-    HookRegistry.register(
-        "flashinfer.sampling.top_k_renorm_probs", top_k_renorm_probs, HookType.REPLACE
-    )
-    HookRegistry.register(
-        "flashinfer.sampling.top_p_renorm_probs", top_p_renorm_probs, HookType.REPLACE
-    )
     def legacy_dtype(original, model_config):
         if model_config.dtype != torch.float16:
             raise ValueError("The enabled SM70 profile requires float16 model weights")
-        # install() already requires SM70; upstream rejects everything below SM75.
 
-    HookRegistry.register(
-        "sglang.srt.model_executor.model_runner_components.load_model_utils.maybe_downgrade_dtype_for_legacy_gpu",
-        legacy_dtype,
-        HookType.AROUND,
-    )
-    from .quantization import (
-        prepare_nvfp4_moe,
-        minimum_capability,
-        marlin_gemm,
-        moe_runner,
-    )
-    from .runtime import dispatcher_init
+    hooks = [
+        ('flashinfer.sampling.top_k_renorm_probs', top_k_renorm_probs, HookType.REPLACE),
+        ('flashinfer.sampling.top_p_renorm_probs', top_p_renorm_probs, HookType.REPLACE),
+        ('sglang.srt.model_executor.model_runner_components.load_model_utils.maybe_downgrade_dtype_for_legacy_gpu', legacy_dtype, HookType.AROUND),
+        ('sglang.srt.layers.quantization.modelopt_quant.ModelOptFp4Config.get_min_capability', minimum_capability, HookType.AROUND),
+        ('sglang.srt.layers.quantization.modelopt_quant.prepare_moe_nvfp4_layer_for_marlin', prepare_nvfp4_moe, HookType.AROUND),
+        ('sglang.kernels.ops.moe.moe_wna16_marlin.moe_wna16_marlin_gemm', marlin_gemm, HookType.AROUND),
+        ('sglang.srt.layers.attention.linear.gdn_backend.GDNKernelDispatcher.__init__', dispatcher_init, HookType.AROUND),
+        ('sglang.srt.layers.moe.moe_runner.base.FusedOpPool.get_fused_func', moe_runner, HookType.AROUND),
+        ('sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent.fused_sigmoid_gating_delta_rule_update_kernel.run', round_verify_state, HookType.AROUND),
+        ('sglang.srt.mem_cache.memory_pool.MHATokenToKVPool.set_kv_buffer', store, HookType.AROUND),
+        ('sglang.srt.server_args.prepare_server_args', arguments, HookType.AROUND),
+        ('sglang.srt.layers.attention.qwen_sparse_attn_backend.QwenSparseAttnBackend', QwenSparseAttnBackend, HookType.REPLACE),
+        ('sglang.srt.layers.attention.qsa.qsa_indexer.QSAIndexer.project_qk', project_qk, HookType.AROUND),
+        ('sglang.srt.layers.attention.qsa.mqa.qsa_mqa_decode', mqa_decode, HookType.AROUND),
+        ('sglang.srt.layers.attention.qsa.mqa.qsa_mqa_prefill', qsa_mqa_prefill, HookType.REPLACE),
+        ('sglang.srt.models.qwen4_exp._gather_ple_embedding_from_pinned_kernel', _gather_ple_embedding_from_pinned_kernel, HookType.REPLACE),
+        ('sglang.srt.models.qwen4_exp.Qwen4ExpPinnedHostEmbedding', Qwen4ExpPinnedHostEmbedding, HookType.REPLACE),
+        ('sglang.srt.layers.quantization.unquant.UnquantizedLinearMethod.apply', apply_unquant, HookType.AROUND),
+        ('sglang.srt.layers.hyperconnection.GatedResidual.__init__', initialize, HookType.AROUND),
+        ('sglang.srt.layers.hyperconnection.GatedResidual.mix', mix, HookType.AROUND),
+        ('sglang.srt.layers.hyperconnection.GatedResidual.combine', combine, HookType.AROUND),
+        ('sglang.srt.models.qwen4_exp.Qwen4ExpNGramEmbedding._finish_embedding_lookup', embedding_output, HookType.AROUND),
 
-    HookRegistry.register(
-        "sglang.srt.layers.quantization.modelopt_quant.ModelOptFp4Config.get_min_capability",
-        minimum_capability,
-        HookType.AROUND,
-    )
-    HookRegistry.register(
-        "sglang.srt.layers.quantization.modelopt_quant.prepare_moe_nvfp4_layer_for_marlin",
-        prepare_nvfp4_moe,
-        HookType.AROUND,
-    )
-    HookRegistry.register(
-        "sglang.kernels.ops.moe.moe_wna16_marlin.moe_wna16_marlin_gemm",
-        marlin_gemm,
-        HookType.AROUND,
-    )
-    HookRegistry.register(
-        "sglang.srt.layers.attention.linear.gdn_backend.GDNKernelDispatcher.__init__",
-        dispatcher_init,
-        HookType.AROUND,
-    )
-    HookRegistry.register(
-        "sglang.srt.layers.moe.moe_runner.base.FusedOpPool.get_fused_func",
-        moe_runner,
-        HookType.AROUND,
-    )
-
-    from .runtime import round_verify_state
-
-    HookRegistry.register(
-        "sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent.fused_sigmoid_gating_delta_rule_update_kernel.run",
-        round_verify_state,
-        HookType.AROUND,
-    )
-    from .runtime import store
-
-    HookRegistry.register(
-        "sglang.srt.mem_cache.memory_pool.MHATokenToKVPool.set_kv_buffer",
-        store,
-        HookType.AROUND,
-    )
-    from .runtime import arguments
-
-    HookRegistry.register(
-        "sglang.srt.server_args.prepare_server_args", arguments, HookType.AROUND
-    )
-
-    from .qsa import QwenSparseAttnBackend, project_qk, mqa_decode
-    from .mqa import qsa_mqa_prefill
-
-    HookRegistry.register(
-        "sglang.srt.layers.attention.qwen_sparse_attn_backend.QwenSparseAttnBackend",
-        QwenSparseAttnBackend,
-        HookType.REPLACE,
-    )
-    HookRegistry.register(
-        "sglang.srt.layers.attention.qsa.qsa_indexer.QSAIndexer.project_qk",
-        project_qk,
-        HookType.AROUND,
-    )
-    HookRegistry.register(
-        "sglang.srt.layers.attention.qsa.mqa.qsa_mqa_decode",
-        mqa_decode,
-        HookType.AROUND,
-    )
-    HookRegistry.register(
-        "sglang.srt.layers.attention.qsa.mqa.qsa_mqa_prefill",
-        qsa_mqa_prefill,
-        HookType.REPLACE,
-    )
-
-    from .ple import _gather_ple_embedding_from_pinned_kernel
-
-    HookRegistry.register(
-        "sglang.srt.models.qwen4_exp._gather_ple_embedding_from_pinned_kernel",
-        _gather_ple_embedding_from_pinned_kernel,
-        HookType.REPLACE,
-    )
-
-    from .ple import Qwen4ExpPinnedHostEmbedding
-
-    HookRegistry.register(
-        "sglang.srt.models.qwen4_exp.Qwen4ExpPinnedHostEmbedding",
-        Qwen4ExpPinnedHostEmbedding,
-        HookType.REPLACE,
-    )
-    from .runtime import apply_unquant
-
-    HookRegistry.register(
-        "sglang.srt.layers.quantization.unquant.UnquantizedLinearMethod.apply",
-        apply_unquant,
-        HookType.AROUND,
-    )
+    ]
+    for target, replacement, kind in hooks:
+        HookRegistry.register(target, replacement, kind)
     global REQUIRED_HOOKS
-
-    from .runtime import initialize, mix, combine, embedding_output
-
-    HookRegistry.register(
-        "sglang.srt.layers.hyperconnection.GatedResidual.__init__",
-        initialize,
-        HookType.AROUND,
-    )
-    HookRegistry.register(
-        "sglang.srt.layers.hyperconnection.GatedResidual.mix", mix, HookType.AROUND
-    )
-    HookRegistry.register(
-        "sglang.srt.layers.hyperconnection.GatedResidual.combine",
-        combine,
-        HookType.AROUND,
-    )
-    HookRegistry.register(
-        "sglang.srt.models.qwen4_exp.Qwen4ExpNGramEmbedding._finish_embedding_lookup",
-        embedding_output,
-        HookType.AROUND,
-    )
-    REQUIRED_HOOKS = frozenset(HookRegistry._hooks)
-
-import os
+    REQUIRED_HOOKS = frozenset(target for target, _, _ in hooks)
 
 
 def arguments(original, *args, **kwargs):
@@ -200,10 +89,6 @@ def redact_logs():
         return record
 
     logging.setLogRecordFactory(factory)
-
-import torch
-import msgspec
-import os
 
 
 def initialize(original, self, config, *args, **kwargs):
@@ -288,6 +173,7 @@ def sm70_hc_down_gemv_silu_supported(
         and w_up.is_contiguous()
     )
 
+
 def store(
     original,
     self,
@@ -326,12 +212,14 @@ def store(
         dcp_kv_mask,
     )
 
+
 def apply_unquant(original, self, layer, x, bias=None):
     from .kernels.gemm import supported, linear_dense
 
     if supported(x, layer.weight, bias):
         return linear_dense(x, layer.weight)
     return original(self, layer, x, bias)
+
 
 def dispatcher_init(
     original, self, decode_backend, prefill_backend, verify_backend=None
@@ -361,12 +249,6 @@ def round_verify_state(original, *args, **kwargs):
         and not kwargs.get("HAS_EAGLE_TREE_CUSTOM_ATTN_MASK", False)
     )
     return original(*args, **kwargs)
-
-from sgl_kernel.sampling import (
-    _top_k_renorm_probs_internal,
-    _top_p_renorm_probs_internal,
-)
-from sgl_kernel.utils import _to_tensor_scalar_tuple
 
 
 def top_k_renorm_probs(probs, top_k):

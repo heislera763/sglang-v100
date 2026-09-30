@@ -23,8 +23,6 @@ _DENSE_CONFIGS = {
 
 
 def supported(x: torch.Tensor, weight: torch.Tensor, bias=None) -> bool:
-    from sglang_v100_lite.kernels.gemm import shape_supported
-
     return (
         os.environ.get("SGLANG_SM70_DENSE_GEMV", "0") == "1"
         and x.is_cuda
@@ -70,19 +68,12 @@ def _dense_module(threads: int, lanes: int, vector: int):
 
 def linear_dense(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     if x.shape[0] != 1:
-        from sglang_v100_lite.kernels.gemm import linear_small as small_linear
-
-        return small_linear(x, weight)
+        return linear_small(x, weight)
     config = _DENSE_CONFIGS.get(tuple(weight.shape), (64, 32, 8))
     out = torch.empty((1, weight.shape[0]), dtype=x.dtype, device=x.device)
     _dense_module(*config).gemv(x, weight, out)
     return out
 
-import os
-
-import torch
-
-from sglang_v100_lite.kernels.utils import cache_once, load_jit
 
 # (rows, output features, input features) -> (threads, lanes per output).
 # Shapes where cuBLAS is faster deliberately stay on the existing path.
