@@ -539,7 +539,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             FlashInferAttnBackend,
             QwenSparseAttnBackend,
         ]
-        if _is_cuda or _is_musa:
+        if (_is_cuda or _is_musa) and not isinstance(
+            self.draft_extend_attn_backend, tuple(graph_supported_backend_types)
+        ):
             # DSA is CUDA-only; import lazily so non-CUDA builds don't pull in
             # deep_gemm and the rest of the sparse-attention stack at import time.
             from sglang.srt.layers.attention.dsa_backend import (
@@ -552,7 +554,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
 
             graph_supported_backend_types.append(DeepseekV4AttnBackend)
-        if _is_cuda:
+        if _is_cuda and not isinstance(
+            self.draft_extend_attn_backend, tuple(graph_supported_backend_types)
+        ):
             # FlashMLA is CUDA-only; import lazily so CPU builds don't pull
             # sgl_kernel.flash_mla at import time.
             from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
