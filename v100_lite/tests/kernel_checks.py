@@ -21,6 +21,28 @@ expected = x.to(torch.float8_e5m2).view(torch.uint8)
 assert torch.equal(k[loc], expected) and torch.equal(v[loc], expected)
 print("E5M2 paged cache: exact bytes match Torch", flush=True)
 
+# Regression for upstream #41759: int4 padding must not overwrite a view's
+# backing guard words when the output length is not divisible by four.
+import sgl_kernel
+
+for experts, tokens in ((33, 8), (129, 640)):
+    ids = torch.randint(experts - 1, (tokens, 8), device=device, dtype=torch.int32)
+    needed = ids.numel() + experts * 63
+    for remainder in range(4):
+        length = needed + (remainder - needed) % 4
+        backing = torch.full((length + 4,), -1, device=device, dtype=torch.int32)
+        expert_ids = torch.zeros((length + 63) // 64, device=device, dtype=torch.int32)
+        count = torch.empty(1, device=device, dtype=torch.int32)
+        cumsum = torch.empty(experts + 1, device=device, dtype=torch.int32)
+        torch.ops.sgl_kernel.moe_align_block_size.default(
+            ids, experts, 64, backing[:length], expert_ids, count, cumsum, True
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(backing[length:], torch.full_like(backing[length:], -1))
+        tail = backing[count.item():length]
+        assert torch.equal(tail, torch.full_like(tail, ids.numel()))
+print("MoE padding: scalar tails filled, backing guard words unchanged", flush=True)
+
 # Qwen TP4 MoE shape. A synthetic checkpoint and a dequantized Torch reference
 # test packing, the unusual S0E5M3 scale layout, gating, and weighted summation.
 e, h, i = 512, 2560, 160

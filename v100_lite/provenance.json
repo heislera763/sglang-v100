@@ -527,5 +527,12 @@
     }
   },
   "hashes_describe": "Original source content before compatibility edits; origin revision defaults to v100_fork unless specified.",
-  "marlin_cutlass_revision": "f3fde58372d33e9a5650ba7b80fc48b3b49d40c8"
+  "marlin_cutlass_revision": "f3fde58372d33e9a5650ba7b80fc48b3b49d40c8",
+  "current_upstream": "fc9bdc8a3e60a0896e58d84ac261cc470ab4a24c",
+  "upstream_backports": {
+    "v100_lite/aot/csrc/moe/moe_align_kernel.cu": {
+      "commit": "fc9bdc8a3e60a0896e58d84ac261cc470ab4a24c",
+      "change": "Bound vector padding stores and fill the scalar tail"
+    }
+  }
 }

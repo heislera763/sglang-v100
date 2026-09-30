@@ -2,6 +2,23 @@
 
 Upstream starting revision: `84523d67851171fa20f7c68d3d6dc6cbf20c4423`. Published V100 reference: `dca488908ee4`.
 
+Current upstream base: `fc9bdc8a3e60a0896e58d84ac261cc470ab4a24c` (12 commits beyond the
+initial base). The three lite commits rebased without conflicts. The retained SM70 MoE
+alignment kernel also carries upstream #41759's padding bounds fix, with guard-word and
+scalar-tail regression coverage. The uv lock follows upstream's SentencePiece 0.2.1 pin.
+The SM70 package remains `0.4.7+v100` because upstream SGLang still requires kernel
+0.4.7, even though its native source package was bumped to 0.4.8.
+
+The performance and 200K-context measurements below were collected on the initial
+upstream base; they are historical baseline results, not rerun benchmarks of this
+update.
+
+This sync passed 81 CPU tests (plus 30 subtests), the disabled-plugin check, a
+clean SM70 native rebuild, dense/sparse QSA and FP16 MTP reference checks, exact
+E5M2 cache conversion, and NVFP4 MoE decode/prefill reference comparisons. The
+padding regression reproduces on the previous native binary and passes on the
+rebuilt binary. Update evidence is consolidated in ignored `artifacts/upstream-sync/`.
+
 ## Purpose and boundaries
 
 Serve the existing RadixArk Qwen3.8 Flash Next NVFP4 checkpoint on port 9001, GPUs 0–3, NUMA node 0, with TP4 and MTP. Port 9000 is a live deployment and is never used for project requests or modified. The old fork, environment, launchers, and caches stay intact for rollback.
@@ -169,7 +186,8 @@ both loaded model runners, and the production endpoint together consumed about
 226 GiB of host RAM during testing. The test unit has a high OOM score so host
 memory pressure favors reclaiming it over the live deployment.
 
-Three local commits separate the timing API, the generic EAGLE import fix, and
+The initial three local commits separate the timing API, the generic EAGLE import fix,
+and
 the opt-in compatibility runtime. The four modified upstream Python files total
 52 added and 2 removed lines. Alternatives and build/runtime tooling stay under
 this project; no changes were made to the original fork or llama-server files.
