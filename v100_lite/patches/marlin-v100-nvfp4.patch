@@ -1,3 +1,71 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -128,6 +128,21 @@
+ endif()
+ list(APPEND MARLIN_V100_MOE_SRC "${MARLIN_MOE_OTHER_SRC}")
+ 
++# The Qwen serving profile needs repacking and NVFP4 MoE, not other families.
++option(MARLIN_V100_NVFP4_ONLY "Build only the NVFP4 MoE serving profile" OFF)
++if(MARLIN_V100_NVFP4_ONLY)
++  set(MARLIN_V100_DENSE_SRC
++    "csrc/torch_bindings_marlin.cpp"
++    "csrc/quantization/marlin/gptq_marlin_repack.cu")
++  set(MARLIN_V100_MOE_SRC
++    "csrc/moe/torch_bindings_marlin.cpp"
++    "csrc/moe/moe_align_sum_kernels.cu"
++    "csrc/moe/topk_softmax_kernels.cu"
++    "csrc/moe/grouped_topk_kernels.cu"
++    "csrc/moe/marlin_moe_wna16/ops.cu"
++    "csrc/moe/marlin_moe_wna16/sm70_marlin_nvfp4_gemm.cu")
++endif()
++
+ define_extension_target(
+   _C
+   DESTINATION vllm
+@@ -149,3 +164,7 @@
+   ARCHITECTURES ${VLLM_GPU_ARCHES}
+   USE_SABI 3
+   WITH_SOABI)
++
++if(MARLIN_V100_NVFP4_ONLY)
++  target_compile_definitions(_moe_C PRIVATE MARLIN_V100_NVFP4_ONLY)
++endif()
+--- a/csrc/moe/marlin_moe_wna16/ops.cu
++++ b/csrc/moe/marlin_moe_wna16/ops.cu
+@@ -388,6 +388,7 @@
+   TORCH_CHECK(!has_bias,
+               "SM70 Marlin MoE does not support bias.");
+ 
++  #if !defined(MARLIN_V100_NVFP4_ONLY)
+   if (b_type == vllm::kU4) {
+     TORCH_CHECK(has_zp && is_zp_float,
+                 "SM70 Marlin MoE uint4 path requires fp16 zero points.");
+@@ -440,6 +441,7 @@
+         mul_topk_weights, size_m, size_n, size_k, group_size);
+   }
+ 
++  #endif
+   if (b_type == vllm::kFE2M1f) {
+     TORCH_CHECK(!has_zp && !is_zp_float,
+                 "SM70 Marlin MoE fp4 does not support zero-point metadata.");
+@@ -456,6 +458,7 @@
+           mul_topk_weights, size_m, size_n, size_k, group_size);
+     }
+ 
++    #if !defined(MARLIN_V100_NVFP4_ONLY)
+     TORCH_CHECK(s_type == vllm::kFE8M0fnu,
+                 "SM70 Marlin MoE mxfp4 expects float8_e8m0fnu scales.");
+     TORCH_CHECK(group_size == 32,
+@@ -466,6 +469,9 @@
+         a, c, b_q_weight, b_scales, sorted_token_ids, expert_ids,
+         num_tokens_past_padded, topk_weights, moe_block_size, top_k,
+         mul_topk_weights, size_m, size_n, size_k, group_size);
++    #else
++    TORCH_CHECK(false, "This build profile supports only NVFP4 MoE.");
++    #endif
+   }
+ 
+   TORCH_CHECK(false, "Unsupported SM70 Marlin MoE weight type.");
 diff --git a/csrc/moe/marlin_moe_wna16/sm70_marlin_gemm.cuh b/csrc/moe/marlin_moe_wna16/sm70_marlin_gemm.cuh
 index 86550a9..f5846d6 100644
 --- a/csrc/moe/marlin_moe_wna16/sm70_marlin_gemm.cuh
@@ -152,6 +220,64 @@ index 86550a9..f5846d6 100644
 +    return params;
 +  }
 +  if (sm70_marlin_moe_try_select_poolside_laguna_s_2_1_int4_params(
++          ctx, params)) {
++    validate_sm70_marlin_auto_params("MoE", params);
++    return params;
++  }
+   if (sm70_marlin_moe_try_select_quanttrio_minimax_m2_7_awq_params(
+           ctx, params)) {
+     validate_sm70_marlin_auto_params("MoE", params);
+diff --git a/csrc/moe/marlin_moe_wna16/sm70_marlin_gemm.cuh b/csrc/moe/marlin_moe_wna16/sm70_marlin_gemm.cuh
+--- a/csrc/moe/marlin_moe_wna16/sm70_marlin_gemm.cuh
++++ b/csrc/moe/marlin_moe_wna16/sm70_marlin_gemm.cuh
+@@ -389,6 +389,42 @@ inline bool sm70_marlin_moe_try_select_poolside_laguna_s_2_1_int4_params(
+ 
+   return false;
+ }
++
++inline bool sm70_marlin_moe_try_select_radixark_qwen3_8_flash_next_nvfp4_params(
++    Sm70MarlinMoeAutoParamsContext const& ctx,
++    Sm70MarlinAutoParams& params) {
++  // RadixArk/Qwen3.8-Flash-Next-NVFP4, TP=4, batch-one decode.  It routes ten
++  // of 512 experts with hidden=2560 and TP-local intermediate=160.  The
++  // checkpoint is ModelOpt NVFP4 (group 16).  An exhaustive V100-SXM2 sweep
++  // measured 73.35 us for gate/up and 83.56 us for down at these shapes.
++  if (ctx.quant_format == nullptr ||
++      std::strcmp(ctx.quant_format, "nvfp4") != 0 ||
++      ctx.group_size != 16 || ctx.moe_block_size != 8) {
++    return false;
++  }
++
++  // Gate/up: M=1, N=2*(640/TP4)=320, K=2560, top-k=10.
++  if (ctx.size_m == 1 && ctx.top_k == 10 &&
++      ctx.size_n == 320 && ctx.size_k == 2560) {
++    params = {{32, 64, 64, 4, 32, 64, 16},
++              1,
++              true,
++              ctx.packed_macro_n};
++    return true;
++  }
++
++  // Down sees the ten routed rows as M=10 with top-k=1.
++  if (ctx.size_m == 10 && ctx.top_k == 1 &&
++      ctx.size_n == 2560 && ctx.size_k == 160) {
++    params = {{64, 256, 32, 4, 64, 64, 32},
++              1,
++              false,
++              ctx.packed_macro_n};
++    return true;
++  }
++
++  return false;
++}
+ 
+ inline bool sm70_marlin_moe_try_select_quanttrio_minimax_m2_7_awq_params(
+     Sm70MarlinMoeAutoParamsContext const& ctx,
+@@ -2352,6 +2388,11 @@ inline Sm70MarlinAutoParams sm70_marlin_moe_auto_stage_params(
+     validate_sm70_marlin_auto_params("MoE", params);
+     return params;
+   }
++  if (sm70_marlin_moe_try_select_radixark_qwen3_8_flash_next_nvfp4_params(
 +          ctx, params)) {
 +    validate_sm70_marlin_auto_params("MoE", params);
 +    return params;
