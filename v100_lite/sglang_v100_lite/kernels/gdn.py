@@ -1,5 +1,3 @@
-from sglang.srt.layers.attention.linear.kernels.kernel_backend import LinearAttnKernelBase
-
 # Copyright 2026 SGLang Team
 # Licensed under the Apache License, Version 2.0.
 """SM70 TileLang kernels for the chunked gated-delta-rule forward pass.
@@ -21,6 +19,7 @@ from functools import lru_cache
 import tilelang
 import tilelang.language as T
 import torch
+from sglang.srt.layers.attention.linear.kernels.kernel_backend import LinearAttnKernelBase
 from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
 from sglang.kernels.ops.attention.fla.index import (
     prepare_chunk_indices,

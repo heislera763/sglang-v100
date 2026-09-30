@@ -33,7 +33,6 @@ elif hasattr(tilelang.PassConfigKey, "TL_ENABLE_FAST_MATH"):
 
 """TileLang fallback combining QSA split-KV attention."""
 
-import tilelang
 import tilelang.language as T
 
 
@@ -106,8 +105,6 @@ while removing page-table lookup, integer divide, and scattered-page address
 resolution from every K/V element load.
 """
 
-import tilelang
-import tilelang.language as T
 
 
 _LOG2_E = 1.4426950408889634

@@ -6,6 +6,7 @@
 #include <c10/cuda/CUDAException.h>
 #include <cuda_fp16.h>
 #include <torch/all.h>
+#include <torch/library.h>
 
 #include <algorithm>
 #include <climits>
@@ -124,4 +125,9 @@ void sm70_fp8_e5m2_cache_write(
       key.stride(0), value.stride(0), key_cache.stride(0),
       value_cache.stride(0));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+TORCH_LIBRARY(sglang_sm70_turbomind, m) {
+    m.def("fp8_e5m2_cache_write(Tensor key, Tensor value, Tensor(a!) key_cache, Tensor(b!) value_cache, Tensor locations, Tensor? k_scale, Tensor? v_scale) -> ()");
+    m.impl("fp8_e5m2_cache_write", torch::kCUDA, &sm70_fp8_e5m2_cache_write);
 }
