@@ -18,7 +18,7 @@ class QwenSparseAttnBackend(BaseQSA):
         image self-contained: it intentionally does not ship the legacy
         external ``flash_attn_v100`` wheel.
         """
-        from sglang_v100_lite.tilelang_attention._kernels_dense_d256 import (
+        from sglang_v100_lite.kernels.attention import (
             get_dense_prefix_d256_kernel,
         )
 
@@ -157,7 +157,7 @@ class QwenSparseAttnBackend(BaseQSA):
             ):
                 if save_kv_cache:
                     pool.set_kv_buffer(layer, forward_batch.out_cache_loc, k, v)
-                from .tilelang_attention._decode_cuda import sm70_cuda_qsa_prefill
+                from .kernels.qsa_cuda import sm70_cuda_qsa_prefill
 
                 out = sm70_cuda_qsa_prefill(
                     q3[:rows].contiguous(),
@@ -182,7 +182,7 @@ class QwenSparseAttnBackend(BaseQSA):
         if self._can_use_sm70_sparse_decode(
             q, kb, vb, forward_batch, metadata, topk_indices
         ):
-            from .tilelang_attention._decode_cuda import sm70_cuda_qsa_decode
+            from .kernels.qsa_cuda import sm70_cuda_qsa_decode
 
             requests = metadata.row_req_pool_indices
             if requests is None:
@@ -221,7 +221,7 @@ def mqa_decode(
         and k_cache.shape[1] in (4, 16)
         and k_cache.shape[2:] == (1, 128)
     ):
-        from .tilelang_attention._decode_cuda import sm70_cuda_qsa_indexer_decode
+        from .kernels.qsa_cuda import sm70_cuda_qsa_indexer_decode
 
         return sm70_cuda_qsa_indexer_decode(
             q,

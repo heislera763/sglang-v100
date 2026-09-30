@@ -175,7 +175,7 @@ for m in (1, 4, 17):
     )
 
 import torch
-from sglang_v100_lite.tilelang_attention._kernels_dense_d256 import (
+from sglang_v100_lite.kernels.attention import (
     get_dense_prefix_d256_kernel,
 )
 from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
@@ -213,7 +213,7 @@ print("D256 causal dense attention: SDPA reference agrees", flush=True)
 
 # Current mainline uses compressed page 16; retain the fork's page 4 too.
 # Random physical page order catches addressing errors hidden by identity maps.
-from sglang_v100_lite.tilelang_attention._decode_cuda import (
+from sglang_v100_lite.kernels.qsa_cuda import (
     sm70_cuda_qsa_indexer_decode,
 )
 
@@ -236,7 +236,7 @@ for page in (4, 16):
         flush=True,
     )
 
-from sglang_v100_lite.tilelang_attention._decode_cuda import (
+from sglang_v100_lite.kernels.qsa_cuda import (
     sm70_cuda_qsa_prefill,
     sm70_cuda_qsa_decode,
 )
@@ -346,7 +346,7 @@ print("Four-step FP16 MTP recurrence: sequential decode agrees", flush=True)
 # Independent sequential FP32 reference for the retained chunked GDN algorithm.
 # Non-aligned sequence boundaries, nonzero indexed state and checkpoint content
 # exercise correctness beyond producing plausible model text.
-from sglang_v100_lite.gdn_tilelang import TileLangGDNKernel
+from sglang_v100_lite.kernels.gdn import TileLangGDNKernel
 n, heads, value_heads, dim = 128, 4, 12, 128
 q = torch.randn(1, n, heads, dim, device=device, dtype=torch.float16)
 k = torch.randn_like(q)

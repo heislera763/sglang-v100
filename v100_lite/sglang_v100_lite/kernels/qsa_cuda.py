@@ -145,7 +145,7 @@ def sm70_cuda_qsa_decode(
             indices.shape[1],
             QSA_DECODE_TOKENS_PER_SPLIT,
         )
-    from .combine import _decode_combine_kernel
+    from .attention import _decode_combine_kernel
 
     combine = _decode_combine_kernel(
         batch,

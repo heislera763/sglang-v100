@@ -1,3 +1,103 @@
+"""Shared TileLang settings for the SM70 QSA kernels."""
+
+import tilelang
+
+tilelang.set_log_level("WARNING")
+
+# Workaround a tilelang bug: BaseKernelAdapter._legalize_result_idx mutates the
+# `out_idx` list in place. Patch once on import (idempotent). Mirrors
+# sglang/srt/layers/attention/dsa/tilelang_kernel.py.
+from tilelang.jit.adapter.base import (  # noqa: E402
+    BaseKernelAdapter as _BaseKernelAdapter,
+)
+
+if not getattr(_BaseKernelAdapter, "_legalize_result_idx_patched", False):
+    _orig_legalize = _BaseKernelAdapter._legalize_result_idx
+
+    def _legalize_result_idx_safe(self, result_idx):
+        if isinstance(result_idx, list):
+            result_idx = list(result_idx)
+        return _orig_legalize(self, result_idx)
+
+    _BaseKernelAdapter._legalize_result_idx = _legalize_result_idx_safe
+    _BaseKernelAdapter._legalize_result_idx_patched = True
+
+pass_configs = {
+    tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+    tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+}
+if hasattr(tilelang.PassConfigKey, "TL_DISABLE_FAST_MATH"):
+    pass_configs[tilelang.PassConfigKey.TL_DISABLE_FAST_MATH] = True
+elif hasattr(tilelang.PassConfigKey, "TL_ENABLE_FAST_MATH"):
+    pass_configs[tilelang.PassConfigKey.TL_ENABLE_FAST_MATH] = False
+
+"""TileLang fallback combining QSA split-KV attention."""
+
+import tilelang
+import tilelang.language as T
+
+
+@tilelang.jit(out_idx=[-1], pass_configs=pass_configs)
+def _decode_combine_kernel(
+    batch: int,
+    heads: int,
+    dim: int,
+    max_splits: int,
+    threads: int,
+    min_tokens_per_split: int,
+    selected_tokens: int = 0,
+):
+    @T.prim_func
+    def main(
+        PartialO: T.Tensor([batch, max_splits, heads, dim], T.float16),
+        PartialLSE: T.Tensor([batch, max_splits, heads], T.float32),
+        SeqLens: T.Tensor([batch], T.int32),
+        Output: T.Tensor([batch, heads, dim], T.float16),
+    ):
+        with T.Kernel(heads, batch, threads=threads) as (head, batch_id):
+            lse = T.alloc_shared([max_splits], T.float32)
+            max_lse = T.alloc_fragment([1], T.float32)
+            sum_lse = T.alloc_fragment([1], T.float32)
+            output = T.alloc_fragment([dim], T.float32)
+            context = (
+                T.min(SeqLens[batch_id], selected_tokens)
+                if selected_tokens > 0
+                else SeqLens[batch_id]
+            )
+            active_splits = T.min(
+                max_splits,
+                T.max(
+                    1,
+                    T.ceildiv(context, min_tokens_per_split),
+                ),
+            )
+            for split in T.Parallel(max_splits):
+                lse[split] = T.if_then_else(
+                    split < active_splits,
+                    PartialLSE[batch_id, split, head],
+                    -(2**30),
+                )
+            T.fill(max_lse, -(2**30))
+            for split in T.serial(max_splits):
+                max_lse[0] = T.max(max_lse[0], lse[split])
+            T.fill(sum_lse, 0)
+            for split in T.serial(max_splits):
+                if split < active_splits:
+                    sum_lse[0] += T.exp2(lse[split] - max_lse[0])
+            T.fill(output, 0)
+            for split in T.serial(max_splits):
+                if split < active_splits:
+                    weight = T.exp2(lse[split] - max_lse[0]) / sum_lse[0]
+                    for d in T.Parallel(dim):
+                        output[d] += weight * T.cast(
+                            PartialO[batch_id, split, head, d],
+                            T.float32,
+                        )
+            for d in T.Parallel(dim):
+                Output[batch_id, head, d] = T.cast(output[d], T.float16)
+
+    return main
+
 """Exact dense-prefix D256 prefill kernel for SM70.
 
 Long paged prefixes are gathered into logical order before this kernel is
@@ -9,7 +109,6 @@ resolution from every K/V element load.
 import tilelang
 import tilelang.language as T
 
-from .config import pass_configs
 
 _LOG2_E = 1.4426950408889634
 _D256_PASS_CONFIGS = dict(pass_configs)

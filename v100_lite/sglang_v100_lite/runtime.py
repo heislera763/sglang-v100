@@ -235,7 +235,7 @@ def dispatcher_init(
         verify_backend,
     )
     if use_tilelang:
-        from .gdn_tilelang import TileLangGDNKernel
+        from .kernels.gdn import TileLangGDNKernel
 
         self.extend_kernel = TileLangGDNKernel()
 

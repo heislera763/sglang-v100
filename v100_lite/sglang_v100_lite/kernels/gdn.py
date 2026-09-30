@@ -1,3 +1,5 @@
+from sglang.srt.layers.attention.linear.kernels.kernel_backend import LinearAttnKernelBase
+
 # Copyright 2026 SGLang Team
 # Licensed under the Apache License, Version 2.0.
 """SM70 TileLang kernels for the chunked gated-delta-rule forward pass.
@@ -630,3 +632,41 @@ def chunked_gdn_sm70(
         checkpoints,
     )
     return output, checkpoints if store_checkpoints else None
+
+
+class TileLangGDNKernel(LinearAttnKernelBase):
+    """Prefill adapter; decode and verify remain mainline Triton."""
+
+    def decode(self, *args, **kwargs) -> torch.Tensor:
+        raise NotImplementedError("This adapter provides prefill only.")
+
+    def extend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        *,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        scale: float | None = None,
+        store_checkpoints: bool = True,
+        **kwargs,
+    ) -> tuple:
+        # Mainline's non-FlashInfer contract returns the chunk-state tensor.
+        # Prefix tracking can consume it without passing store_checkpoints.
+        out, checkpoints = chunked_gdn_sm70(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale=scale or k.shape[-1] ** -0.5,
+            state=ssm_states,
+            state_indices=cache_indices,
+            cu_seqlens=query_start_loc,
+            store_checkpoints=store_checkpoints,
+        )
+        return out, None, checkpoints
