@@ -226,8 +226,12 @@ def dispatcher_init(
     original, self, decode_backend, prefill_backend, verify_backend=None
 ):
     from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
+    from sglang.srt.runtime_context import get_exec
 
-    use_tilelang = prefill_backend.is_custom()
+    mamba = get_exec().mamba
+    use_tilelang = prefill_backend.is_custom() and (
+        mamba.linear_attn_prefill_backend or mamba.linear_attn_backend
+    ) == "tilelang_v100"
     original(
         self,
         decode_backend,

@@ -652,8 +652,11 @@ class TileLangGDNKernel(LinearAttnKernelBase):
         query_start_loc: torch.Tensor,
         scale: float | None = None,
         store_checkpoints: bool = True,
+        inplace_update: bool = True,
         **kwargs,
     ) -> tuple:
+        if not inplace_update:
+            raise NotImplementedError("SM70 chunked GDN requires in-place state updates")
         # Mainline's non-FlashInfer contract returns the chunk-state tensor.
         # Prefix tracking can consume it without passing store_checkpoints.
         out, checkpoints = chunked_gdn_sm70(
