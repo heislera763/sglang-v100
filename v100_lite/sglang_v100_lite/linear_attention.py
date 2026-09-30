@@ -17,3 +17,15 @@ def dispatcher_init(
         from .gdn_tilelang import TileLangGDNKernel
 
         self.extend_kernel = TileLangGDNKernel()
+
+
+def round_verify_state(original, *args, **kwargs):
+    import torch
+
+    states = kwargs.get("intermediate_states_buffer")
+    kwargs["QUANTIZE_STATE_EACH_STEP"] = (
+        states is not None
+        and states.dtype != torch.float32
+        and not kwargs.get("HAS_EAGLE_TREE_CUSTOM_ATTN_MASK", False)
+    )
+    return original(*args, **kwargs)

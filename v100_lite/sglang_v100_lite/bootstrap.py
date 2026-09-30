@@ -39,15 +39,6 @@ def install():
     HookRegistry.register(
         "flashinfer.sampling.top_p_renorm_probs", top_p_renorm_probs, HookType.REPLACE
     )
-    from .native_api import moe_align_block_size, moe_sum_reduce
-
-    HookRegistry.register(
-        "sgl_kernel.moe.moe_align_block_size", moe_align_block_size, HookType.AROUND
-    )
-    HookRegistry.register(
-        "sgl_kernel.moe.moe_sum_reduce", moe_sum_reduce, HookType.AROUND
-    )
-
     def legacy_dtype(original, model_config):
         if model_config.dtype != torch.float16:
             raise ValueError("The enabled SM70 profile requires float16 model weights")
@@ -92,12 +83,12 @@ def install():
         HookType.AROUND,
     )
 
-    from .gdn_recurrent import fused_sigmoid_gating_delta_rule_update
+    from .linear_attention import round_verify_state
 
     HookRegistry.register(
-        "sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent.fused_sigmoid_gating_delta_rule_update",
-        fused_sigmoid_gating_delta_rule_update,
-        HookType.REPLACE,
+        "sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent.fused_sigmoid_gating_delta_rule_update_kernel.run",
+        round_verify_state,
+        HookType.AROUND,
     )
     from .kv_cache import store
 

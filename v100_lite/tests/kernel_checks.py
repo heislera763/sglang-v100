@@ -35,7 +35,7 @@ for experts, tokens in ((33, 8), (129, 640)):
         count = torch.empty(1, device=device, dtype=torch.int32)
         cumsum = torch.empty(experts + 1, device=device, dtype=torch.int32)
         torch.ops.sgl_kernel.moe_align_block_size.default(
-            ids, experts, 64, backing[:length], expert_ids, count, cumsum, True
+            ids, experts, 64, backing[:length], expert_ids, count, cumsum, True, False
         )
         torch.cuda.synchronize()
         assert torch.equal(backing[length:], torch.full_like(backing[length:], -1))
@@ -92,17 +92,12 @@ def dequant(prefix, expert):
 
 from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 from sglang_v100_lite.quantization import marlin_gemm
-from sglang_v100_lite.native_api import moe_align_block_size, moe_sum_reduce
 
 HookRegistry.register(
     "sglang.kernels.ops.moe.moe_wna16_marlin.moe_wna16_marlin_gemm",
     marlin_gemm,
     HookType.AROUND,
 )
-HookRegistry.register(
-    "sgl_kernel.moe.moe_align_block_size", moe_align_block_size, HookType.AROUND
-)
-HookRegistry.register("sgl_kernel.moe.moe_sum_reduce", moe_sum_reduce, HookType.AROUND)
 HookRegistry.apply_hooks()
 from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
 

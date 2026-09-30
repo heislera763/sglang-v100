@@ -4,9 +4,19 @@ import torch
 from sglang_v100_lite.tilelang_attention._kernels_dense_d256 import (
     get_dense_prefix_d256_kernel,
 )
-from sglang_v100_lite.gdn_recurrent import (
+from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update as recurrent,
 )
+
+from sglang.srt.plugins.hook_registry import HookRegistry, HookType
+from sglang_v100_lite.linear_attention import round_verify_state
+
+HookRegistry.register(
+    "sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent.fused_sigmoid_gating_delta_rule_update_kernel.run",
+    round_verify_state,
+    HookType.AROUND,
+)
+HookRegistry.apply_hooks()
 
 assert torch.cuda.get_device_capability() == (7, 0)
 torch.manual_seed(51)
