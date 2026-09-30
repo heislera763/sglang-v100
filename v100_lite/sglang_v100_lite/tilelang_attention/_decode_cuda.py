@@ -31,27 +31,8 @@ QSA_DECODE_TARGET_CTAS = 160
 QSA_DECODE_TOKENS_PER_SPLIT = 32
 
 
-def sm70_cuda_decode_enabled() -> bool:
-    """Whether the CUDA decode partial is requested.
-
-    Defaults to on for SM70 (the kernel is bit-exact and faster than the
-    TileLang codegen on the same layout); set ``SGLANG_V100_DECODE_CUDA=0`` to
-    fall back to the TileLang partial.
-    """
-    return os.environ.get("SGLANG_V100_DECODE_CUDA", "1") == "1"
 
 
-def sm70_cuda_decode_available() -> bool:
-    """Whether the CUDA partial can be used on this GPU."""
-    if not sm70_cuda_decode_enabled():
-        return False
-    if not torch.cuda.is_available():
-        return False
-    try:
-        capability = torch.cuda.get_device_capability()
-    except Exception:
-        return False
-    return capability == (7, 0)
 
 
 def _load_sm70_cuda_decode_ops():
@@ -89,46 +70,6 @@ def _load_sm70_cuda_decode_ops():
     return _EXT
 
 
-def sm70_cuda_decode_partial(
-    q,
-    k_cache,
-    v_cache,
-    page_table,
-    seq_lens,
-    max_splits,
-    min_tokens_per_split,
-    softmax_scale,
-    k_scale,
-    v_scale,
-):
-    """Run the CUDA split-KV partial, returning (partial_o, partial_lse)."""
-    ext = _load_sm70_cuda_decode_ops()
-    if ext is None:
-        raise RuntimeError(
-            "SM70 CUDA decode partial requested but extension is unavailable."
-        )
-    batch, heads, dim = q.shape
-    partial_o = torch.empty(
-        (batch, max_splits, heads, dim), dtype=torch.float16, device=q.device
-    )
-    partial_lse = torch.empty(
-        (batch, max_splits, heads), dtype=torch.float32, device=q.device
-    )
-    ext.sm70_longctx_decode(
-        q.contiguous(),
-        k_cache.view(torch.uint8).contiguous(),
-        v_cache.view(torch.uint8).contiguous(),
-        page_table.to(dtype=torch.int32).contiguous(),
-        seq_lens.to(dtype=torch.int32).contiguous(),
-        int(max_splits),
-        int(min_tokens_per_split),
-        float(softmax_scale),
-        float(k_scale),
-        float(v_scale),
-        partial_o,
-        partial_lse,
-    )
-    return partial_o, partial_lse
 
 
 def sm70_cuda_qsa_prefill(

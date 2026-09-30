@@ -6,7 +6,6 @@
     "v100_lite/sglang_v100_lite/kernels/sm70_nvfp4_moe_decode.py": {"origin": "python/sglang/jit_kernel/sm70_nvfp4_moe_decode.py", "sha256": "c24c112f88c628d166734bcf90190654d1eb0a640a81e2a6e2288f8373e9dc27"},
     "v100_lite/sglang_v100_lite/kernels/csrc/sm70_nvfp4_moe_decode.cu": {"origin": "python/sglang/jit_kernel/csrc/sm70_nvfp4_moe_decode.cu", "sha256": "8d8d10ae4b382e91833c731fd265099d9936172a188cf8858f0f7c9211ae331c"},
     "v100_lite/sglang_v100_lite/kernels/csrc/sm70_fp8_e5m2_cache.cu": {"origin": "python/sglang/jit_kernel/csrc/sm70_fp8_e5m2_cache.cu", "sha256": "2c497fdb283cc1771643ebe678cc299d7e1949f4652a22e4a168873f63a12328"},
-    "v100_lite/sglang_v100_lite/kernels/csrc/sm70_fp8_qpn8_decode.cu": {"origin": "python/sglang/jit_kernel/csrc/sm70_fp8_qpn8_decode.cu", "sha256": "4ad3ba4e6fadf827db234b633482f012c3f30e7ba58ecfc8eaec15335c46bf2c"},
     "v100_lite/sglang_v100_lite/kernels/csrc/elementwise/sm70_small_gemm.cuh": {"origin": "python/sglang/jit_kernel/csrc/elementwise/sm70_small_gemm.cuh", "sha256": "a1d031dda6d019956749e18b57c991ab536af20b3169a521400912b90aa44476"},
     "v100_lite/sglang_v100_lite/kernels/csrc/elementwise/sm70_qsa_combine.cuh": {"origin": "python/sglang/jit_kernel/csrc/elementwise/sm70_qsa_combine.cuh", "sha256": "320baff0f8846f6b8ccbd006b4742a30f8be52d990a69a6f7e832c122f7325a7"},
     "v100_lite/sglang_v100_lite/kernels/csrc/elementwise/sm70_dense_gemv.cuh": {"origin": "python/sglang/jit_kernel/csrc/elementwise/sm70_dense_gemv.cuh", "sha256": "a8cdbf962b85319dca150ffb48985a0815b4de54e7dce26443f5ee54bfb5a829"},

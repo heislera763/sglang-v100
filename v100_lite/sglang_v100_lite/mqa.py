@@ -20,11 +20,6 @@ def _qsa_mqa_kernel_dtype(device: torch.device) -> str:
 
 
 try:
-    import flashinfer.comm  # noqa: F401
-except ImportError:
-    pass
-
-try:
     import tilelang
     from tilelang import language as T
 
@@ -67,56 +62,8 @@ def torch_qsa_mqa_prefill(
     return logits.masked_fill(~valid, -float("inf"))
 
 
-def _validate_decode_inputs(
-    q: torch.Tensor,
-    k_cache: torch.Tensor,
-    page_table: torch.Tensor,
-    context_lens: torch.Tensor,
-) -> None:
-    _validate_q(q)
-    if k_cache.ndim != 4 or k_cache.shape[2] != 1:
-        raise ValueError(
-            "QSA decode cache must be [pages, page_size, 1, head_dim], "
-            f"got {tuple(k_cache.shape)}"
-        )
-    if k_cache.shape[-1] != q.shape[-1]:
-        raise ValueError("QSA query and key head dimensions must match")
-    if page_table.ndim != 2 or page_table.shape[0] != q.shape[0]:
-        raise ValueError("QSA decode page table must have one row per query")
-    if context_lens.numel() != q.shape[0]:
-        raise ValueError("QSA decode context lengths must have one entry per query")
 
 
-def torch_qsa_mqa_decode(
-    q: torch.Tensor,
-    k_cache: torch.Tensor,
-    page_table: torch.Tensor,
-    context_lens: torch.Tensor,
-    max_model_len: int,
-    score_scale: Optional[float] = None,
-) -> torch.Tensor:
-    """Torch reference for variable-length paged decode MQA."""
-
-    _validate_decode_inputs(q, k_cache, page_table, context_lens)
-    batch = q.shape[0]
-    page_size = k_cache.shape[1]
-    total = page_table.shape[1] * page_size
-    gathered = k_cache[page_table.long().clamp_min(0).reshape(-1), :, 0].reshape(
-        batch, total, q.shape[-1]
-    )
-    scores = torch.einsum("bhd,bnd->bnh", q.float(), gathered.float())
-    scores = torch.relu(scores).sum(dim=-1) / (score_scale or math.sqrt(q.shape[-1]))
-    positions = torch.arange(total, device=q.device).unsqueeze(0)
-    scores.masked_fill_(
-        positions >= context_lens.to(q.device).reshape(-1, 1), -float("inf")
-    )
-    logits = torch.full(
-        (batch, max_model_len), -float("inf"), dtype=torch.float32, device=q.device
-    )
-    copy_len = min(total, max_model_len)
-    if copy_len:
-        logits[:, :copy_len] = scores[:, :copy_len]
-    return logits
 
 
 if HAS_TILELANG:
@@ -208,87 +155,6 @@ if HAS_TILELANG:
 
         return kernel
 
-    @tilelang.jit(
-        pass_configs={
-            tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
-            tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-        }
-    )
-    def _tilelang_qsa_mqa_decode_kernel(
-        heads: int,
-        head_dim: int,
-        page_size: int = 64,
-        groups_per_cta: int = 1,
-        num_stages: int = 3,
-        threads: int = 128,
-        dtype: str = "bfloat16",
-    ):
-        # The validated MMA layout wants 64 GEMM rows; pages narrower than
-        # that (full_page // ratio compressed views) are packed in sub-page
-        # quadrants of one 64-row tile.
-        GROUP = 64
-        assert GROUP % page_size == 0, page_size
-        sub_pages = GROUP // page_size
-        batch = T.dynamic("batch")
-        pages = T.dynamic("pages")
-        max_pages = T.dynamic("max_pages")
-        max_model_len = T.dynamic("max_model_len")
-
-        @T.prim_func
-        def kernel(
-            Q: T.Tensor([batch, 1, heads, head_dim], dtype),  # type: ignore
-            KCache: T.Tensor([pages, page_size, 1, head_dim], dtype),  # type: ignore
-            PageTable: T.Tensor([batch, max_pages], T.int32),  # type: ignore
-            ContextLens: T.Tensor([batch], T.int32),  # type: ignore
-            Logits: T.Tensor([batch, max_model_len], T.float32),  # type: ignore
-            Scale: T.float32,
-        ):
-            with T.Kernel(
-                batch,
-                T.ceildiv(T.ceildiv(max_pages, sub_pages), groups_per_cta),
-                threads=threads,
-            ) as (bx, group_block):
-                q_shared = T.alloc_shared([heads, head_dim], dtype)
-                k_shared = T.alloc_shared([GROUP, head_dim], dtype)
-                scores = T.alloc_fragment([GROUP, heads], T.float32)
-                reduced = T.alloc_fragment([GROUP], T.float32)
-                T.copy(Q[bx, 0, :, :], q_shared)
-                context_len = ContextLens[bx]
-
-                for gi in T.Pipelined(groups_per_cta, num_stages=num_stages):
-                    group = group_block * groups_per_cta + gi
-                    if group * GROUP < context_len:
-                        # Python-level unroll: sub_pages is a compile-time
-                        # constant and TileLang's pipeliner rejects dynamic
-                        # inner loops around shared-memory copies.
-                        for sp in range(sub_pages):
-                            if (group * sub_pages + sp) * page_size < context_len:
-                                T.copy(
-                                    KCache[
-                                        PageTable[bx, group * sub_pages + sp],
-                                        :,
-                                        0,
-                                        :,
-                                    ],
-                                    k_shared[sp * page_size : (sp + 1) * page_size, :],
-                                )
-                        T.gemm(
-                            k_shared,
-                            q_shared,
-                            scores,
-                            transpose_B=True,
-                            clear_accum=True,
-                            policy=T.GemmWarpPolicy.FullCol,
-                        )
-                        for token, head in T.Parallel(GROUP, heads):
-                            scores[token, head] = T.max(scores[token, head], 0.0)
-                        T.reduce_sum(scores, reduced, dim=1, clear=True)
-                        for token in T.Parallel(GROUP):
-                            position = group * GROUP + token
-                            if position < context_len:
-                                Logits[bx, position] = reduced[token] / Scale
-
-        return kernel
 
 
 def tilelang_qsa_mqa_prefill(
@@ -345,64 +211,6 @@ def tilelang_qsa_mqa_prefill(
     return logits
 
 
-def tilelang_qsa_mqa_decode(
-    q: torch.Tensor,
-    k_cache: torch.Tensor,
-    page_table: torch.Tensor,
-    context_lens: torch.Tensor,
-    max_model_len: int,
-    score_scale: Optional[float] = None,
-) -> torch.Tensor:
-    """Validated TileLang paged decode kernel with weights removed."""
-
-    if not HAS_TILELANG:
-        raise RuntimeError("TileLang is unavailable")
-    _validate_decode_inputs(q, k_cache, page_table, context_lens)
-    page_size = int(k_cache.shape[1])
-    # SM70 fork: the model's KV page is 16 and the QSA compress ratio is 4,
-    # so the compressed page is 4; sub-page packing supports any divisor of
-    # the 64-row GEMM tile (4/8/16/32/64).
-    if page_size < 4 or 64 % page_size != 0:
-        raise ValueError(
-            "TileLang QSA decode requires a compressed page size of "
-            f"4/8/16/32/64 (64-row GEMM sub-page packing), got {page_size}"
-        )
-    logits = torch.full(
-        (q.shape[0], max_model_len),
-        -float("inf"),
-        dtype=torch.float32,
-        device=q.device,
-    )
-    if not q.shape[0] or not max_model_len:
-        return logits
-    # The validated MMA layout requires N (the Q-head dimension) to be a
-    # multiple of eight; the SM70 (V100) MMA path additionally needs a
-    # multiple of 16. Zero-padding preserves the weight-free head sum.
-    query_heads, head_dim = q.shape[1:]
-    align = 16 if get_device_capability(q.device.index)[0] < 8 else 8
-    kernel_heads = max(align, ((query_heads + align - 1) // align) * align)
-    dtype = _qsa_mqa_kernel_dtype(q.device)
-    torch_dtype = torch.float16 if dtype == "float16" else torch.bfloat16
-    q_kernel = q.to(torch_dtype)
-    if kernel_heads != query_heads:
-        q_kernel = torch.cat(
-            [
-                q_kernel,
-                q_kernel.new_zeros(q.shape[0], kernel_heads - query_heads, head_dim),
-            ],
-            dim=1,
-        )
-    _tilelang_qsa_mqa_decode_kernel(
-        heads=kernel_heads, head_dim=head_dim, page_size=page_size, dtype=dtype
-    )(
-        q_kernel.unsqueeze(1).contiguous(),
-        k_cache.to(torch_dtype).contiguous(),
-        page_table.to(device=q.device, dtype=torch.int32).contiguous(),
-        context_lens.to(device=q.device, dtype=torch.int32).contiguous(),
-        logits,
-        float(score_scale or math.sqrt(head_dim)),
-    )
-    return logits
 
 
 def qsa_mqa_prefill(
@@ -417,51 +225,11 @@ def qsa_mqa_prefill(
     return torch_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
 
 
-def qsa_mqa_decode(
-    q: torch.Tensor,
-    k_cache: torch.Tensor,
-    page_table: torch.Tensor,
-    context_lens: torch.Tensor,
-    max_model_len: int,
-    score_scale: Optional[float] = None,
-) -> torch.Tensor:
-    if (
-        q.is_cuda
-        and get_device_capability(q.device.index) == (7, 0)
-        and q.dtype == torch.float16
-        and q.shape[0] > 0
-        and q.shape[1:] == (4, 128)
-        and k_cache.dtype == torch.float16
-        and k_cache.ndim == 4
-        and k_cache.shape[1:] == (4, 1, 128)
-    ):
-        from sglang_v100_lite.tilelang_attention._decode_cuda import (
-            sm70_cuda_qsa_indexer_decode,
-        )
-
-        return sm70_cuda_qsa_indexer_decode(
-            q,
-            k_cache,
-            page_table,
-            context_lens,
-            max_model_len,
-            score_scale or math.sqrt(q.shape[-1]),
-        )
-    if q.is_cuda and HAS_TILELANG:
-        return tilelang_qsa_mqa_decode(
-            q, k_cache, page_table, context_lens, max_model_len, score_scale
-        )
-    return torch_qsa_mqa_decode(
-        q, k_cache, page_table, context_lens, max_model_len, score_scale
-    )
 
 
 __all__ = [
     "HAS_TILELANG",
-    "qsa_mqa_decode",
     "qsa_mqa_prefill",
-    "tilelang_qsa_mqa_decode",
     "tilelang_qsa_mqa_prefill",
-    "torch_qsa_mqa_decode",
     "torch_qsa_mqa_prefill",
 ]
