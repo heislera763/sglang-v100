@@ -3,172 +3,217 @@
 Mainline base: `fc9bdc8a3e60a0896e58d84ac261cc470ab4a24c`.
 Original V100 reference: `dca488908ee4e3f1bc676c3bf5dcd26ff049cfc3`.
 
-## Scope and installation
+## Use
 
-This opt-in profile serves the existing RadixArk Qwen3.8 Flash Next NVFP4 checkpoint
-on **9001, GPUs 0–3, NUMA node 0**, with TP4, MTP and one request slot. Port 9000,
-GPUs 4–7, the original fork, its environment and its launchers stay untouched.
-No Docker, model copies, downloads or compatibility links are required.
-
-Run `bash v100_lite/setup.sh` once. It creates the uv environment and builds the
-SM70 native extensions. Run `./sglang-server.sh` to serve; the launcher installs
-nothing and only accepts port 9001. The installed service is
-`sglang-openai-9001.service`. The launcher uses FP16, page-64 E5M2 KV, pinned CPU
-PLE, SDPA vision, TP4/MTP and one-slot settings. Model storage remains:
+This opt-in profile serves the existing RadixArk Qwen3.8 Flash Next NVFP4
+checkpoint on **9001, GPUs 0–3, NUMA node 0**, using TP4, MTP and one request
+slot. Production port 9000 and GPUs 4–7 are outside this project.
+There are no Docker requirements, model downloads, copies or compatibility links.
+Model storage remains:
 `/home/alexander/.llama-server/models/sglang/RadixArk-Qwen3.8-Flash-Next-NVFP4`.
 
-## Small maintenance surface
+Run `bash v100_lite/setup.sh` once to create the uv environment and build native
+extensions. Run `./sglang-server.sh` to serve. The launcher installs nothing and
+accepts only port 9001. The installed service is `sglang-openai-9001.service`.
+The profile uses FP16, page-64 E5M2 KV, pinned CPU PLE, SDPA vision,
+a 262,144-token total context limit, and an 8,192-token prefill chunk.
 
-The reduction removes the copied native source/header/Python-SDK tree. The AOT
-profile compiles 18 existing mainline/dependency translation units plus a small
-operator registry, and packages mainline's existing `sgl_kernel` Python SDK.
-Unused CPU, HIP, FP8, GPTQ and QServe copies are gone. The native build has 19
-compilation/link steps rather than 48. Its package version is `0.4.8+v100`; the
-uv override reconciles this with mainline's older 0.4.7 dependency pin.
+## Maintenance surface
 
-Runtime adapters and 22 required hook registrations live in one `runtime.py`.
-GEMV and small GEMM share `kernels/gemm.py`. Uncalled projection-fusion wrappers
-and their CUDA headers were removed. Quantization, QSA, PLE and the substantial
-GDN kernels remain separate because they own distinct implementations.
-Imported-source hashes and merged-source origins remain in `v100_lite/provenance.json`.
+The tracked diff against the base is **48 files, 9,387 added lines and two
+removed lines**, versus 171 files / 42,743 added lines before reduction and
+56 files / 11,740 at the start of this pass. About 5,000 lines are runtime/kernel
+implementation and 2,694 are the reproducibility lock. Combining files alone
+does not remove complexity; unreachable implementations and experimental
+branches were actually deleted.
 
-Five existing mainline Python files have small changes:
+Five existing mainline Python files change, totaling **55 added and two removed
+lines**. Three preserve exact server timing counters and optional timing-only
+SSE chunks for Pi; EAGLE avoids importing unused optional DeepSeek backends;
+GDN adds a default-off constexpr and state reload, totaling three added lines.
+The SM70 plugin enables this specialized fix for low-precision sequential MTP
+verification. Mainline already supports xhigh; there is no xhigh patch.
 
-- Three preserve the opt-in Pi API contract: server timings and timing-only SSE chunks.
-- EAGLE defers optional DeepSeek imports when the known backend already matches.
-- GDN adds a default-off constexpr and a state reload: **three added lines**.
-  Only the SM70 plugin enables it for sequential low-precision verification.
-  This preserves the specialized FP16 MTP rounding fix while removing its
-  568-line copied kernel. Ordinary mainline execution retains the default-off path.
+The AOT profile compiles 17 existing upstream/dependency translation units and
+a small operator registry, then packages the unchanged mainline `sgl_kernel`
+SDK. The copied native tree is gone. There are 19 compilation/link steps versus
+48 before the reduction. The package is `sglang-kernel==0.4.8+v100`.
+Marlin's three adjustments are consolidated into one patch at a pinned revision.
 
-Mainline already supports xhigh and passes it to the checkpoint's template;
-there is no xhigh patch. Required hooks must all install before serving begins.
-Default plugin registration imports no runtime or kernels.
+The opt-in integration and 23 required hooks live in `runtime.py`.
+Quantization, QSA dispatch and PLE each have one adapter module. GPU code lives
+under `kernels/`; GDN prefill and its interface share one module, as do the
+TileLang attention helpers. Imported-source revisions/hashes remain in
+`v100_lite/provenance.json`. Default registration imports no runtime or kernels;
+missing required hooks stop startup. Custom GDN dispatch requires the explicit
+`tilelang_v100` choice. Non-mutating GDN scoring is rejected rather than silently
+modifying state.
 
-## Collected performance
+Removed alternatives include packed GDN prefill/decode that mainline never
+called, experimental GDN schedules, duplicate MQA decode, unused QPN8 code,
+ordinary paged CUDA attention beside QSA, and separate cache-registration glue.
+GDN prefill shrank from 2,258 lines in two files to approximately 675 lines in
+one module. Runtime scheduling, QSA metadata, model definitions, decode/verify
+kernels and checkpoint loading remain mainline implementations.
 
-Same checkpoint and local PCIe hardware, TP4/MTP, FP16, E5M2, pinned CPU PLE,
-one slot, greedy sampling, uncached 1K/8K/25K input and 1024 output tokens.
-A 256-output-token warmup is excluded at each prompt length. PP is exact prompt
-count divided by server-measured dispatch-to-first-token time; TG uses server
-output counts and decode elapsed time. These are server measurements, not
-GPU-kernel-only timings or client clock estimates.
+This is substantially smaller and more compartmentalized, but it is a scoped
+Qwen TP4 serving profile, not general Volta support for every mainline model.
+Most remaining custom complexity is GPU math that Volta needs or benefits from.
+Its ownership is explicit; GPU reference coverage improves confidence without
+proving broad model accuracy or eliminating every inherited assumption.
 
-| Prompt tokens | Fork PP | Lite before PP | Reduced PP | Fork TG | Lite before TG | Reduced TG | Reduced repeats |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1,000 | 1776.2 | 1740.5 | 1724.1 | 93.99 | 81.93 | 81.87 | 3 |
-| 8,192 | 2130.9 | 2011.1 | 1986.9 | 92.51 | 84.76 | 84.24 | 3 |
-| 25,000 | 2008.7 | 1978.1 | 1960.3 | 90.34 | 82.78 | 80.96 | 1 |
+## Performance and comparison
 
-Rates are tokens/s. Fork and lite-before have three repeats at every length.
-**Benchmarking was stopped at the user's request.** Reduced 1K/8K have three
-repeats; the 25K reduced result is one completed measurement, not a median of three.
-No performance probes were run after the stop request.
+The before/after runs use the same local checkpoint, GPUs, one request slot,
+TP4/MTP, greedy sampling, uncached 1K/8K/25K inputs and 1,024 output tokens.
+Each length has a 256-output-token warmup followed by three measurements.
+PP is exact prompt count divided by server dispatch-to-first-token elapsed time;
+TG uses server output counters and decode elapsed time. These include server
+overhead and are not pure GPU compute rates.
 
-At 1K/8K, reduction changes TG by less than 1% and PP by about 1% compared with
-lite-before. It does not recover the existing fork-to-mainline performance gap.
-Reduced verification cycles are 29.29/29.51 ms at 1K/8K, versus fork
-26.97/27.19 ms. Different draft acceptance adds a separate source of TG variation.
+| Input tokens | Lite before PP | Lite now PP | Fork PP | Lite before TG | Lite now TG | Fork TG |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1,000 | 1730.0 | 1719.0 | 1776.5 | 82.08 | 92.41 | 93.16 |
+| 8,192 | 1996.3 | 1979.3 | 1754.9 | 82.99 | 90.74 | 90.85 |
+| 25,000 | 1961.5 | 1944.2 | 1885.3 | 84.64 | 90.06 | 88.42 |
 
-The comparison has material differences: lite uses page 64/compressed page 16
-and static memory fraction 0.88, versus fork page 16/compressed page 4 and 0.80.
-Lite respects the checkpoint's sparse-selection budget above 2048 tokens;
-the original fork uses dense first-chunk attention through 8192. Thus 8K/25K
-are deployment comparisons, not identical attention work or identical outputs.
-Native reductions can change FP16 accumulation order slightly; reference checks
-pass, but this is not a broad model-accuracy evaluation.
+Rates are tokens/s; each cell is the median of three completed measurements.
 
-## Why throughput differs
+TG improves **12.6%, 9.3% and 6.4%** at 1K/8K/25K versus the fresh
+lite-before run. PP changes by -0.64%, -0.85% and -0.88%; these small observed
+differences do not establish a statistically significant regression. Relative
+to the matched fork, TG is -0.8%, -0.1% and +1.9%; PP is -3.2%, +12.8% and
++3.1%. Draft acceptance changes too, so these are useful deployment comparisons,
+not proof of identical logits or an isolated speedup for either new hook.
 
-Rank-0 CPU/GPU traces were collected for the fork and lite-before, separately
-for prefill and decode. Prefill captures include first-token speculative work.
-Profiles establish different execution paths; their overhead and collective
-waiting mean raw GPU durations cannot simply be added to explain request latency.
+The fresh fork uses a uv venv with read-only access to the original package set;
+Torch binary hashes and all recorded package versions match the original Conda
+environment. This checks invocation/package parity without another dependency
+download. uv alone does not change GPU math. The baseline uses the same page
+size, sparse cutoff, prefill chunk, sampling backend, CPU affinity and preferred
+NUMA node. It needs static memory fraction **0.80**, versus lite's **0.88**:
+the first attempt at 0.88 ran out of CUDA memory at 25K after passing 1K/8K.
+Its failed results are retained and excluded from the completed comparison.
+Thus serving memory layouts and native implementations still differ.
 
-| Decode kernel/path | Fork average GPU duration | Lite average GPU duration | Evidence |
+Earlier old-fork defaults used dense no-prefix prefill through 8K. Both current
+comparison launches cap that shortcut at the checkpoint's 2,048-token selection
+budget. Above that, dense and sparse attention perform different computation;
+changing the cutoff for speed is not an innocuous tuning choice.
+
+The original [README](https://github.com/haohervchb/sglang-V100/blob/dca488908ee4e3f1bc676c3bf5dcd26ff049cfc3/README.md)
+reports **measured NVLink** results, not theoretical limits: MTP-3/4 gives
+117.55/119.84 TG and 3,269/4,693 client-measured PP at 1K/25K. The fresh local
+fork gives 93.15/88.42 client TG and 1,762.79/1,883.35 client PP; lite gives
+92.40/90.05 and 1,704.47/1,942.31. Thus this host does not reproduce those
+NVLink numbers. Hardware, custom-all-reduce choice, chunk size, dense cutoff,
+software paths and acceptance differ; the entire gap cannot be assigned to
+NVLink alone. The local fork's 1K result is within 1% of its earlier local run.
+Longer-prompt differences also reflect the corrected sparse cutoff.
+
+## Why retain custom kernels?
+
+Mainline Triton GDN prefill runs correctly on SM70. Independent FP32 sequential
+recurrence agrees for non-aligned variable-length sequences, nonzero indexed
+FP16 state, outputs and checkpoints. However, CUDA graph microbenchmarks of
+the TP4 shape measured **10.35 versus 1.25 ms at 1K**, and **77.44 versus
+3.23 ms at 8K**, for mainline versus the custom TileLang path. These isolated
+kernel-path measurements are not whole-model speedups. Keeping the active
+custom schedule is justified by measured cost, rather than an assumption that
+mainline cannot run on V100.
+
+Earlier decode profiles identified mainline's larger GDN verification tile and
+slower unified router. The profile now selects **BV=8** for the exact single-slot
+TP4 FP16 verification shape and routes eligible top-10/512-expert calls through
+the already-retained native kernel. Other contracts use mainline. This adds
+two bounded dispatch changes and no further mainline edits or copied kernels.
+
+Previous profiles also found a fused QKVZ/BA projection in the old fork versus
+separate projections/layout work in lite. Uncalled copies of that fusion were
+removed; adapting an active model boundary is future work. Raw profiler kernel
+durations cannot be summed to explain end-to-end latency because collectives
+wait and profiling adds overhead.
+
+| Decode evidence | Fork | Lite before tuning | Interpretation |
 | --- | ---: | ---: | --- |
-| Top-10 router | 7.65 us | 29.69 us | Fork native radix router versus mainline Triton router |
-| FP16 GDN verification | 14.56 us | 35.19 us | Fork chooses BV=8 for the TP4 MTP shape; lite uses mainline BV=32 |
-| GDN projection | One fused QKVZ/BA kernel | Separate small GEMMs and layout work | Fork model dispatch calls its SM70 fusion; lite's copied wrappers were never called |
-| NCCL all-reduce | 117.57 us | 55.69 us | Collective waits and profiling differ; this does not demonstrate a PCIe regression |
+| Router average | 7.65 us | 29.69 us | Different native/Triton implementations |
+| GDN verify average | 14.56 us | 35.19 us | Different value tiles and launch grids |
+| NCCL all-reduce average | 117.57 us | 55.69 us | Includes waiting; not proof of a PCIe bandwidth change |
 
-The original BV=8 tuning launches 192 CTAs rather than 48 for this shape,
-reducing register pressure and exposing more parallel work. Restoring this tuning
-and the router dispatch are small, concrete follow-up candidates. Restoring the
-projection fusion requires adapting the current model boundary; retaining unused
-copies alone provides no speed benefit. These are observed path differences and
-plausible contributors, not isolated end-to-end speedup measurements.
+| Overlap opportunity | Evidence needed |
+| --- | --- |
+| Collective/compute overlap | Same-iteration multi-rank capture with minimal profiling overhead |
 
-| Overlap opportunity | Confidence | Next discriminating measurement |
-| --- | --- | --- |
-| Collective/compute overlap | Unproven from these individual traces | Same-iteration multi-rank trace without stack-capture overhead |
+| Fusion candidate | Maintenance cost |
+| --- | --- |
+| QKVZ/BA projection plus layout | Adapt the current projection boundary; avoid copying another model class |
 
-| Fusion candidate | Current evidence | Maintenance implication |
-| --- | --- | --- |
-| QKVZ/BA projection plus output layout | Original fork uses its fused kernel; mainline separates projections | Requires a hook at the current projection boundary, not an unused file copy |
-| Expert routing | Mainline router is slower per profiled call | Existing SM70 top-10 kernel can be considered through an opt-in hook |
+## Torch, CUDA and NUMA
 
-PCIe communication remains a substantial part of prefill: NCCL all-reduce is
-about 55–59% of profiled GPU kernel time for both runtimes. That is collective
-execution/wait time, not a direct PCIe bandwidth measurement. Both baselines use
-this host's non-NVLink configuration. Kernel choice, launch overhead, software
-version and speculative acceptance must be separated from hardware limits.
+Torch **2.13.0/cu126**, Triton **3.7.1**, and the CUDA **12.9 compiler** execute
+this profile. The old package set is Torch **2.9.1/cu128**, Triton **3.5.1**, and
+CUDA **12.8**. Runtime libraries packaged with Torch and the extension compiler
+are separate choices; actual SM70 compilation and execution pass.
 
-## Validation and context
+Identical-source, warmed GPU microbenchmarks compared the old and new stacks
+with the same CUDA 12.9 assembler. FP16 GEMM samples at M=1/4/1024 were
+25.92/32.27/163.27 us on the old stack and 26.22/32.25/162.61 us on the new one.
+Both use Volta cuBLAS kernels. The same BV=8 GDN verify source measured
+10.29 versus 8.74 us. Clocks were observed, not locked; these bounded samples
+show no large GEMM penalty from cu126 but do not isolate CUDA, Torch, Triton
+or NCCL individually. In particular NCCL is 2.27.5 versus 2.29.3. They do not
+justify another multi-gigabyte wheel download or a stack change without a
+controlled whole-model comparison.
 
-The reduced native package imports and passes exact E5M2 byte comparisons, MoE
-padding guard-word checks, NVFP4 MoE decode/prefill dequantized references,
-dense/sparse attention references with permuted physical pages, and four-step
-FP16 MTP versus sequential decode. Twenty mainline hook-registry tests pass.
-Both consolidation commits reproduce byte-for-byte from their parents.
+Both launches use `numactl --cpunodebind=0 --preferred=0`, with worker CPU masks
+`0-21,44-65`. During measured operation, lite workers had 0.15-0.16% resident
+memory on node 1, versus 2.58-3.96% for the fork. This is a placement observation,
+not a controlled NUMA speedup. Prefer-node policy is retained: strict binding
+was not benchmarked, and would remove fallback under node-0 memory pressure.
+Library/file pages can already reside on another node despite the process policy.
 
-The server loads the target and MTP models and completes generation at 1K, 8K
-and 25K. Earlier full API replay established xhigh, images, tools, tokenization
-and live server timings; those API integration edits remain unchanged. That full
-API replay was not repeated during this reduction pass. Current allocated KV
-capacity is 465,792 tokens and the advertised total context limit is 262,144.
-Two earlier 200K-input requests passed; 200K and the full 262K boundary were not
-retested in this pass.
+Torch 2.9.1/cu128 is not the last usable V100 combination. PyTorch's official
+[2.11 packaging notice](https://dev-discuss.pytorch.org/t/dropping-volta-support-from-cuda-12-8-binaries-for-release-2-11/3290)
+retains Volta in cu126 while removing it from newer wheel variants. Its
+[2.15 packaging notice](https://dev-discuss.pytorch.org/t/notice-cuda-12-6-wheels-will-no-longer-be-published-from-pytorch-2-15-drops-maxwell-pascal-volta/3432)
+identifies **2.14/cu126** as the final prebuilt Volta option; it has not been
+tested here. [CUDA 13](https://docs.nvidia.com/cuda/archive/13.0.0/cuda-toolkit-release-notes/index.html)
+removes offline compilation support for older architectures. A later Torch
+source build against CUDA 12.x is a separate investigation.
 
-Retained validation entry points are `v100_lite/tests/gpu_checks.py`,
-`smoke.py` and `benchmark.py`. `smoke.py --disabled-plugin` verifies the default-off
-contract without server inference. `smoke.py --tag NAME` exercises the 9001 API.
-The opt-in streaming field `return_timing_metrics: true` emits server counters,
-TTFT and live decode rates under `sglext.timing_metrics` for the existing Pi extension.
-Raw results, sanitized settings, traces, proofs and logs are consolidated under
-ignored `artifacts/reduction/`; historical evidence remains in `artifacts/`.
+## Validation and next refinements
 
-## CUDA / Torch support findings
+GPU references pass exact E5M2 byte conversion, MoE padding guard words,
+NVFP4 decode/prefill against dequantized weights, router ids/ties/weights against
+Torch and mainline, dense SDPA and sparse selected-row attention with permuted
+pages, compressed page sizes 4/16, FP16 MTP versus sequential decode, and GDN
+outputs/state/checkpoints versus independent FP32 recurrence. Twenty mainline
+hook-registry tests pass. Module and patch consolidation reproduce byte-for-byte.
+The default-off plugin check also passes.
 
-Do not treat the working Torch 2.9.1 + CUDA 12.8 installation as the final
-V100-capable PyTorch release. CUDA toolkit support, PyTorch wheel architectures,
-and inference-kernel support are separate constraints.
+The final API replay passes text, Qwen sampling, xhigh, tokenization, an image,
+a tool call/result roundtrip and live server timing counters. The server remains
+on 9001 with 465,792 allocated KV tokens and a 262,144-token total context limit.
+This pass measures up to 25K input; earlier 200K-input requests passed before
+this pass, and the full context boundary was not retested. Production PID
+416531 remains unchanged; the temporary fork service and checkout are removed.
 
-| Candidate | Volta support evidence | Local execution |
-| --- | --- | --- |
-| Torch 2.9.1 + cu128 | Existing wheel includes sm_70 | CUDA arithmetic, FP16 GEMM and Triton 3.5.1 pass |
-| Torch 2.10 + cu128/cu129 | Last release before 2.11 removes Volta from these wheel variants | Not tested |
-| Torch 2.13 + cu126 | Official wheel includes sm_70; selected to match mainline's Torch pin | CUDA arithmetic, FP16 GEMM and Triton 3.7.1 pass |
-| Torch 2.14 + cu126 | Officially the last release with a prebuilt Volta wheel | Not tested |
-| Torch 2.15+ standard wheels | cu126 removed; standard wheels drop Volta | Requires investigating a source build |
-| CUDA toolkit 12.9 | Local nvcc lists compute_70 and sm_70 | SM70 AOT library and NVFP4 Marlin build pass; native import, E5M2, dense, MoE and QSA checks pass |
-| CUDA toolkit 13.x | Offline compilation and library support before Turing removed | Unsuitable for the SM70 extension build |
+Three retained validation entry points are `v100_lite/tests/gpu_checks.py`,
+`smoke.py`, and `benchmark.py`. For Pi, `return_timing_metrics: true` emits server
+counts, TTFT and live decode rates under `sglext.timing_metrics`.
+Raw measurements, sanitized settings, numerical checks, environment manifests,
+NUMA snapshots, proofs and logs are consolidated in ignored
+`artifacts/lite-audit/`; older evidence stays in `artifacts/reduction/`.
 
-PyTorch's official [2.11 packaging notice](https://dev-discuss.pytorch.org/t/dropping-volta-support-from-cuda-12-8-binaries-for-release-2-11/3290)
-removes Volta from CUDA 12.8 and 12.9 wheels while retaining it in cu126.
-Its [2.15 packaging notice](https://dev-discuss.pytorch.org/t/notice-cuda-12-6-wheels-will-no-longer-be-published-from-pytorch-2-15-drops-maxwell-pascal-volta/3432)
-identifies 2.14 as the last release providing a prebuilt wheel for Volta.
-The [CUDA 13 release notes](https://docs.nvidia.com/cuda/archive/13.0.0/cuda-toolkit-release-notes/index.html)
-record the removal of older architecture compilation and library support.
+Future work should be small and discriminating:
 
-The profile uses the cu126 **runtime packaged with Torch** and the locally
-installed CUDA 12.9 **compiler**. Those need not be the same minor release,
-but actual compilation and GPU execution must pass. Triton 3.7.1 also passed
-with its bundled CUDA 12.8.93 assembler; replacing it is not required for SM70.
-The serving profile selects CUDA 12.9's ptxas to use the same local toolchain. The driver
-version reported by nvidia-smi is not the CUDA toolkit or Torch runtime version.
-
-Excluded audio and CUDA 13 acceleration packages are outside this Qwen
-text/image serving profile. The profile is not a promise of support for every
-upstream model or optional backend. Re-evaluate the dependency exclusions and
-native build with each upstream update.
+- Benchmark an additional Torch wheel against identical source and a rebuilt
+  native package, separating Triton/cuBLAS/NCCL changes from Python packaging.
+- Profile multi-rank collectives and CPU launch gaps under the existing PCIe
+  topology, then repeat after NVLink arrives.
+- Evaluate QSA/indexer kernel efficiency while preserving the selection budget;
+  verify cached-prefix and context-boundary behavior before expanding support.
+- Expand actual-checkpoint/logprob and scale-distribution accuracy checks for
+  inherited quantization and GDN math; synthetic references are not a quality eval.
+- Consider projection fusion only if its measured gain warrants another hook.
+- Upstream the small generic import/timing/state-precision changes where appropriate.
