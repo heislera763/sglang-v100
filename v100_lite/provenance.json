@@ -25,8 +25,8 @@
   "current_upstream": "fc9bdc8a3e60a0896e58d84ac261cc470ab4a24c",
   "upstream_backports": {"v100_lite/aot/csrc/moe/moe_align_kernel.cu": {"commit": "fc9bdc8a3e60a0896e58d84ac261cc470ab4a24c", "change": "Bound vector padding stores and fill the scalar tail"}},
   "consolidated": {
-    "v100_lite/sglang_v100_lite/kernels/gemm.py": ["python/sglang/jit_kernel/sm70_dense_gemv.py", "python/sglang/jit_kernel/sm70_small_gemm.py"],
-    "v100_lite/sglang_v100_lite/kernels/fusions.py": ["python/sglang/jit_kernel/sm70_qsa_combine.py"],
+    "v100_lite/sglang_v100_lite/kernels/gemm.py": [{"origin": "python/sglang/jit_kernel/sm70_dense_gemv.py", "sha256": "9e789443e39c2dd31ba1ceff8f70a0ff05b9800d8ad342569d2980519eaaf2ed"}, {"origin": "python/sglang/jit_kernel/sm70_small_gemm.py", "sha256": "1a6b11090d154a7094eb7fb1d6e6eaed571140ba7a4477b04f6e28b4b52e2612"}],
+    "v100_lite/sglang_v100_lite/kernels/fusions.py": [{"origin": "python/sglang/jit_kernel/sm70_qsa_combine.py", "sha256": "9defb3b4636ea4c9b7d7b4959965bf580610b1aa72dd913f2b6824fd440f1f67"}],
     "v100_lite/aot/ops.cc": ["mainline common_extension.cc registrations", "reference common_extension.cc speculative registrations"]
   }
 }
