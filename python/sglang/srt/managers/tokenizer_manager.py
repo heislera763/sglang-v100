@@ -242,6 +242,8 @@ class ReqState:
 
     # For performance metrics
     time_stats: APIServerReqTimeStats
+    first_output_completion_tokens: int = 0
+    first_output_arrival_time: float = 0.0
     last_completion_tokens: int = 1
     ttft_observed: bool = False
 
@@ -2602,6 +2604,27 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     or first_output_time
                 )
                 state.time_stats.set_last_time(ts=first_output_time)
+                if not isinstance(recv_obj, BatchEmbeddingOutput):
+                    state.first_output_completion_tokens = recv_obj.completion_tokens[i]
+                    state.first_output_arrival_time = first_output_time
+
+            if self.enable_metrics and not isinstance(recv_obj, BatchEmbeddingOutput):
+                dispatch_time = state.time_stats.api_server_dispatch_finish_time
+                if (
+                    dispatch_time > 0
+                    and state.time_stats.first_token_time > dispatch_time
+                ):
+                    meta_info["server_ttft"] = (
+                        state.time_stats.first_token_time - dispatch_time
+                    )
+                decode_tokens = (
+                    recv_obj.completion_tokens[i] - state.first_output_completion_tokens
+                )
+                decode_seconds = time.perf_counter() - state.first_output_arrival_time
+                if decode_tokens > 0 and decode_seconds > 0:
+                    meta_info["stream_decode_throughput"] = (
+                        decode_tokens / decode_seconds
+                    )
 
             if state.finished:
                 span_attrs = (

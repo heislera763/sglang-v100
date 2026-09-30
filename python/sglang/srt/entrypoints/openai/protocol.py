@@ -450,6 +450,7 @@ class SglExt(BaseModel):
     should be added as fields here rather than directly on the choice object.
     """
 
+    timing_metrics: Optional[Dict[str, float]] = None
     routed_experts: Optional[str] = None
     cached_tokens_details: Optional[CachedTokensDetails] = None
     spec_tokens_details: Optional[Union[SpecTokensDetails, List[SpecTokensDetails]]] = (
@@ -895,6 +896,7 @@ class ChatCompletionRequest(PDRoutingFields):
     return_hidden_states: Union[bool, Literal["last"]] = False
     return_routed_experts: bool = False
     routed_experts_start_len: int = 0
+    return_timing_metrics: bool = False
     return_cached_tokens_details: bool = False
     return_spec_tokens_details: bool = False
     return_prompt_token_ids: bool = False
