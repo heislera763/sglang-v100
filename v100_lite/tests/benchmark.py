@@ -25,6 +25,7 @@ p.add_argument("--lengths", type=int, nargs="+", default=[1000, 8192, 25000])
 p.add_argument("--output-len", type=int, default=1024)
 p.add_argument("--repeats", type=int, default=3)
 p.add_argument("--output-dir", default=".")
+p.add_argument("--model-path", default=os.environ.get("MODEL_PATH"))
 a = p.parse_args()
 root = Path(a.output_dir)
 root.mkdir(parents=True, exist_ok=True)
@@ -32,11 +33,9 @@ out = root / f"{a.tag}_measurements.jsonl"
 assert not out.exists()
 url = "http://127.0.0.1:9001"
 session = requests.Session()
-for line in Path("/home/alexander/.llama-server/.env").read_text().splitlines():
-    if line.startswith("LLAMA_API_KEY="):
-        session.headers["Authorization"] = "Bearer " + line.split("=", 1)[
-            1
-        ].strip().strip("\"'")
+key = os.environ.get("API_KEY") or os.environ.get("LLAMA_API_KEY")
+if key:
+    session.headers["Authorization"] = "Bearer " + key
 
 for _ in range(900):
     try:
@@ -47,11 +46,11 @@ for _ in range(900):
     time.sleep(1)
 else:
     raise RuntimeError("server not ready")
+info_response = session.get(url + "/get_server_info", timeout=60)
+info_response.raise_for_status()
+info = info_response.json()
 tokenizer = AutoTokenizer.from_pretrained(
-    os.environ.get(
-        "MODEL_PATH",
-        "/home/alexander/.llama-server/models/sglang/RadixArk-Qwen3.8-Flash-Next-NVFP4",
-    )
+    a.model_path or info.get("tokenizer_path") or info["model_path"]
 )
 for length in a.lengths:
     for repeat in range(a.repeats + 1):
@@ -86,6 +85,7 @@ for length in a.lengths:
         )
         assert len(ids) == length
         session.post(url + "/flush_cache", timeout=60).raise_for_status()
+        # An empty update resets speculative acceptance counters in mainline.
         session.post(
             url + "/set_internal_state", json={"server_args": {}}, timeout=60
         ).raise_for_status()

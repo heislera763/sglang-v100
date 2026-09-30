@@ -18,9 +18,18 @@ accepts only port 9001. The installed service is `sglang-openai-9001.service`.
 The profile uses FP16, page-64 E5M2 KV, pinned CPU PLE, SDPA vision,
 a 262,144-token total context limit, and an 8,192-token prefill chunk.
 
+Setup defaults to a project-local CUTLASS v4.2.1 checkout; `CUTLASS_DIR` can
+select an existing header tree, and `CUDA_HOME` selects the compiler toolkit.
+The launcher accepts `MODEL_PATH`, `LLAMA_API_KEY`, and `ENV_FILE` overrides.
+Its existing model and credential defaults are relative to `$HOME`.
+Port 9001, GPUs 0–3 and NUMA node 0 remain deliberate constraints of this host's
+test launcher. The deployment unit lives outside Git; the unused copy containing
+absolute host paths was removed. This improves setup portability without claiming
+a generic hardware configuration or support for additional model families.
+
 ## Maintenance surface
 
-The tracked diff against the base is **48 files, 9,387 added lines and two
+The tracked diff against the base is **47 files, 9,372 added lines and two
 removed lines**, versus 171 files / 42,743 added lines before reduction and
 56 files / 11,740 at the start of this pass. About 5,000 lines are runtime/kernel
 implementation and 2,694 are the reproducibility lock. Combining files alone
@@ -201,6 +210,14 @@ this pass, and the full context boundary was not retested. Production PID
 Three retained validation entry points are `v100_lite/tests/gpu_checks.py`,
 `smoke.py`, and `benchmark.py`. For Pi, `return_timing_metrics: true` emits server
 counts, TTFT and live decode rates under `sglext.timing_metrics`.
+Authenticated API checks use exported `API_KEY` or `LLAMA_API_KEY`; they do not
+read private credential files. Smoke replay needs no artifact directory unless
+`--tag` is supplied. Benchmark tokenizer discovery uses the server configuration,
+with `--model-path` or `MODEL_PATH` as an explicit override.
+One overlapping plain-text request and duplicate GPU-test setup/count assertions
+were removed. All numerical reference cases remain: the dtype, shape, page-size
+and checkpoint variants exercise different supported paths. The empty benchmark
+state update remains because it resets speculative acceptance counters.
 Raw measurements, sanitized settings, numerical checks, environment manifests,
 NUMA snapshots, proofs and logs are consolidated in ignored
 `artifacts/lite-audit/`; older evidence stays in `artifacts/reduction/`.

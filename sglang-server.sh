@@ -21,10 +21,10 @@ export SGLANG_V100_MARLIN_DIR="$PWD/artifacts/marlin-v100/vllm"
 export SGLANG_SM70_DENSE_GEMV=1
 export SGLANG_MAMBA_CONV_DTYPE=float16 SGLANG_MAMBA_SSM_DTYPE=float16
 if [[ -z ${LLAMA_API_KEY:-} ]]; then
-    set -a; source /home/alexander/.llama-server/.env; set +a
+    set -a; source "${ENV_FILE:-$HOME/.llama-server/.env}"; set +a
 fi
 : "${LLAMA_API_KEY:?LLAMA_API_KEY is required}"
-model=${MODEL_PATH:-/home/alexander/.llama-server/models/sglang/RadixArk-Qwen3.8-Flash-Next-NVFP4}
+model=${MODEL_PATH:-$HOME/.llama-server/models/sglang/RadixArk-Qwen3.8-Flash-Next-NVFP4}
 exec numactl --cpunodebind=0 --preferred=0 .venv/bin/python -m sglang_v100_lite \
   --model-path "$model" --served-model-name "${SGLANG_SERVED_MODEL_NAME:-qwen3.8-flash-next-radixark-nvfp4}" \
   --trust-remote-code --host 0.0.0.0 --tensor-parallel-size 4 \

@@ -1,6 +1,6 @@
 """Exercise the 9001 API contract; never access production port 9000."""
 
-import argparse, base64, io, json
+import argparse, base64, io, json, os
 from pathlib import Path
 import requests
 from PIL import Image
@@ -10,22 +10,18 @@ p.add_argument("--tag")
 p.add_argument("--disabled-plugin", action="store_true")
 args = p.parse_args()
 if args.disabled_plugin:
-    import os, sys
+    import sys
     os.environ.pop("SGLANG_V100_LITE", None)
     import sglang_v100_lite
     sglang_v100_lite.register()
     assert "sglang_v100_lite.runtime" not in sys.modules
     print("Plugin disabled: no runtime or kernel imports")
     raise SystemExit(0)
-if not args.tag:
-    p.error("--tag is required for the API replay")
 root = Path(__file__).resolve().parents[2]
 s = requests.Session()
-for line in Path("/home/alexander/.llama-server/.env").read_text().splitlines():
-    if line.startswith("LLAMA_API_KEY="):
-        s.headers["Authorization"] = "Bearer " + line.split("=", 1)[1].strip().strip(
-            "\"'"
-        )
+key = os.environ.get("API_KEY") or os.environ.get("LLAMA_API_KEY")
+if key:
+    s.headers["Authorization"] = "Bearer " + key
 url = "http://127.0.0.1:9001"
 results = {}
 
@@ -55,12 +51,6 @@ results["models"] = model
 results["tokenize"] = post(
     "/tokenize", {"prompt": "What is six times seven?", "reasoning_effort": "xhigh"}
 )
-results["text"] = chat(
-    [{"role": "user", "content": "Answer with only the number: six times seven."}]
-)
-assert "42" in (results["text"]["choices"][0]["message"].get("content") or ""), results[
-    "text"
-]
 results["sampling"] = chat(
     [{"role": "user", "content": "Answer with only the number: six times seven."}],
     temperature=0.6,
@@ -157,12 +147,13 @@ assert any(x.get("server_ttft", 0) > 0 for x in chunks), chunks
 assert any(x.get("stream_decode_throughput", 0) > 0 for x in chunks), chunks
 assert all("prompt_tokens" in x and "completion_tokens" in x for x in chunks), chunks
 results["stream_timings"] = chunks
-(root / "artifacts" / f"{args.tag}-smoke.json").write_text(
-    json.dumps(results, indent=2) + "\n"
-)
+if args.tag:
+    output = root / "artifacts" / f"{args.tag}-smoke.json"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(results, indent=2) + "\n")
 print(
     "PASS",
     args.tag,
     model,
-    "text, sampling, xhigh, tokenize, image, tool roundtrip, streaming server timing fields",
+    "sampling, xhigh, tokenize, image, tool roundtrip, streaming server timing fields",
 )
