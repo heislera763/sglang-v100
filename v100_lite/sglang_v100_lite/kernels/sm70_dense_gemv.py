@@ -7,7 +7,7 @@ import torch
 from sglang_v100_lite.kernels.utils import cache_once, load_jit
 
 # (output features, input features) -> (threads, lanes per row, vector width).
-_CONFIGS = {
+_DENSE_CONFIGS = {
     (4096, 2560): (64, 16, 8),
     (3584, 2560): (64, 32, 8),
     (2560, 1536): (128, 32, 8),
@@ -44,7 +44,7 @@ def supported(x: torch.Tensor, weight: torch.Tensor, bias=None) -> bool:
             (
                 x.shape[0] == 1
                 and (
-                    tuple(weight.shape) in _CONFIGS
+                    tuple(weight.shape) in _DENSE_CONFIGS
                     or (weight.shape[1] == 2560 and weight.shape[0] >= 32768)
                 )
             )
@@ -55,7 +55,7 @@ def supported(x: torch.Tensor, weight: torch.Tensor, bias=None) -> bool:
 
 
 @cache_once
-def _module(threads: int, lanes: int, vector: int):
+def _dense_module(threads: int, lanes: int, vector: int):
     return load_jit(
         "sm70_dense_gemv",
         threads,
@@ -68,12 +68,12 @@ def _module(threads: int, lanes: int, vector: int):
     )
 
 
-def linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+def linear_dense(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     if x.shape[0] != 1:
-        from sglang_v100_lite.kernels.sm70_small_gemm import linear as small_linear
+        from sglang_v100_lite.kernels.sm70_small_gemm import linear_small as small_linear
 
         return small_linear(x, weight)
-    config = _CONFIGS.get(tuple(weight.shape), (64, 32, 8))
+    config = _DENSE_CONFIGS.get(tuple(weight.shape), (64, 32, 8))
     out = torch.empty((1, weight.shape[0]), dtype=x.dtype, device=x.device)
-    _module(*config).gemv(x, weight, out)
+    _dense_module(*config).gemv(x, weight, out)
     return out

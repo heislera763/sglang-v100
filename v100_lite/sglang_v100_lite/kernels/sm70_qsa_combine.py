@@ -6,7 +6,7 @@ from sglang_v100_lite.kernels.utils import cache_once, load_jit
 
 
 @cache_once
-def _module():
+def _combine_module():
     return load_jit(
         "sm70_qsa_combine",
         cuda_files=["elementwise/sm70_qsa_combine.cuh"],
@@ -18,5 +18,5 @@ def combine(partial, lse, lengths, selected_tokens, tokens_per_split=32):
     output = torch.empty(
         (partial.shape[0], 6, 256), dtype=partial.dtype, device=partial.device
     )
-    _module().combine(partial, lse, lengths, output, selected_tokens, tokens_per_split)
+    _combine_module().combine(partial, lse, lengths, output, selected_tokens, tokens_per_split)
     return output

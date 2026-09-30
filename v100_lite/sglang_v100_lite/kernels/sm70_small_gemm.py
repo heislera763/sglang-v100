@@ -8,7 +8,7 @@ from sglang_v100_lite.kernels.utils import cache_once, load_jit
 
 # (rows, output features, input features) -> (threads, lanes per output).
 # Shapes where cuBLAS is faster deliberately stay on the existing path.
-_CONFIGS = {
+_SMALL_CONFIGS = {
     (2, 24, 2560): (64, 32),
     (2, 640, 2560): (256, 32),
     (2, 1, 2560): (64, 32),
@@ -36,12 +36,12 @@ _CONFIGS = {
 def shape_supported(x, weight):
     return (
         os.environ.get("SGLANG_SM70_MTP_SMALL_GEMM", "1") == "1"
-        and (x.shape[0], *weight.shape) in _CONFIGS
+        and (x.shape[0], *weight.shape) in _SMALL_CONFIGS
     )
 
 
 @cache_once
-def _module(rows, threads, lanes):
+def _small_module(rows, threads, lanes):
     return load_jit(
         "sm70_small_gemm",
         rows,
@@ -54,8 +54,8 @@ def _module(rows, threads, lanes):
     )
 
 
-def linear(x, weight):
-    threads, lanes = _CONFIGS[(x.shape[0], *weight.shape)]
+def linear_small(x, weight):
+    threads, lanes = _SMALL_CONFIGS[(x.shape[0], *weight.shape)]
     out = torch.empty((x.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device)
-    _module(x.shape[0], threads, lanes).run(x, weight, out)
+    _small_module(x.shape[0], threads, lanes).run(x, weight, out)
     return out

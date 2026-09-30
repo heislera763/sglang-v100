@@ -142,11 +142,11 @@ def install():
         Qwen4ExpPinnedHostEmbedding,
         HookType.REPLACE,
     )
-    from .linear import apply
+    from .linear import apply_unquant
 
     HookRegistry.register(
         "sglang.srt.layers.quantization.unquant.UnquantizedLinearMethod.apply",
-        apply,
+        apply_unquant,
         HookType.AROUND,
     )
     global REQUIRED_HOOKS
