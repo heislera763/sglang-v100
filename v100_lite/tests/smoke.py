@@ -6,8 +6,19 @@ import requests
 from PIL import Image
 
 p = argparse.ArgumentParser()
-p.add_argument("--tag", required=True)
+p.add_argument("--tag")
+p.add_argument("--disabled-plugin", action="store_true")
 args = p.parse_args()
+if args.disabled_plugin:
+    import os, sys
+    os.environ.pop("SGLANG_V100_LITE", None)
+    import sglang_v100_lite
+    sglang_v100_lite.register()
+    assert "sglang_v100_lite.runtime" not in sys.modules
+    print("Plugin disabled: no runtime or kernel imports")
+    raise SystemExit(0)
+if not args.tag:
+    p.error("--tag is required for the API replay")
 root = Path(__file__).resolve().parents[2]
 s = requests.Session()
 for line in Path("/home/alexander/.llama-server/.env").read_text().splitlines():
