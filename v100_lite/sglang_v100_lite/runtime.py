@@ -43,6 +43,7 @@ def install():
         ('sglang.kernels.ops.moe.moe_wna16_marlin.moe_wna16_marlin_gemm', marlin_gemm, HookType.AROUND),
         ('sglang.srt.layers.attention.linear.gdn_backend.GDNKernelDispatcher.__init__', dispatcher_init, HookType.AROUND),
         ('sglang.srt.layers.moe.moe_runner.base.FusedOpPool.get_fused_func', moe_runner, HookType.AROUND),
+        ('sglang.kernels.ops.moe.moe_fused_gate.moe_fused_gate', route_top10, HookType.AROUND),
         ('sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent.fused_sigmoid_gating_delta_rule_update_kernel.run', round_verify_state, HookType.AROUND),
         ('sglang.srt.mem_cache.memory_pool.MHATokenToKVPool.set_kv_buffer', store, HookType.AROUND),
         ('sglang.srt.server_args.prepare_server_args', arguments, HookType.AROUND),
@@ -248,7 +249,40 @@ def round_verify_state(original, *args, **kwargs):
         and states.dtype != torch.float32
         and not kwargs.get("HAS_EAGLE_TREE_CUSTOM_ATTN_MASK", False)
     )
+    grid = kwargs["grid"]
+    split_grid = kwargs.get("SPLIT_N_HV_GRID", False)
+    sequences = grid[1] if split_grid else grid[2] // kwargs["HV"]
+    if (
+        states is not None and states.dtype == torch.float16
+        and kwargs["q"].dtype == torch.float16
+        and (kwargs["B"], sequences, kwargs["H"], kwargs["HV"], kwargs["K"], kwargs["V"])
+        == (1, 1, 4, 12, 128, 128)
+        and kwargs["T"] in (2, 4) and kwargs["DISABLE_STATE_UPDATE"]
+        and not kwargs["IS_KDA"] and not kwargs["HAS_EAGLE_TREE_CUSTOM_ATTN_MASK"]
+    ):
+        # Preserve the fork's TP4 verification tile and the full launch grid.
+        kwargs["BV"] = 8
+        kwargs["grid"] = (16, *grid[1:]) if split_grid else (grid[0], 16, grid[2])
     return original(*args, **kwargs)
+
+
+def route_top10(original, scores, bias, topk, *args, **kwargs):
+    defaults = dict(scoring_func="softmax", num_fused_shared_experts=0,
+                    renormalize=True, routed_scaling_factor=1.0,
+                    apply_routed_scaling_factor_on_output=False,
+                    num_token_non_padded=None, packed_out=None, sqrtsoftplus_log1p=False)
+    if (
+        not args and bias is None and topk == 10
+        and kwargs.get("scoring_func") == "softmax"
+        and all(key in defaults and value == defaults[key] for key, value in kwargs.items())
+        and scores.is_cuda and scores.dtype in (torch.float16, torch.float32)
+        and scores.ndim == 2 and scores.shape[0] in (1, 2, 4)
+        and scores.shape[1] == 512 and scores.is_contiguous()
+    ):
+        from .kernels.sm70_nvfp4_moe_decode import sm70_topk10_softmax
+
+        return sm70_topk10_softmax(scores)
+    return original(scores, bias, topk, *args, **kwargs)
 
 
 def top_k_renorm_probs(probs, top_k):

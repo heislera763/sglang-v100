@@ -8,7 +8,7 @@ class TileLangGDNKernel(LinearAttnKernelBase):
     """Prefill adapter; decode and verify remain mainline Triton."""
 
     def decode(self, *args, **kwargs) -> torch.Tensor:
-        raise NotImplementedError("TileLang GDN decode requires packed mixed_qkv.")
+        raise NotImplementedError("This adapter provides prefill only.")
 
     def extend(
         self,

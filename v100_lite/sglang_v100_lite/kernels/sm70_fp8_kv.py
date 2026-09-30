@@ -24,7 +24,6 @@ def _get_op():
         load(
             name="sglang_v100_fp8_cache",
             sources=[
-                str(source_root / "fp8_cache_bindings.cpp"),
                 str(source_root / "sm70_fp8_e5m2_cache.cu"),
             ],
             is_python_module=False,

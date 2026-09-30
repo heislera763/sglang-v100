@@ -1,14 +1,4 @@
-"""Opt-in hand-written CUDA long-context grouped-decode partial (SM70).
-
-Replaces the TileLang split-KV decode partial with a native SM70 kernel for the
-exact Qwen3.8-27B TP4 shape (H6 / Hkv1 / D256, E5M2 byte KV, page size 16).
-The kernel streams each split's K/V from the paged cache exactly once, which
-cuts DRAM traffic versus the TileLang codegen on the same layout. The partial
-output ABI matches ``_decode_partial_kernel`` exactly so downstream code can
-reuse the unchanged TileLang combine kernel.
-
-Gated by ``SGLANG_V100_DECODE_CUDA=1``; falls back to TileLang otherwise.
-"""
+"""SM70 CUDA kernels for QSA prefill, decode and indexer scoring."""
 
 from __future__ import annotations
 
@@ -26,7 +16,6 @@ _SRC_PATH = Path(__file__).resolve().parents[1] / "kernels/csrc/sm70_longctx_dec
 _EXT = None
 _OPS_LOAD_ATTEMPTED = False
 
-PAGE_SIZE = 16  # fixed page granularity supported by the CUDA kernel
 QSA_DECODE_TARGET_CTAS = 160
 QSA_DECODE_TOKENS_PER_SPLIT = 32
 

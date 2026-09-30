@@ -43,6 +43,34 @@ for experts, tokens in ((33, 8), (129, 640)):
         assert torch.equal(tail, torch.full_like(tail, ids.numel()))
 print("MoE padding: scalar tails filled, backing guard words unchanged", flush=True)
 
+# The native router must preserve sorted ids, tie ordering and renormalization.
+from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
+from sglang_v100_lite.runtime import route_top10
+
+for dtype in (torch.float16, torch.float32):
+    for rows in (1, 2, 4):
+        for tied in (False, True):
+            scores = torch.randn(rows, 512, device=device, dtype=dtype) * 8
+            if tied:
+                scores.zero_()
+            weights, ids = route_top10(moe_fused_gate, scores, None, 10, scoring_func="softmax")
+            expected_ids = scores.float().argsort(dim=-1, descending=True, stable=True)[:, :10]
+            expected_weights = scores.float().gather(1, expected_ids).softmax(-1)
+            assert torch.equal(ids.long(), expected_ids)
+            torch.testing.assert_close(weights, expected_weights, rtol=1e-6, atol=1e-7)
+            mainline_weights, mainline_ids = moe_fused_gate(scores, None, 10, scoring_func="softmax")
+            assert torch.equal(ids, mainline_ids)
+            torch.testing.assert_close(weights, mainline_weights, rtol=1e-6, atol=1e-7)
+print("Native top-10 router: ids, ties and weights agree with Torch and mainline", flush=True)
+
+forwarded = []
+def original_router(*args, **kwargs):
+    forwarded.append((args, kwargs))
+    return "fallback"
+for options in ({"renormalize": False}, {"packed_out": torch.empty(1, device=device)}, {"routed_scaling_factor": 2.0}):
+    assert route_top10(original_router, scores, None, 10, scoring_func="softmax", **options) == "fallback"
+assert len(forwarded) == 3
+
 # Qwen TP4 MoE shape. A synthetic checkpoint and a dequantized Torch reference
 # test packing, the unusual S0E5M3 scale layout, gating, and weighted summation.
 e, h, i = 512, 2560, 160
@@ -268,14 +296,14 @@ for mode, rows in [("prefill", 11), ("decode", 4)]:
 
 q = torch.randn(1, 4, 4, 128, device="cuda", dtype=torch.float16)
 k = torch.randn_like(q)
-v = torch.randn(1, 4, 8, 128, device="cuda", dtype=torch.float16)
-a = torch.randn(4, 8, device="cuda", dtype=torch.float16)
+v = torch.randn(1, 4, 12, 128, device="cuda", dtype=torch.float16)
+a = torch.randn(4, 12, device="cuda", dtype=torch.float16)
 b = torch.randn_like(a)
-alog = torch.zeros(8, device="cuda", dtype=torch.float32)
-bias = torch.zeros(8, device="cuda", dtype=torch.float16)
-state = torch.randn(1, 8, 128, 128, device="cuda", dtype=torch.float16) * 0.01
+alog = torch.zeros(12, device="cuda", dtype=torch.float32)
+bias = torch.zeros(12, device="cuda", dtype=torch.float16)
+state = torch.randn(1, 12, 128, 128, device="cuda", dtype=torch.float16) * 0.01
 idx = torch.zeros(1, device="cuda", dtype=torch.int32)
-snapshots = torch.empty(1, 4, 8, 128, 128, device="cuda", dtype=torch.float16)
+snapshots = torch.empty(1, 4, 12, 128, 128, device="cuda", dtype=torch.float16)
 common = dict(
     A_log=alog,
     dt_bias=bias,
@@ -314,3 +342,43 @@ for t in range(4):
     torch.testing.assert_close(snapshots[:, t], sequential, rtol=0.001, atol=0.0001)
 torch.testing.assert_close(actual, torch.cat(outputs, dim=1), rtol=0.001, atol=0.0001)
 print("Four-step FP16 MTP recurrence: sequential decode agrees", flush=True)
+
+# Independent sequential FP32 reference for the retained chunked GDN algorithm.
+# Non-aligned sequence boundaries, nonzero indexed state and checkpoint content
+# exercise correctness beyond producing plausible model text.
+from sglang_v100_lite.gdn_tilelang import TileLangGDNKernel
+n, heads, value_heads, dim = 128, 4, 12, 128
+q = torch.randn(1, n, heads, dim, device=device, dtype=torch.float16)
+k = torch.randn_like(q)
+v = torch.randn(1, n, value_heads, dim, device=device, dtype=torch.float16)
+g = -torch.rand(1, n, value_heads, device=device) * 0.15
+beta = torch.rand_like(g)
+initial = torch.randn(3, value_heads, dim, dim, device=device, dtype=torch.float16) * 0.02
+indices = torch.tensor([2, 0], device=device, dtype=torch.int32)
+cu = torch.tensor([0, 51, n], device=device, dtype=torch.int32)
+qn = torch.nn.functional.normalize(q.float(), dim=-1, eps=1e-6).repeat_interleave(3, 2)
+kn = torch.nn.functional.normalize(k.float(), dim=-1, eps=1e-6).repeat_interleave(3, 2)
+reference = torch.empty_like(v, dtype=torch.float32)
+final = initial.clone()
+checkpoint_reference = []
+for start, end, slot in ((0, 51, 2), (51, n, 0)):
+    current = initial[slot].float()
+    for t in range(start, end):
+        if (t - start) % 64 == 0:
+            checkpoint_reference.append(current.half())
+        current = current * g[0, t].exp()[:, None, None]
+        delta = (v[0, t].float() - (current * kn[0, t, :, None, :]).sum(-1)) * beta[0, t, :, None]
+        current += delta[:, :, None] * kn[0, t, :, None, :]
+        reference[0, t] = (current * qn[0, t, :, None, :]).sum(-1) * dim ** -0.5
+    final[slot] = current.half()
+for checkpoints_enabled in (False, True):
+    actual_state = initial.clone()
+    output, _, checkpoints = TileLangGDNKernel().extend(q, k, v, g, beta, ssm_states=actual_state, cache_indices=indices, query_start_loc=cu, store_checkpoints=checkpoints_enabled)
+    torch.testing.assert_close(output.float(), reference, rtol=0.02, atol=0.0001)
+    torch.testing.assert_close(actual_state.float(), final.float(), rtol=0.02, atol=0.0005)
+    assert torch.equal(actual_state[1], initial[1])
+    if checkpoints_enabled:
+        torch.testing.assert_close(checkpoints[0], torch.stack(checkpoint_reference), rtol=0.02, atol=0.0005)
+    else:
+        assert checkpoints is None
+print("Chunked GDN: outputs, indexed state and chunk checkpoints agree with FP32 recurrence", flush=True)
