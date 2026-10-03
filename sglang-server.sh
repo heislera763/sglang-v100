@@ -25,7 +25,10 @@ if [[ -z ${LLAMA_API_KEY:-} ]]; then
 fi
 : "${LLAMA_API_KEY:?LLAMA_API_KEY is required}"
 model=${MODEL_PATH:-$HOME/.llama-server/models/sglang/RadixArk-Qwen3.8-Flash-Next-NVFP4}
-exec numactl --cpunodebind=0 --preferred=0 .venv/bin/python -m sglang_v100_lite \
+pci_bus=$(nvidia-smi -i "${CUDA_VISIBLE_DEVICES%%,*}" --query-gpu=pci.bus_id --format=csv,noheader)
+pci_bus=${pci_bus,,}
+numa_node=${NUMA_NODE:-$(cat "/sys/bus/pci/devices/${pci_bus:4}/numa_node")}
+exec numactl --cpunodebind="$numa_node" --preferred="$numa_node" .venv/bin/python -m sglang_v100_lite \
   --model-path "$model" --served-model-name "${SGLANG_SERVED_MODEL_NAME:-qwen3.8-flash-next-radixark-nvfp4}" \
   --trust-remote-code --host 0.0.0.0 --tensor-parallel-size 4 \
   --dtype float16 --quantization modelopt_fp4 --moe-runner-backend marlin \
@@ -34,7 +37,7 @@ exec numactl --cpunodebind=0 --preferred=0 .venv/bin/python -m sglang_v100_lite 
   --linear-attn-prefill-backend tilelang_v100 --linear-attn-decode-backend triton \
   --page-size 64 --kv-cache-dtype fp8_e5m2 --qsa-indexer-dtype float16 --mamba-ssm-dtype float16 --ple-offload-embedding \
   --mem-fraction-static 0.88 --context-length 262144 --max-running-requests 1 \
-  --chunked-prefill-size 8192 --cuda-graph-bs-decode 1 --disable-prefill-cuda-graph --disable-custom-all-reduce \
+  --chunked-prefill-size 8192 --cuda-graph-bs-decode 1 --disable-prefill-cuda-graph \
   --mamba-radix-cache-strategy extra_buffer --mamba-full-memory-ratio 0.2 \
   --speculative-algorithm EAGLE --speculative-draft-model-path "$model" \
   --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \

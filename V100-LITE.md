@@ -3,11 +3,17 @@
 Mainline base: `bd66ce343e4f6e2f2b75d7e820fe4d0718a8d824`.
 Original V100 reference: `dca488908ee4e3f1bc676c3bf5dcd26ff049cfc3`.
 
+For the 2026-10-03 move to the main server, see [V100-HANDOFF.md](V100-HANDOFF.md).
+The source testbed now has no GPUs; deployment and performance statements below
+describe the earlier runs, not a currently running source-host service.
+
 ## Use
 
 This opt-in profile serves the existing RadixArk Qwen3.8 Flash Next NVFP4
-checkpoint on **9001, GPUs 0–3, NUMA node 0**, using TP4, MTP and one request
-slot. Production port 9000 and GPUs 4–7 are outside this project.
+checkpoint on **9001, GPUs 0–3**, using TP4, MTP and one request slot.
+CPU and memory affinity follow the first selected GPU's NUMA node, with a
+`NUMA_NODE` override. Production port 9000 is outside this project; GPU numbering
+can change after hardware moves, so verify ownership before launching.
 There are no Docker requirements, model downloads, copies or compatibility links.
 Model storage remains:
 `/home/alexander/.llama-server/models/sglang/RadixArk-Qwen3.8-Flash-Next-NVFP4`.
@@ -17,13 +23,15 @@ extensions. Run `./sglang-server.sh` to serve. The launcher installs nothing and
 accepts only port 9001. The installed service is `sglang-openai-9001.service`.
 The profile uses FP16, page-64 E5M2 KV, pinned CPU PLE, SDPA vision,
 a 262,144-token total context limit, and an 8,192-token prefill chunk.
+The NVLink launcher now allows mainline's default custom all-reduce; pass
+`--disable-custom-all-reduce` to restore the earlier NCCL-only configuration.
 
 Setup defaults to a project-local CUTLASS v4.2.1 checkout; `CUTLASS_DIR` can
 select an existing header tree, and `CUDA_HOME` selects the compiler toolkit.
-The launcher accepts `MODEL_PATH`, `LLAMA_API_KEY`, and `ENV_FILE` overrides.
+The launcher accepts `MODEL_PATH`, `LLAMA_API_KEY`, `ENV_FILE`, and `NUMA_NODE` overrides.
 Its existing model and credential defaults are relative to `$HOME`.
-Port 9001, GPUs 0–3 and NUMA node 0 remain deliberate constraints of this host's
-test launcher. The deployment unit lives outside Git; the unused copy containing
+Port 9001 and GPUs 0–3 remain deliberate constraints of this host's test
+launcher. The deployment unit lives outside Git; the unused copy containing
 absolute host paths was removed. This improves setup portability without claiming
 a generic hardware configuration or support for additional model families.
 
@@ -75,8 +83,9 @@ proving broad model accuracy or eliminating every inherited assumption.
 
 ## Performance and comparison
 
-The tables below were measured on the previous mainline base `fc9bdc8a`;
-the `bd66ce34` port does not claim a fresh performance comparison.
+The first table was measured on the previous mainline base `fc9bdc8a`.
+The NVLink runs below use `bd66ce34`; the original fork has not been rerun on
+the newly installed NVLink quad.
 
 The before/after runs use the same local checkpoint, GPUs, one request slot,
 TP4/MTP, greedy sampling, uncached 1K/8K/25K inputs and 1,024 output tokens.
@@ -119,11 +128,77 @@ The original [README](https://github.com/haohervchb/sglang-V100/blob/dca488908ee
 reports **measured NVLink** results, not theoretical limits: MTP-3/4 gives
 117.55/119.84 TG and 3,269/4,693 client-measured PP at 1K/25K. The fresh local
 fork gives 93.15/88.42 client TG and 1,762.79/1,883.35 client PP; lite gives
-92.40/90.05 and 1,704.47/1,942.31. Thus this host does not reproduce those
-NVLink numbers. Hardware, custom-all-reduce choice, chunk size, dense cutoff,
+92.40/90.05 and 1,704.47/1,942.31. Those PCIe runs did not reproduce the
+README's NVLink numbers. Hardware, custom-all-reduce choice, chunk size, dense cutoff,
 software paths and acceptance differ; the entire gap cannot be assigned to
 NVLink alone. The local fork's 1K result is within 1% of its earlier local run.
+
+### NVLink quad baseline, 2026-09-30
+
+The `bd66ce34` profile completed the same three-repeat workload on the newly
+installed quad, with NUMA-node-1 affinity and NV2 connectivity between every
+pair. API checks passed for xhigh, tools, images and exact streaming timings.
+This first NVLink launch used NCCL, with custom all-reduce disabled.
+
+| Input tokens | Server PP | Server TG |
+| --- | ---: | ---: |
+| 1,000 | 3212.6 | 88.24 |
+| 8,192 | 4589.5 | 87.44 |
+| 25,000 | 3399.8 | 85.02 |
+
+These are deployment observations before a physical connection check, not an
+isolated NVLink comparison: the mainline base and GPU placement also changed.
+PCIe generations remained 3/1/2/3 at x8 during inference; a direct host-transfer
+test was deferred. GPU 1 (`84:00.0`) is also the card that dropped off PCIe on
+the preceding boot. Systemd recorded 7 GB peak swap during this launch; whether
+swap affected timed requests was not measured. Link negotiation, host transfers,
+benchmark-time swap and custom all-reduce remain follow-up checks.
+Raw measurements and telemetry are in `artifacts/nvlink-quad/` (untracked).
+The test endpoint was stopped for the user's physical connection inspection.
 Longer-prompt differences also reflect the corrected sparse cutoff.
+
+### NVLink with mainline custom all-reduce, 2026-09-30
+
+After reboot, removing `--disable-custom-all-reduce` enabled mainline's v2
+custom all-reduce. Startup confirmed symmetric-memory initialization with pull
+enabled and multicast disabled. No SGLang runtime/kernel edits were needed.
+The same TP4/MTP-3/4, single-slot, uncached workload completed all nine measured
+requests, with 1,024 output tokens each. These use greedy non-thinking prompts;
+xhigh was checked separately through the API smoke test.
+
+| Input tokens | Server PP | Server TG | TG vs earlier NVLink/NCCL |
+| --- | ---: | ---: | ---: |
+| 1,000 | 3107.7 | 121.90 | +38.1% |
+| 8,192 | 4590.8 | 112.47 | +28.6% |
+| 25,000 | 4052.8 | 117.72 | +38.5% |
+
+These are medians of three measurements using server timing fields. Compared
+with the earlier PCIe lite baseline, PP is +80.8%/+131.9%/+108.5% and TG is
++31.9%/+23.9%/+30.7%. Hardware placement, link negotiation and draft acceptance
+also changed, so these differences do not isolate the collective implementation.
+For the original README's client-timing comparison, current 1K/25K PP is
+3,064.36/4,043.31 (-6.3%/-13.8%) and TG is 121.88/117.70 (+3.7%/-1.8%).
+This approximately reproduces its decode throughput; prompt throughput is lower.
+
+All four GPUs remained available with no service restarts or logged Xid errors.
+PCIe remained Gen3/Gen3/Gen1/Gen1 x8, with NV2 between every pair and NUMA-1
+affinity. Host swap was about 4.75 GiB in use during inference; sampled free swap
+varied by only about 10 MiB, which does not establish whether swap I/O occurred.
+The configured context limit is 262,144 tokens; this run exercised up to 25K
+input plus 1K output, not the full limit. API sampling, xhigh, tokenization,
+images, tool round trips and exact streaming timing checks all passed.
+Raw measurements and telemetry are in `artifacts/nvlink-car/` (untracked).
+
+On 2026-10-01, a quick check after forcing Gen2 retained Gen2/Gen2/Gen1/Gen2
+x8 and completed one measured request per length, following warmups:
+1K input gave 3,162.5 server PP / 122.45 server TG; 25K gave 4,379.3 / 118.88.
+Each generated 1,024 tokens, and an OpenAI chat check returned `Test passed`.
+These single measurements do not replace the three-repeat baseline above.
+All GPUs stayed available with no service restarts or logged Xid errors.
+Replay counts increased by 0/26/0/16 from loading through the final chat check;
+GPU 3 also recorded seven replay rollovers, so Gen2 did not eliminate link errors.
+Sampled peak temperatures were 63/64/74/72 C. Evidence is in
+`artifacts/nvlink-gen2-quick/` (untracked); no runtime or launcher edits were made.
 
 ## Why retain custom kernels?
 
@@ -231,8 +306,8 @@ Future work should be small and discriminating:
 
 - Benchmark an additional Torch wheel against identical source and a rebuilt
   native package, separating Triton/cuBLAS/NCCL changes from Python packaging.
-- Profile multi-rank collectives and CPU launch gaps under the existing PCIe
-  topology, then repeat after NVLink arrives.
+- Profile multi-rank collectives and CPU launch gaps across the main server's
+  two NVLink quads, including the PCIe connection between the quads.
 - Evaluate QSA/indexer kernel efficiency while preserving the selection budget;
   verify cached-prefix and context-boundary behavior before expanding support.
 - Expand actual-checkpoint/logprob and scale-distribution accuracy checks for
