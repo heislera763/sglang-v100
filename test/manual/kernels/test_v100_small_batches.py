@@ -3,6 +3,7 @@
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -14,6 +15,8 @@ with patch.object(
     sys, "path", [str(Path(__file__).resolve().parents[3] / "v100_lite"), *sys.path]
 ):
     from sglang_v100_lite.kernels import gemm, sm70_hc_mix
+    from sglang_v100_lite.dispatch import V100FallbackError
+    from sglang_v100_lite.runtime import apply_unquant
 
 
 @unittest.skipUnless(
@@ -21,6 +24,32 @@ with patch.object(
     "Requires a V100",
 )
 class TestV100SmallBatches(CustomTestCase):
+    def test_glm_primary_projection_routes_preserve_fp32(self):
+        def forbidden_fallback(*args):
+            self.fail("Declared GLM projections must not delegate dispatch")
+
+        with (
+            envs.SGLANG_DEBUG_V100_STRICT_DISPATCH.override(True),
+            torch.inference_mode(),
+        ):
+            for rows in (1, 6):
+                for n, dtype in ((3336, torch.float16), (32, torch.float32)):
+                    x = torch.randn(rows, 4096, device="cuda", dtype=dtype)
+                    weight = torch.randn(n, 4096, device="cuda", dtype=dtype) * 0.02
+                    actual = apply_unquant(
+                        forbidden_fallback, None, SimpleNamespace(weight=weight), x
+                    )
+                    self.assertEqual(actual.dtype, dtype)
+                    torch.testing.assert_close(
+                        actual, torch.nn.functional.linear(x, weight), rtol=0, atol=0
+                    )
+            x = torch.zeros(6, 4096, device="cuda", dtype=torch.float16)
+            weight = torch.zeros(3337, 4096, device="cuda", dtype=torch.float16)
+            with self.assertRaisesRegex(V100FallbackError, "gemm.unquantized_linear"):
+                apply_unquant(
+                    forbidden_fallback, None, SimpleNamespace(weight=weight), x
+                )
+
     def test_hc_three_rows_equal_four_row_prefix(self):
         torch.manual_seed(53)
         with (

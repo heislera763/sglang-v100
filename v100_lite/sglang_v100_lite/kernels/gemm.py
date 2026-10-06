@@ -107,6 +107,27 @@ _SMALL_CONFIGS.update(
 )
 _SMALL_CONFIGS[(3, 1, 2560)] = (64, 32)
 
+# GLM-5.3-Flash's checkpoint-declared unquantized projections, TP8/TP4.
+# These use Volta cuBLAS for both decode and verification; they have no
+# custom small-GEMM implementation to fall back from.
+_GLM_BLAS_SHAPES = {
+    (3336, 4096),
+    (6416, 4096),  # fused KDA QKV/beta/forget/norm gates
+    (2048, 4096),
+    (1536, 4096),
+    (512, 4096),  # MLA latent projections
+    (2048, 1536),
+    (4096, 1536),  # MLA queries and replicated indexer query
+    (4096, 512),
+    (8192, 512),  # MLA keys/values
+    (4096, 1024),
+    (4096, 2048),
+    (4096, 4096),  # KDA/MLA output
+    (128, 4096),  # replicated indexer key
+    (1024, 4096),
+    (4096, 256),  # unquantized NextN shared expert (TP4/TP8)
+}
+
 
 def shape_supported(x, weight):
     return (
@@ -116,15 +137,17 @@ def shape_supported(x, weight):
 
 
 def blas_supported(x, weight, bias=None):
-    """Explicit FP16 Volta library paths, separate from small decode kernels.
+    """Explicit Volta library paths, separate from small decode kernels.
 
     Known small-kernel shapes must use that implementation or fail. cuBLAS
     is the selected backend for prefill, Qwen's four-bank embedding projection,
-    the two untuned Qwen projections, and GLM's vocabulary projection.
+    the two untuned Qwen projections, and GLM's unquantized projections.
+    The GLM indexer head-weight projection intentionally stays FP32.
     """
     if not (
         x.is_cuda
-        and x.dtype == weight.dtype == torch.float16
+        and x.dtype == weight.dtype
+        and x.dtype in (torch.float16, torch.float32)
         and x.device == weight.device
         and x.ndim in (2, 3)
         and weight.ndim == 2
@@ -135,6 +158,8 @@ def blas_supported(x, weight, bias=None):
         and torch.cuda.get_device_capability(x.device) == (7, 0)
     ):
         return False
+    if x.dtype == torch.float32:
+        return x.ndim == 2 and weight.shape == (32, 4096) and bias is None
     if x.ndim == 2:
         rows = x.shape[0]
         shape = tuple(weight.shape)
@@ -144,6 +169,8 @@ def blas_supported(x, weight, bias=None):
         )
         if native_small:
             return False
+        if shape in _GLM_BLAS_SHAPES and bias is None:
+            return True
         if rows in (2, 3, 4) and shape in ((1, 2560), (10240, 2560)):
             return True
         if weight.shape[1] == 4096 and weight.shape[0] >= 16384:

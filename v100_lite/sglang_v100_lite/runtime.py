@@ -463,7 +463,7 @@ def apply_unquant(original, self, layer, x, bias=None):
         return torch.nn.functional.linear(x, layer.weight, bias)
     reject_fallback(
         "gemm.unquantized_linear",
-        "native dense/small GEMM requires SGLANG_SM70_DENSE_GEMV=1, "
+        "no declared SM70 linear backend; native dense/small GEMM requires SGLANG_SM70_DENSE_GEMV=1, "
         "aligned contiguous SM70 FP16 input/weights, no bias and a tuned "
         "shape (rows 1, 2, 3 or 4); batched shapes require SGLANG_SM70_MTP_SMALL_GEMM=1",
         input=x,

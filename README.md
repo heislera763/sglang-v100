@@ -131,7 +131,8 @@ fast-path options: a full-model run can stop at the first coverage gap during
 startup or execution. It covers the plugin's HC/mHC, dense linear, router,
 NVFP4 MoE, QSA attention/indexer and E5M2 cache dispatch boundaries, rather than
 every Torch operation or upstream backend. Explicit SM70 FP16 cuBLAS prefill,
-embedding/vocabulary projections, native CUDA HC combine and SM70 Marlin
+declared Qwen/GLM projections (including FP32 GLM indexer head weights),
+native CUDA HC combine and SM70 Marlin
 routes are valid primary backends, not implicit fallbacks. Native variants
 within a selected path still use their existing scheduling. It does not change sampling,
 precision or tensor contents.
