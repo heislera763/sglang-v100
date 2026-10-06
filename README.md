@@ -139,6 +139,59 @@ SGLANG_PLUGINS=v100_lite SGLANG_V100_LITE=1 \
 Refer to upstream SGLang for API usage. Configure models, GPU selection and
 serving policy separately for your host.
 
+### Qwen3.8-Flash-Next: thinking + MTP
+
+Quick reference for `glm-5.3-flash-fast`, from the repository root. GPUs 4–7
+are this machine's full-Gen3 NVLink quad; choose a single NVLink quad on other
+hosts. This is the serving equivalent of the measured batch-one, 16K offline
+profile above, with the user's LAN endpoint and API key.
+
+```bash
+export CUDA_VISIBLE_DEVICES=4,5,6,7
+export CUDA_HOME=/usr/local/cuda-12.9
+export PATH="$PWD/.venv/bin:$CUDA_HOME/bin:$PATH"
+export TRITON_PTXAS_PATH="$CUDA_HOME/bin/ptxas"
+export TORCH_CUDA_ARCH_LIST=7.0 OMP_NUM_THREADS=4 MAX_JOBS=4
+export NCCL_P2P_LEVEL=PHB NCCL_NVLS_ENABLE=0
+export SGLANG_PLUGINS=v100_lite SGLANG_V100_LITE=1
+export SGLANG_V100_MARLIN_DIR="$PWD/artifacts/marlin-v100/vllm"
+export SGLANG_JIT_CACHE_DIR="$PWD/.cache/jit"
+export SGLANG_V100_NVFP4_MOE_BUILD_DIR="$PWD/.cache/nvfp4_moe"
+export SGLANG_V100_DECODE_CUDA_BUILD_DIR="$PWD/.cache/longctx"
+export SGLANG_SM70_DENSE_GEMV=1
+export SGLANG_MAMBA_CONV_DTYPE=float16 SGLANG_MAMBA_SSM_DTYPE=float16
+unset SGLANG_PP_LAYER_PARTITION SGLANG_ENABLE_PP_SPEC
+
+uv run --no-project .venv/bin/python -m sglang_v100_lite \
+  --model-path "$HOME/models/sglang/RadixArk-Qwen3.8-Flash-Next-NVFP4" \
+  --served-model-name qwen3.8-flash-next --trust-remote-code \
+  --host 192.168.4.78 --port 9000 --api-key test-only \
+  --tensor-parallel-size 4 --disable-overlap-schedule \
+  --dtype float16 --quantization modelopt_fp4 \
+  --moe-runner-backend marlin --fp4-gemm-backend marlin \
+  --sampling-backend pytorch --reasoning-parser auto --tool-call-parser auto \
+  --mm-attention-backend sdpa --attention-backend triton \
+  --linear-attn-prefill-backend tilelang_v100 --linear-attn-decode-backend triton \
+  --page-size 64 --kv-cache-dtype fp8_e5m2 --qsa-indexer-dtype float16 \
+  --mamba-ssm-dtype float16 --ple-offload-embedding --disable-radix-cache \
+  --mem-fraction-static 0.88 --context-length 16384 --max-total-tokens 16384 \
+  --max-running-requests 1 --chunked-prefill-size 8192 \
+  --cuda-graph-bs-decode 1 --disable-prefill-cuda-graph \
+  --mamba-radix-cache-strategy extra_buffer --mamba-full-memory-ratio 0.2 \
+  --speculative-algorithm EAGLE --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+  --speculative-use-rejection-sampling \
+  --default-chat-template-kwargs '{"enable_thinking":true,"reasoning_effort":"xhigh"}' \
+  --preferred-sampling-params '{"temperature":1.0,"top_p":0.95,"top_k":20,"min_p":0.0,"presence_penalty":0.0,"frequency_penalty":0.0,"repetition_penalty":1.0}'
+```
+
+OpenAI-compatible base URL: `http://192.168.4.78:9000/v1`, key `test-only`.
+Client-supplied settings override these defaults: keep thinking enabled,
+temperature 1, top-p 0.95, top-k 20, min-p 0, presence/frequency penalties 0
+and repetition penalty 1 in WebUI. The sampling top-k of 20 is separate from
+the MTP branch width of one. Larger contexts and concurrency need separate
+memory/performance checks; the former 262K profile is a different configuration.
+
 ## Upstream maintenance
 
 The integrated upstream revision is recorded in `provenance.json`.
