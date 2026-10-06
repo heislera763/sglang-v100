@@ -899,6 +899,10 @@ class SchedulerPPMixin:
                 tensor_dict["spec_next_top_scores"] = (
                     result.next_verify_top_scores_index
                 )
+                if result.next_verify_draft_probs is not None:
+                    tensor_dict["spec_next_draft_probs"] = (
+                        result.next_verify_draft_probs
+                    )
 
         # Draft extend runs only on the last stage, but every rank needs its relayed
         # output to fill PD auxiliary buffers.
@@ -1329,6 +1333,7 @@ class SchedulerPPMixin:
                 tokens=chain.to(torch.int64).reshape(len(fwd_rids), num_draft_tokens),
                 parents=pp_outputs.tensors.get("spec_next_parents"),
                 top_scores=pp_outputs.tensors.get("spec_next_top_scores"),
+                draft_probs=pp_outputs.tensors.get("spec_next_draft_probs"),
             )
         self._pp_spec_set_relay(batch, relayed)
 
@@ -1462,6 +1467,20 @@ class SchedulerPPMixin:
             tree_mask_buf,
             fill_prefix_mask=fill_mask,
         )
+        draft_probs = relay.draft_probs
+        if (
+            spec.speculative_use_rejection_sampling
+            and draft_probs is None
+            and (batch.sampling_info is None or not batch.sampling_info.is_all_greedy)
+        ):
+            # Cold prefill rows have no sampled proposal. q=0 makes the chain
+            # sampler reject their padding and sample pure target p; it never
+            # pretends the padding came from an invented distribution.
+            draft_probs = torch.zeros(
+                (bs, steps, self.tp_worker.model_runner.model_config.vocab_size),
+                dtype=torch.float32,
+                device=device,
+            )
         batch.spec_info = EagleVerifyInput(
             draft_token=flat_draft_tokens,
             custom_mask=tree_mask,
@@ -1476,6 +1495,7 @@ class SchedulerPPMixin:
             capture_hidden_mode=None,
             seq_lens_sum=batch.seq_lens_sum,
             seq_lens_cpu=batch.seq_lens_cpu,
+            draft_probs=None if draft_probs is None else draft_probs.to(device),
         )
 
     def _pp_send_output_to_next_stage(

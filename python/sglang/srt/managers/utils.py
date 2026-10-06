@@ -111,6 +111,7 @@ class GenerationBatchResult:
     next_verify_chain: Optional[torch.Tensor] = None
     next_verify_parent_list: Optional[torch.Tensor] = None
     next_verify_top_scores_index: Optional[torch.Tensor] = None
+    next_verify_draft_probs: Optional[torch.Tensor] = None
 
     # PP+spec: the verify forward's KV slots on a non-last stage. That stage
     # prepares verify inside forward isolation, which restores

@@ -36,6 +36,7 @@ class PPSpecRelayInput(SpecInput):
         tokens: torch.Tensor,
         parents: Optional[torch.Tensor] = None,
         top_scores: Optional[torch.Tensor] = None,
+        draft_probs: Optional[torch.Tensor] = None,
     ):
         super().__init__(SpecInputType.PP_SPEC_RELAY)
         # [bs, num_draft_tokens], column 0 is the bonus token
@@ -46,6 +47,9 @@ class PPSpecRelayInput(SpecInput):
         # which are rejected whatever tree shape they hang on.
         self.parents = parents
         self.top_scores = top_scores
+        # Exact proposal q, [bs, num_steps, vocab], excluding the bonus root.
+        # None for a cold prefill row or when rejection sampling is disabled.
+        self.draft_probs = draft_probs
 
     def __repr__(self) -> str:
         return (
@@ -73,6 +77,8 @@ class PPSpecRelayInput(SpecInput):
         keep = new_indices_cpu if new_indices_cpu is not None else new_indices.tolist()
         self.rids = [self.rids[i] for i in keep]
         self.tokens = self.tokens[new_indices]
+        if self.draft_probs is not None:
+            self.draft_probs = self.draft_probs[new_indices]
         if self.parents is not None:
             self.parents = self.parents[new_indices]
             self.top_scores = self.top_scores[new_indices]
@@ -83,7 +89,18 @@ class PPSpecRelayInput(SpecInput):
         if not self.rids:
             self.rids, self.tokens = list(other.rids), other.tokens
             self.parents, self.top_scores = other.parents, other.top_scores
+            self.draft_probs = other.draft_probs
             return
+        template = (
+            self.draft_probs if self.draft_probs is not None else other.draft_probs
+        )
+        if template is not None:
+            self.draft_probs = torch.cat(
+                [
+                    self._draft_probs_or_zeros(template),
+                    other._draft_probs_or_zeros(template),
+                ]
+            )
         self.rids = self.rids + list(other.rids)
         self.tokens = torch.cat([self.tokens, other.tokens])
         # A batch merging in from prefill has no topology yet; give it the
@@ -118,6 +135,15 @@ class PPSpecRelayInput(SpecInput):
         )
         relayed_tokens = relayed.tokens.to(self.tokens.device)[take]
         self.tokens = torch.where(keep.unsqueeze(1), self.tokens, relayed_tokens)
+        template = (
+            self.draft_probs if self.draft_probs is not None else relayed.draft_probs
+        )
+        if template is not None:
+            self.draft_probs = torch.where(
+                keep[:, None, None],
+                self._draft_probs_or_zeros(template).to(self.tokens.device),
+                relayed._draft_probs_or_zeros(template).to(self.tokens.device)[take],
+            )
         if relayed.parents is None:
             return
         widths = relayed._widths()
@@ -144,7 +170,15 @@ class PPSpecRelayInput(SpecInput):
             tokens=self.tokens[take],
             parents=None if self.parents is None else self.parents[take],
             top_scores=None if self.top_scores is None else self.top_scores[take],
+            draft_probs=None if self.draft_probs is None else self.draft_probs[take],
         )
+
+    def _draft_probs_or_zeros(self, template: torch.Tensor) -> torch.Tensor:
+        if self.draft_probs is not None:
+            return self.draft_probs
+        # Absent/cold rows propose nothing: they must resample from target p,
+        # not inherit a different request's q after merge or subset adoption.
+        return template.new_zeros((len(self.rids), *template.shape[1:]))
 
     def topology(self, *, fallback):
         """The rows' tree shape, as a rectangular pair. ``fallback`` supplies

@@ -106,7 +106,6 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_pp_context,
     draft_tp_context,
-    fast_sample,
     get_plan_stream,
     load_token_map,
     renorm_draft_probs,
@@ -996,14 +995,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Assemble the next-iter draft spec_info from the extend output.
         use_rejection_sampling = get_spec().speculative_use_rejection_sampling
-        probs = renorm_draft_probs(
-            logits_output.next_token_logits,
-            batch.sampling_info,
-            use_rejection_sampling,
-        )
         if use_rejection_sampling:
-            topk_p, topk_index = fast_sample(probs, num_samples=1)
+            probs, topk_p, topk_index = sample_draft_proposal(
+                logits_output.next_token_logits,
+                batch.sampling_info.temperatures,
+                batch.sampling_info.top_ks,
+            )
         else:
+            probs = renorm_draft_probs(
+                logits_output.next_token_logits,
+                batch.sampling_info,
+                use_rejection_sampling,
+            )
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
         return EagleDraftInput(
             topk_p=topk_p,
@@ -1441,6 +1444,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         self.draft_worker.draft(batch, with_topology=True)
                     )
                 batch_output.next_verify_chain = next_verify_input.draft_token
+                # Carry the exact q used to draw these proposals. Recomputing
+                # it after the relay would invalidate the rejection correction.
+                batch_output.next_verify_draft_probs = next_verify_input.draft_probs
                 # The tree shape is data-dependent once topk > 1, so the other
                 # stages cannot re-derive it; relay it alongside the tokens.
                 # clone(): both come out of cuda-graph-owned buffers under

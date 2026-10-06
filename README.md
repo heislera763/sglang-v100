@@ -48,13 +48,16 @@ mutually exclusive. Existing shape/dtype/scheduling guards retain the fallback
 paths for unsupported cases.
 
 The fast branch supports GLM's native MTP with EAGLE, top-k one and linear
-chains of up to six verification slots. TP8 batch-one offline runs have exercised
-one- and five-step drafting, target/draft graphs, partial rejection and request
-reuse. PP+MTP, sampling and concurrent requests remain unvalidated. The SM70
-cache writer consumes upstream speculative write plans and causal lengths;
-the scheduler and verifier are unchanged. MTP remains an explicit CLI choice:
+chains of up to six verification slots. TP8 and TP4×PP2 batch-one offline runs
+have exercised target/draft graphs, rejection, request reuse and sampled decoding
+at temperature 1/top-p 0.95. The SM70 cache writer consumes upstream plans;
+the PP relay now preserves the exact draft proposal probabilities by request,
+and greedy prefills use the same proposal policy as decode. Concurrent requests
+remain unvalidated. MTP remains an explicit CLI choice:
 `--speculative-algorithm EAGLE --speculative-num-steps 5
 --speculative-eagle-topk 1 --speculative-num-draft-tokens 6`.
+Sampled MTP tests add `--speculative-use-rejection-sampling`; aggregate PP+MTP
+requires `SGLANG_ENABLE_PP_SPEC=1` and `--disable-overlap-schedule`.
 
 Preliminary batch-one measurements on eight 32 GB V100s:
 
@@ -76,18 +79,24 @@ Extending GEMV dispatch to the measured TP4 projection shapes raises TP4×PP2 TG
 from 23.45 to 25.00 tokens/s at 2K (6.6%); prefill remains approximately 1,080
 tokens/s. TP8 leads single-request TG, while TP4×PP2 leads longer-prompt prefill.
 
-A fresh TP8 comparison with an 8,192-token cache cap measures 41.54 TG without
-MTP and 49.30 with five draft steps at 2K: TG improves 18.7%, while PP falls
-from 675.4 to 618.2 tokens/s. At 128 tokens, TG rises from 41.59 to 49.75.
-A separate one-step MTP run with automatic cache capacity reaches only 33.29
-TG at 2K. The extra prefill cost consumes the five-step decode saving for a
-2K prompt with 64 output tokens; longer answers stand to benefit more.
-All 11 greedy output sequences in each MTP profile match the non-MTP control;
-this is bounded evidence, not a general parity guarantee. Runs use three
-measured repetitions after warmup, 64 output tokens and a 0.90 static fraction;
-the five-step run and its matched control cap total cache capacity at 8,192
-tokens. Extra draft weights and graph memory require separate budgeting from
-the non-MTP profile.
+Matched five-step MTP comparisons at 2K (TG tokens/s):
+
+| Layout | Sampling | Without MTP | With MTP |
+| --- | --- | ---: | ---: |
+| TP8 | Greedy | 41.4 | 48.8 |
+| TP4×PP2 | Greedy | 25.0 | 37.0 |
+| TP8 | Temperature 1, top-p 0.95 | 39.8 | 19.8 |
+| TP4×PP2 | Temperature 1, top-p 0.95 | 24.8 | 13.6 |
+
+Five-step MTP helps greedy TG; it loses with sampling on these inputs.
+Greedy PP drops from 675.5 to 611.7 tokens/s at TP8 and from 1,088.1 to 958.6
+at TP4×PP2. Prefill cost offsets some decode saving on short answers.
+Runs use three repetitions after warmup, 64 forced output tokens, batch one,
+8,192-token cache capacity and a 0.92 static fraction. All 11 greedy output
+sequences per layout match their non-MTP controls; sampler checks compare with
+a CPU oracle and verify actual proposal probabilities. This does not establish
+broad model-quality or sampled-output parity. Extra draft weights and graphs
+need separate memory budgeting; the PP+MTP last quad has limited headroom.
 
 ## Build and use
 
