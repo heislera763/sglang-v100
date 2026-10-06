@@ -63,13 +63,33 @@ Preliminary batch-one measurements on eight 32 GB V100s:
 
 | Model/profile | Prompt tokens | PP tokens/s | TG tokens/s |
 | --- | ---: | ---: | ---: |
-| Qwen3.8-Flash-Next, TP4 + MTP | 1,000 | 3,068 | 125.3 |
+| Qwen3.8-Flash-Next, TP4 + MTP, sampled thinking | 1,000 | 3,229 | 126.0 |
 | GLM-5.3-Flash fast, TP8 | 2,048 | 675.0 | 41.52 |
 | GLM-5.3-Flash fast, TP4×PP2 | 2,048 | 1,079.2 | 25.00 |
 
 These are profile-specific development measurements. The matched GLM runs use
 256-token prefill chunks, a 24/21 PP split and no speculation; they do not
 predict concurrent-request throughput or imply cross-model comparisons.
+Greedy measurements are diagnostics; sampled performance is the primary tuning
+target. Use the lab's settings for the exact model and thinking mode, including
+penalties, rather than assuming checkpoint generation defaults cover them.
+[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next#api-usage)
+specifies T=1/top-p=0.95/top-k=20 with no presence penalty for thinking, and
+T=0.7/top-p=0.80/top-k=20/presence penalty=1.5 for non-thinking; both use
+min-p=0 and repetition penalty=1.
+[GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash#footnotes) publishes
+task-specific sampled recipes; our T=1/top-p=0.95 profile matches the checkpoint
+defaults and several lab evaluations. Speculative verification currently
+broadcasts history penalties across each block, so nonzero penalties do not yet
+have ordinary decoding's per-token semantics.
+
+Matched Qwen TP4 offline runs use the lab's thinking settings, EAGLE3/1/4 with
+classical rejection sampling, no overlap/radix caching, 8K prefill chunks,
+16K cache capacity and a 0.88 static fraction. Median TG rises from 70.1 to
+126.0 tokens/s at 1K and from 70.0 to 124.8 at 8K. Each uses three repetitions
+after warmup and 128 output tokens. The former 125.3 tokens/s result used greedy
+decoding and a different serving profile. These measurements establish a sampled
+speed gain, not exact output parity or broad quality equivalence.
 
 Initial matched TP8 offline Engine runs on the fast branch improve TG from
 32.58 to 41.70 tokens/s at 128 prompt tokens and 32.50 to 41.52 at 2,048
