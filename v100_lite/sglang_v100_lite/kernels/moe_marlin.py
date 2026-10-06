@@ -231,18 +231,32 @@ def moe_wna16_marlin_gemm(
         from sglang.srt.layers.quantization.utils import get_scalar_types
         from sglang.srt.runtime_context import get_schedule
 
+        # Batch-one GLM projections at TP8 and TP4. TP4 doubles the sharded
+        # output width or reduction depth; the packed-layout kernel is shared.
         dense_gemv = (
             size_m == top_k == 1
             and b_q_weight.shape[0] == 1
             and (size_n, size_k)
-            in ((512, 4096), (3072, 4096), (4096, 1024), (4096, 256))
+            in (
+                (512, 4096),
+                (3072, 4096),
+                (6144, 4096),
+                (4096, 1024),
+                (4096, 256),
+                (4096, 512),
+            )
         )
         routed_gemv = (
             b_q_weight.shape[0] == 288
             and moe_block_size == 8
             and (
                 (size_m, top_k, size_n, size_k)
-                in ((1, 8, 512, 4096), (8, 1, 4096, 256))
+                in (
+                    (1, 8, 512, 4096),
+                    (1, 8, 1024, 4096),
+                    (8, 1, 4096, 256),
+                    (8, 1, 4096, 512),
+                )
             )
             and sorted_token_ids.numel() == 64
             and expert_ids.numel() == 8

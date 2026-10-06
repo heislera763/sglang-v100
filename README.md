@@ -52,8 +52,8 @@ Preliminary batch-one measurements on eight 32 GB V100s:
 | Model/profile | Prompt tokens | PP tokens/s | TG tokens/s |
 | --- | ---: | ---: | ---: |
 | Qwen3.8-Flash-Next, TP4 + MTP | 1,000 | 3,068 | 125.3 |
-| GLM-5.3-Flash, TP8 | 2,048 | 670.7 | 33.09 |
-| GLM-5.3-Flash, TP4×PP2 | 2,048 | 1,096.3 | 22.10 |
+| GLM-5.3-Flash fast, TP8 | 2,048 | 675.0 | 41.52 |
+| GLM-5.3-Flash fast, TP4×PP2 | 2,048 | 1,079.2 | 25.00 |
 
 These are profile-specific development measurements. The matched GLM runs use
 256-token prefill chunks, a 24/21 PP split and no speculation; they do not
@@ -63,6 +63,9 @@ Initial matched TP8 offline Engine runs on the fast branch improve TG from
 32.58 to 41.70 tokens/s at 128 prompt tokens and 32.50 to 41.52 at 2,048
 (about 28%). Each uses three measured repetitions, an excluded warmup and 64
 generated tokens. At 2K, PP remains approximately 674–675 tokens/s.
+Extending GEMV dispatch to the measured TP4 projection shapes raises TP4×PP2 TG
+from 23.45 to 25.00 tokens/s at 2K (6.6%); prefill remains approximately 1,080
+tokens/s. TP8 leads single-request TG, while TP4×PP2 leads longer-prompt prefill.
 
 ## Build and use
 
