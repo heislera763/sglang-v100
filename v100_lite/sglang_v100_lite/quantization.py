@@ -5,6 +5,8 @@ from pathlib import Path
 
 import torch
 
+from .dispatch import reject_fallback
+
 
 def minimum_capability(original, cls):
     return 70
@@ -242,6 +244,16 @@ def moe_runner(original, cls, dispatch_name, runner_name):
                     topk.topk_weights.view(-1),
                 )
                 return StandardCombineInput(hidden_states=output)
+        reject_fallback(
+            "moe.nvfp4_decode",
+            "native Qwen MoE requires SGLANG_V100_NVFP4_MOE_DECODE=1, "
+            "FP16 [1..4, 2560], 512 NVFP4 gated experts with intermediate "
+            "size 160, topk=10 and default activation/routing options",
+            input=h,
+            route_ids=getattr(topk, "topk_ids", None),
+            w13=getattr(quant, "w13_qweight", None),
+            w2=getattr(quant, "w2_qweight", None),
+        )
         return fn(dispatch, quant, config)
 
     return run

@@ -120,6 +120,18 @@ need separate memory budgeting; the PP+MTP last quad has limited headroom.
 
 ## Build and use
 
+For development, `SGLANG_DEBUG_V100_STRICT_DISPATCH=1` makes guarded V100
+dispatch reject fallback paths with the operation name, expected contract and
+tensor shape/dtype/device/layout. It catches missing coverage such as Qwen's
+three-row HC and small-GEMM checks. Default `0` preserves existing dispatch.
+The mode is deliberately strict, including guarded prefill calls and disabled
+fast-path options: a full-model run can stop at the first coverage gap during
+startup or execution. It covers the plugin's HC/mHC, dense linear, router,
+NVFP4 MoE, QSA attention/indexer and E5M2 cache dispatch boundaries, rather than
+every Torch operation or upstream backend. Native variants within a selected
+path still use their existing scheduling. It does not change sampling,
+precision or tensor contents.
+
 Requires Python 3.12/uv, a CUDA 12.9 toolchain and SM70 GPUs. The project lock
 pins the Volta-compatible CUDA-12 stack and selected `sglang-kernel` build.
 

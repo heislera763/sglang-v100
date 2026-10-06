@@ -6,6 +6,8 @@ from pathlib import Path
 
 import torch
 
+from ..dispatch import reject_fallback
+
 _OP = None
 _CHECKED = False
 _SCALE_TENSORS = {}
@@ -61,6 +63,9 @@ def write_fp8_e5m2_cache_sm70(
 ) -> bool:
     op = _get_op()
     if op is None:
+        reject_fallback(
+            "qwen.fp8_kv_store", "native E5M2 cache operator is unavailable", key=key
+        )
         return False
     if (
         key.device.type != "cuda"
@@ -73,6 +78,16 @@ def write_fp8_e5m2_cache_sm70(
         or value_cache.ndim != 3
         or locations.dtype != torch.int64
     ):
+        reject_fallback(
+            "qwen.fp8_kv_store",
+            "native writer requires SM70 CUDA FP16 keys/values, 3D byte "
+            "cache and int64 locations",
+            key=key,
+            value=value,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            locations=locations,
+        )
         return False
     for scale in (k_scale, v_scale):
         if isinstance(scale, torch.Tensor) and (
@@ -80,6 +95,12 @@ def write_fp8_e5m2_cache_sm70(
             or scale.dtype != torch.float32
             or scale.numel() != 1
         ):
+            reject_fallback(
+                "qwen.fp8_kv_store",
+                "tensor scales must be FP32 scalars on the key device",
+                scale=scale,
+                key=key,
+            )
             return False
     op(
         key,

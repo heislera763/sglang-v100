@@ -5,6 +5,12 @@ import os
 
 def register():
     if os.environ.get("SGLANG_V100_LITE") != "1":
+        from .dispatch import reject_fallback
+
+        reject_fallback(
+            "plugin.activation",
+            "strict dispatch requires the V100 plugin to be active (SGLANG_V100_LITE=1)",
+        )
         return
     from .runtime import install
 

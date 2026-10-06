@@ -11,6 +11,8 @@ from typing import Optional
 import torch
 from sglang.srt.utils import get_device_capability
 
+from .dispatch import reject_fallback
+
 
 def _qsa_mqa_kernel_dtype(device: torch.device) -> str:
     """SM70 tilelang MMA only supports FP16; newer archs use bf16."""
@@ -222,6 +224,12 @@ def qsa_mqa_prefill(
 ) -> torch.Tensor:
     if q.is_cuda and HAS_TILELANG:
         return tilelang_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
+    reject_fallback(
+        "qsa.indexer_prefill",
+        "native prefill requires CUDA input and TileLang",
+        query=q,
+        key=k,
+    )
     return torch_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
 
 

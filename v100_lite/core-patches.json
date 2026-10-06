@@ -1,5 +1,6 @@
 {
   "upstream_paths": {
+    "python/sglang/srt/environ.py": "Typed SM70 optimization switches and opt-in strict V100 dispatch diagnostics.",
     "python/sglang/kernels/ops/attention/fla/fused_sigmoid_gating_recurrent.py": "Optional FP16 recurrent state rounding at each verification step.",
     "python/sglang/srt/arg_groups/fields/model.py": "Allow explicit float16 QSA index cache.",
     "python/sglang/srt/managers/scheduler_pp_mixin.py": "Relay exact draft probabilities into sampled PP verification; cold rows fall back to target sampling.",

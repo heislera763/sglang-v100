@@ -10,6 +10,8 @@ from sgl_kernel.sampling import (
 )
 from sgl_kernel.utils import _to_tensor_scalar_tuple
 
+from .dispatch import reject_fallback
+
 
 def install():
     redact_logs()
@@ -245,6 +247,11 @@ def mix(original, self, hyper_input):
         or hyper_input.shape[1] != 10240
         or hyper_input.dtype != torch.float16
     ):
+        reject_fallback(
+            "qwen.hc_mix",
+            "native HC requires FP16 [rows, 10240] with rows in (1, 2, 4)",
+            hyper_input=hyper_input,
+        )
         return original(self, hyper_input)
     if self.config.hc_per_branch_norm:
         normed = self.hc_norm(hyper_input)
@@ -255,6 +262,15 @@ def mix(original, self, hyper_input):
     if not sm70_hc_down_gemv_silu_supported(
         normed, self.input_mix_weight_down.weight, self.input_mix_weight_up.weight
     ):
+        reject_fallback(
+            "qwen.hc_mix",
+            "native HC requires contiguous, aligned SM70 FP16 input/weights "
+            "with down/up shapes (320, 10240)/(10240, 320); batched HC "
+            "requires SGLANG_SM70_HC_NATIVE=1 and SGLANG_SM70_MTP_HC=1",
+            input=normed,
+            down_weight=self.input_mix_weight_down.weight,
+            up_weight=self.input_mix_weight_up.weight,
+        )
         return original(self, hyper_input)
     from .kernels.sm70_hc_mix import gate_supported, hc_down, hc_down_with_gate, hc_up
 
@@ -277,6 +293,11 @@ def combine(original, self, block_output, residuals):
         from .kernels.sm70_hc_mix import hc_apply_gate
 
         return hc_apply_gate(block_output, residuals[0], residuals[2])
+    reject_fallback(
+        "qwen.hc_combine",
+        "native fused combine requires the three-part state from the HC gate path",
+        output=block_output,
+    )
     return original(self, block_output, residuals)
 
 
@@ -343,6 +364,13 @@ def store(
             key, value, self.k_buffer[idx], self.v_buffer[idx], loc, k_scale, v_scale
         ):
             return
+    reject_fallback(
+        "qwen.fp8_kv_store",
+        "native cache writer requires E5M2 cache, non-HND layout, no DCP mask "
+        "and supported FP16 key/value tensors and scales",
+        key=key,
+        value=value,
+    )
     return original(
         self,
         layer,
@@ -361,6 +389,15 @@ def apply_unquant(original, self, layer, x, bias=None):
 
     if supported(x, layer.weight, bias):
         return linear_dense(x, layer.weight)
+    reject_fallback(
+        "gemm.unquantized_linear",
+        "native dense/small GEMM requires SGLANG_SM70_DENSE_GEMV=1, "
+        "aligned contiguous SM70 FP16 input/weights, no bias and a tuned "
+        "shape (rows 1, 2 or 4); batched shapes require SGLANG_SM70_MTP_SMALL_GEMM=1",
+        input=x,
+        weight=layer.weight,
+        bias=bias,
+    )
     return original(self, layer, x, bias)
 
 
@@ -453,6 +490,13 @@ def route_top10(original, scores, bias, topk, *args, **kwargs):
         from .kernels.sm70_nvfp4_moe_decode import sm70_topk10_softmax
 
         return sm70_topk10_softmax(scores)
+    reject_fallback(
+        "moe.top10_router",
+        "native router requires contiguous CUDA FP16/FP32 [rows, 512], "
+        "rows in (1, 2, 4), topk=10, no bias and default softmax routing options",
+        scores=scores,
+        bias=bias,
+    )
     return original(scores, bias, topk, *args, **kwargs)
 
 

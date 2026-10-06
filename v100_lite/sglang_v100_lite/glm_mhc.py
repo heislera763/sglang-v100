@@ -2,9 +2,16 @@
 
 import torch
 
+from .dispatch import reject_fallback
+
 
 def mhc_pre(original, residual, *args, **kwargs):
     if residual.dtype != torch.float16 or residual.shape[1] != 4:
+        reject_fallback(
+            "glm.mhc_pre",
+            "SM70 mHC requires FP16 residual with four branches",
+            residual=residual,
+        )
         return original(residual, *args, **kwargs)
     from sglang.kernels.ops.layernorm.mhc_sm70 import mhc_pre_sm70
     from sglang.srt.environ import envs
@@ -26,6 +33,12 @@ def mhc_pre(original, residual, *args, **kwargs):
 
 def mhc_post(original, x, residual, post_layer_mix, comb_res_mix):
     if x.dtype != torch.float16 or residual.shape[1] != 4:
+        reject_fallback(
+            "glm.mhc_post",
+            "SM70 mHC requires FP16 output and four residual branches",
+            output=x,
+            residual=residual,
+        )
         return original(x, residual, post_layer_mix, comb_res_mix)
     from sglang.kernels.ops.layernorm.mhc_post_split_h import mhc_post_split_h
 

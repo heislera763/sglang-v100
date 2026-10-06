@@ -1,10 +1,13 @@
 """SM70 QSA execution; all metadata and scheduling remain mainline."""
 
 import os
+
 import torch
 from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
     QwenSparseAttnBackend as BaseQSA,
 )
+
+from .dispatch import reject_fallback
 
 
 class QwenSparseAttnBackend(BaseQSA):
@@ -170,6 +173,15 @@ class QwenSparseAttnBackend(BaseQSA):
                     layer.scaling,
                 )
                 return self._pad_extend_output(out, q3.shape[0])
+            reject_fallback(
+                "qsa.prefill",
+                "neither native dense no-prefix prefill nor single-request "
+                "SM70 FP16 QSA prefill with E5M2 cache is supported",
+                query=q3,
+                key_cache=kb,
+                value_cache=vb,
+                indices=topk_indices,
+            )
         return super().forward_extend(
             q, k, v, layer, forward_batch, save_kv_cache, topk_indices, **kwargs
         )
@@ -198,6 +210,15 @@ class QwenSparseAttnBackend(BaseQSA):
                 layer.scaling,
             )
             return out.reshape(q.shape[0], -1)
+        reject_fallback(
+            "qsa.paged_attention",
+            "native decode/verify requires SM70 FP16 [rows, 6, 256], "
+            "matching row metadata/indices and E5M2 [pages, 1, 256] cache",
+            query=q,
+            key_cache=kb,
+            value_cache=vb,
+            indices=topk_indices,
+        )
         return super()._forward_paged_attention(q, layer, forward_batch, topk_indices)
 
 
@@ -231,4 +252,11 @@ def mqa_decode(
             max_model_len,
             score_scale or q.shape[-1] ** 0.5,
         )
+    reject_fallback(
+        "qsa.indexer_decode",
+        "native indexer requires FP16 [rows, 4, 128] query and FP16 "
+        "[pages, 4 or 16, 1, 128] key cache",
+        query=q,
+        key_cache=k_cache,
+    )
     return original(q, k_cache, page_table, context_lens, max_model_len, score_scale)
