@@ -31,6 +31,7 @@ def _pool4_decode_write(
     CACHE_STRIDE: tl.constexpr,
     TABLE_STRIDE: tl.constexpr,
     ROUND_SCALE: tl.constexpr,
+    RETAIN_CLOSED_TAIL: tl.constexpr,
 ):
     b = tl.program_id(0)
     req = tl.load(REQS + b).to(tl.int64)
@@ -41,6 +42,8 @@ def _pool4_decode_write(
         cols = tl.arange(0, 128)
         key = tl.load(K + b * K_ROW + cols * K_COL).to(tl.bfloat16).to(tl.float32)
         gate = tl.load(G + b * G_ROW + cols * G_COL).to(tl.float32)
+        if RETAIN_CLOSED_TAIL:
+            gate = gate.to(tl.bfloat16).to(tl.float32)
         if length % 4 == 0:
             slots = tl.arange(0, 4)
             closed_tail_pos = (prefix - slot + slots) % TAIL_SIZE
@@ -89,7 +92,7 @@ def _pool4_decode_write(
                 tl.pointer_type(tl.float32)
             )
             tl.store(scale_ptr, scale)
-        else:
+        if (length % 4 != 0) | RETAIN_CLOSED_TAIL:
             tail_pos = prefix % TAIL_SIZE
             tl.store(TAIL_K + req * TAIL_SIZE * 128 + tail_pos * 128 + cols, key)
             tl.store(TAIL_G + req * TAIL_SIZE * 128 + tail_pos * 128 + cols, gate)
@@ -168,6 +171,7 @@ def pool4_decode_sm70(
     request_ids,
     seq_lens,
     round_scale=False,
+    retain_closed_tail=False,
 ):
     """Append one key per request, close pools on-device, and gather FP16 keys.
 
@@ -221,6 +225,7 @@ def pool4_decode_sm70(
         cache.stride(0),
         token_table.stride(0),
         round_scale,
+        retain_closed_tail,
         num_warps=4,
         enable_fp_fusion=False,
     )
@@ -229,6 +234,204 @@ def pool4_decode_sm70(
         token_table,
         request_ids,
         seq_lens,
+        gathered,
+        scales,
+        pools,
+        cache.stride(0),
+        token_table.stride(0),
+        capacity,
+        16,
+        num_warps=4,
+    )
+    return gathered, scales, pools
+
+
+@triton.jit
+def _pool4_spec_write(
+    K,
+    G,
+    APE,
+    TAIL_K,
+    TAIL_G,
+    CACHE,
+    REQS,
+    STARTS,
+    TAIL_STARTS,
+    WRITE_LOCS,
+    OUT_LOCS,
+    EFFECTIVE_N,
+    K_ROW: tl.constexpr,
+    G_ROW: tl.constexpr,
+    A_ROW: tl.constexpr,
+    A_COL: tl.constexpr,
+    TAIL_SIZE: tl.constexpr,
+    CACHE_STRIDE: tl.constexpr,
+    WRITE_STRIDE: tl.constexpr,
+    N: tl.constexpr,
+    MAX_CLOSED: tl.constexpr,
+    ROUND_SCALE: tl.constexpr,
+    HAS_EFFECTIVE_N: tl.constexpr,
+):
+    b = tl.program_id(0)
+    req = tl.load(REQS + b).to(tl.int64)
+    start = tl.load(STARTS + b).to(tl.int32)
+    active = tl.load(OUT_LOCS + b * N) != 0
+    if active & (req >= 0) & (start >= 0):
+        cols = tl.arange(0, 128)
+        for i in tl.static_range(N):
+            row = b * N + i
+            pos = (start + i) % TAIL_SIZE
+            key = tl.load(K + row * K_ROW + cols).to(tl.bfloat16)
+            gate = tl.load(G + row * G_ROW + cols).to(tl.bfloat16)
+            tl.store(TAIL_K + (req * TAIL_SIZE + pos) * 128 + cols, key)
+            tl.store(TAIL_G + (req * TAIL_SIZE + pos) * 128 + cols, gate)
+        tl.debug_barrier()
+        effective_n = tl.load(EFFECTIVE_N + b) if HAS_EFFECTIVE_N else N
+        closed = (start + effective_n) // 4 - start // 4
+        base = tl.load(TAIL_STARTS + b).to(tl.int32)
+        slots = tl.arange(0, 4)
+        for p in tl.static_range(MAX_CLOSED):
+            if p < closed:
+                positions = (base + p * 4 + slots) % TAIL_SIZE
+                offsets = (req * TAIL_SIZE + positions[:, None]) * 128 + cols[None, :]
+                keys = tl.load(TAIL_K + offsets).to(tl.float32)
+                scores = tl.load(TAIL_G + offsets).to(tl.float32)
+                scores += tl.load(
+                    APE + slots[:, None] * A_ROW + cols[None, :] * A_COL
+                ).to(tl.float32)
+                prob = tl.exp(scores - tl.max(scores, 0)[None, :])
+                prob = prob / tl.sum(prob, 0)[None, :]
+                x = tl.sum(prob * keys, 0).to(tl.bfloat16).to(tl.float32)
+                x = _hadamard_stage(x, 64, 1)
+                x = _hadamard_stage(x, 32, 2)
+                x = _hadamard_stage(x, 16, 4)
+                x = _hadamard_stage(x, 8, 8)
+                x = _hadamard_stage(x, 4, 16)
+                x = _hadamard_stage(x, 2, 32)
+                x = _hadamard_stage(x, 1, 64)
+                encoded, scale = _quantize_row(
+                    (x * 128**-0.5).to(tl.bfloat16).to(tl.float32), ROUND_SCALE
+                )
+                loc = tl.load(WRITE_LOCS + b * WRITE_STRIDE + p).to(tl.int64)
+                page, offset = loc // 64, loc % 64
+                tl.store(CACHE + page * CACHE_STRIDE + offset * 128 + cols, encoded)
+                scale_ptr = (CACHE + page * CACHE_STRIDE + 8192 + offset * 4).to(
+                    tl.pointer_type(tl.float32)
+                )
+                tl.store(scale_ptr, scale)
+
+
+def pool4_spec_sm70(
+    keys,
+    gates,
+    ape,
+    tail_keys,
+    tail_gates,
+    cache,
+    token_table,
+    request_ids,
+    write_starts,
+    tail_starts,
+    write_locations,
+    out_locations,
+    query_request_ids,
+    query_lengths,
+    effective_num_tokens=None,
+    round_scale=False,
+):
+    """Apply upstream chain verify/draft-extend plans using software FP8.
+
+    Stage every candidate in the extra-width tail ring, but close only pools
+    within effective_num_tokens when supplied by draft-extend. Rejected future
+    pools remain outside the next round's causal lengths and are overwritten
+    before becoming visible. The caller owns plans, token pages and rollback.
+    """
+    batch = request_ids.numel()
+    if batch == 0 or keys.shape[0] % batch:
+        raise ValueError("Speculative pool4 requires a fixed chain width per request")
+    n = keys.shape[0] // batch
+    max_closed = (n + 3) // 4
+    if not 1 <= n <= 6 or keys.shape != gates.shape or keys.shape[1:] != (128,):
+        raise ValueError("SM70 pool4 supports chain widths 1..6 and 128-wide keys")
+    if (
+        ape.shape != (4, 128)
+        or tail_keys.shape != tail_gates.shape
+        or tail_keys.shape[1] < 4 + n
+        or tail_keys.shape[-1] != 128
+        or tail_keys.dtype != torch.bfloat16
+        or tail_gates.dtype != torch.bfloat16
+        or cache.dtype != torch.uint8
+        or cache.ndim != 2
+        or cache.shape[1] != 8448
+        or write_locations.shape != (batch, max_closed)
+        or out_locations.numel() != keys.shape[0]
+        or query_lengths.numel() != keys.shape[0]
+        or query_request_ids.numel() != keys.shape[0]
+        or write_starts.numel() != batch
+        or tail_starts.numel() != batch
+    ):
+        raise ValueError("Invalid SM70 speculative pool4 plan or cache layout")
+    tensors = [
+        keys,
+        gates,
+        ape,
+        tail_keys,
+        tail_gates,
+        cache,
+        token_table,
+        request_ids,
+        write_starts,
+        tail_starts,
+        write_locations,
+        out_locations,
+        query_request_ids,
+        query_lengths,
+    ]
+    if effective_num_tokens is not None:
+        if effective_num_tokens.numel() != batch:
+            raise ValueError("Effective chain lengths must match request count")
+        tensors.append(effective_num_tokens)
+    if any(t.device != keys.device or not t.is_contiguous() for t in tensors):
+        raise ValueError("SM70 speculative pool4 requires contiguous colocated tensors")
+    capacity = token_table.shape[1] // 4
+    gathered = torch.empty(
+        (keys.shape[0], capacity, 128), dtype=torch.float16, device=keys.device
+    )
+    scales = torch.empty(
+        (keys.shape[0], capacity), dtype=torch.float32, device=keys.device
+    )
+    pools = torch.empty((keys.shape[0],), dtype=torch.int32, device=keys.device)
+    _pool4_spec_write[(batch,)](
+        keys,
+        gates,
+        ape,
+        tail_keys,
+        tail_gates,
+        cache,
+        request_ids,
+        write_starts,
+        tail_starts,
+        write_locations,
+        out_locations,
+        effective_num_tokens,
+        keys.stride(0),
+        gates.stride(0),
+        *ape.stride(),
+        tail_keys.shape[1],
+        cache.stride(0),
+        write_locations.stride(0),
+        n,
+        max_closed,
+        round_scale,
+        effective_num_tokens is not None,
+        num_warps=4,
+        enable_fp_fusion=False,
+    )
+    _pool4_decode_gather[(keys.shape[0], triton.cdiv(capacity, 16))](
+        cache,
+        token_table,
+        query_request_ids,
+        query_lengths,
         gathered,
         scales,
         pools,

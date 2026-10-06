@@ -47,6 +47,15 @@ requires `SGLANG_OPT_SM70_MHC_PROJECTION=0`; the two mHC implementations are
 mutually exclusive. Existing shape/dtype/scheduling guards retain the fallback
 paths for unsupported cases.
 
+The fast branch supports GLM's native MTP with EAGLE, top-k one and linear
+chains of up to six verification slots. TP8 batch-one offline runs have exercised
+one- and five-step drafting, target/draft graphs, partial rejection and request
+reuse. PP+MTP, sampling and concurrent requests remain unvalidated. The SM70
+cache writer consumes upstream speculative write plans and causal lengths;
+the scheduler and verifier are unchanged. MTP remains an explicit CLI choice:
+`--speculative-algorithm EAGLE --speculative-num-steps 5
+--speculative-eagle-topk 1 --speculative-num-draft-tokens 6`.
+
 Preliminary batch-one measurements on eight 32 GB V100s:
 
 | Model/profile | Prompt tokens | PP tokens/s | TG tokens/s |
@@ -66,6 +75,19 @@ generated tokens. At 2K, PP remains approximately 674–675 tokens/s.
 Extending GEMV dispatch to the measured TP4 projection shapes raises TP4×PP2 TG
 from 23.45 to 25.00 tokens/s at 2K (6.6%); prefill remains approximately 1,080
 tokens/s. TP8 leads single-request TG, while TP4×PP2 leads longer-prompt prefill.
+
+A fresh TP8 comparison with an 8,192-token cache cap measures 41.54 TG without
+MTP and 49.30 with five draft steps at 2K: TG improves 18.7%, while PP falls
+from 675.4 to 618.2 tokens/s. At 128 tokens, TG rises from 41.59 to 49.75.
+A separate one-step MTP run with automatic cache capacity reaches only 33.29
+TG at 2K. The extra prefill cost consumes the five-step decode saving for a
+2K prompt with 64 output tokens; longer answers stand to benefit more.
+All 11 greedy output sequences in each MTP profile match the non-MTP control;
+this is bounded evidence, not a general parity guarantee. Runs use three
+measured repetitions after warmup, 64 output tokens and a 0.90 static fraction;
+the five-step run and its matched control cap total cache capacity at 8,192
+tokens. Extra draft weights and graph memory require separate budgeting from
+the non-MTP profile.
 
 ## Build and use
 

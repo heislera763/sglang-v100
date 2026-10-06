@@ -199,6 +199,15 @@ register_kernel(
     )
 )
 
+register_kernel(
+    KernelSpec(
+        op="attention.pool4_spec_sm70",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.dsa.sm70_pool4_decode:pool4_spec_sm70",
+        capabilities={CapabilityRequirement.cuda(min_sm=(7, 0), max_sm=(7, 0))},
+    )
+)
+
 # DeepSeek DSA / DSV4 kernels migrated in Phase 2.5 (RFC #29630);
 # registered for inventory. Import them from their modules.
 for _mod, _fn in [
