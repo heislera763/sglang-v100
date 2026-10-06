@@ -1,176 +1,253 @@
 # sglang-v100-plus
 
-SM70 support for [SGLang](https://github.com/sgl-project/sglang), targeting V100
-SXM2 GPUs arranged as two NVLink quads. This fork ports selected compatibility
-work from [haohervchb/sglang-V100](https://github.com/haohervchb/sglang-V100) onto
-recent mainline, using plugin hooks rather than carrying the original fork's
-entire patch set. Source revisions and attribution are in
+SM70 support for [SGLang](https://github.com/sgl-project/sglang), tuned for V100
+SXM2 GPUs arranged as two NVLink quads. We rebuilt the compatibility work from
+[haohervchb/sglang-V100](https://github.com/haohervchb/sglang-V100) on mainline,
+selectively porting its kernels into plugin hooks and shared operators. This
+is effectively a rebase of the useful hardware adaptations into an independent
+fork, with a smaller surface for future upstream updates. The integrated
+upstream revision is `affa261e3d28`; exact origins and revisions are recorded in
 [v100_lite/provenance.json](v100_lite/provenance.json).
 
-## Code organization
+## Architecture and scope
 
-- `v100_lite/sglang_v100_lite/`: opt-in SM70 runtime adapters and CUDA/Triton
-  kernels; no copied model implementations.
-- `v100_lite/aot/`, `v100_lite/patches/`: selected native build and Marlin patches.
-- `python/sglang/kernels/ops/`: shared operators where public kernel integration
-  is appropriate, including GLM additions on its branch.
-- `v100_lite/tests/gpu_checks.py` and `test/registered/`: numerical/operator and
-  distributed regression tests.
+Each NVLink quad has 128 GB of installed GPU memory. TP4 keeps Qwen's frequent
+collectives inside one quad. TP8 spans both quads over PCIe/host links.
+TP4×PP2 confines TP collectives to each quad and passes activations between
+stages; its potential prefill advantage does not imply lower single-request
+decode latency. Models share memory with KV/recurrent caches, draft weights
+and workspaces, so 256 GB installed is not 256 GB available for weights.
 
-Host services, deployment profiles, transfer scripts, investigation harnesses,
-runbooks and experiment results belong outside this code repository.
+NVFP4 weights are unpacked into FP16 arithmetic through the SM70 Marlin/WMMA
+adapter and selected GEMV kernels. FP8 cache/indexer formats use software
+conversion on Volta. Qwen support includes QSA, GDN, gated residual connections
+and pinned-host n-gram embeddings. GLM adds sparse MLA/K-pool indexing, KDA and
+mHC, with FP16 activations/residuals and FP32 indexer head weights/mHC parameters.
+Current measured profiles use eager prefill and batch-one decode graphs.
 
-## Architecture and branches
+| Branch | Purpose |
+| --- | --- |
+| `main` | Established Qwen and SM70 compatibility |
+| `glm-5.3-flash` | GLM compatibility and conservative operator paths |
+| `glm-5.3-flash-fast` | GLM speed work; floating-point reduction differences are accepted |
 
-Each four-GPU NVLink quad has 128 GB of installed GPU memory. Communication
-between quads uses PCIe/host links; weights share memory with caches and
-workspaces. TP4 is the established Qwen profile. TP4×PP2 keeps frequent TP
-collectives inside each quad for larger models; TP8 spans both quads.
+On the fast branch, batch-one NVFP4 GEMV and fused mHC projection/RMS are on
+by default for supported shapes. The checkpoint and model architecture stay
+fixed, but reduction order can change routing, logits and generated tokens.
+Operator references, finite-output checks and native model runs are development
+gates; coherent prose is not a correctness test, and these gates do not prove
+whole-model sampled-distribution or exact reference-output equivalence.
 
-`main` contains established Qwen/SM70 support. `glm-5.3-flash` adds experimental
-GLM-5.3-Flash NVFP4 support, software FP8 indexing, sparse MLA, FP16 mHC and KDA
-compatibility. GLM currently uses eager prefill and batch-one decode graphs;
-MTP and multi-user throughput remain unvalidated.
+For an unfused comparison, set
+`SGLANG_OPT_SM70_NVFP4_GEMV=0 SGLANG_OPT_SM70_MHC_PROJECTION=0`.
+`SGLANG_OPT_SM70_MHC_POINTWISE=1` requires projection fusion to be off.
+These alternatives have their own numerical/performance behavior.
 
-`glm-5.3-flash-fast` builds on the GLM branch and prioritizes speed over exact
-reference token/logit parity. Batch-one SM70 NVFP4 GEMV and fused mHC
-projection/RMS are enabled by default for their supported shapes. Checkpoint
-weights, quantization and model architecture are unchanged; accumulation order
-changes can alter generated tokens. Development gates remain numerical
-agreement with independent operator references, finite outputs, bounded
-generation smoke checks and full-model performance measurements. These checks
-do not establish broad quality equivalence.
+## Preliminary performance
 
-Set `SGLANG_OPT_SM70_NVFP4_GEMV=0 SGLANG_OPT_SM70_MHC_PROJECTION=0` to compare
-against the unfused paths. The alternative `SGLANG_OPT_SM70_MHC_POINTWISE=1`
-requires `SGLANG_OPT_SM70_MHC_PROJECTION=0`; the two mHC implementations are
-mutually exclusive. Existing shape/dtype/scheduling guards retain the fallback
-paths for unsupported cases.
+Maintainer measurements on eight 32 GB V100 SXM2s, **2026-10-06**. Numbers below
+are generation tokens/s on real chat prompts, using the pinned
+[llama.cpp SPEED-Bench HTTP client](https://github.com/ggml-org/llama.cpp/blob/abeada335e2e78bd3fe63febafab7e900ce75810/tools/server/bench/speed-bench/README.md)
+and [NVIDIA SPEED-Bench dataset](https://huggingface.co/datasets/nvidia/SPEED-Bench).
+These links identify the workload and methodology; the GPU results are this
+fork's measurements, not NVIDIA or the model labs' published performance.
 
-The fast branch supports GLM's native MTP with EAGLE, top-k one and linear
-chains of up to six verification slots. TP8 and TP4×PP2 batch-one offline runs
-have exercised target/draft graphs, rejection, request reuse and sampled decoding
-at temperature 1/top-p 0.95. The SM70 cache writer consumes upstream plans;
-the PP relay now preserves the exact draft proposal probabilities by request,
-and greedy prefills use the same proposal policy as decode. Concurrent requests
-remain unvalidated. MTP remains an explicit CLI choice:
-`--speculative-algorithm EAGLE --speculative-num-steps 5
---speculative-eagle-topk 1 --speculative-num-draft-tokens 6`.
-Sampled MTP tests add `--speculative-use-rejection-sampling`; aggregate PP+MTP
-requires `SGLANG_ENABLE_PP_SPEC=1` and `--disable-overlap-schedule`.
+### Qwen3.8-Flash-Next NVFP4, TP4
 
-Preliminary batch-one measurements on eight 32 GB V100s:
-
-| Model/profile | Prompt tokens | PP tokens/s | TG tokens/s |
+| Category | 1 draft step | 2 draft steps | 3 draft steps |
 | --- | ---: | ---: | ---: |
-| Qwen3.8-Flash-Next, TP4 + MTP, sampled thinking | 1,000 | 3,229 | 126.0 |
-| GLM-5.3-Flash fast, TP8 | 2,048 | 675.0 | 41.52 |
-| GLM-5.3-Flash fast, TP4×PP2 | 2,048 | 1,079.2 | 25.00 |
+| Coding | 87.6 | 109.1 | 98.6 |
+| QA | 92.8 | 107.9 | 93.2 |
+| Writing | 91.1 | 106.4 | 102.8 |
+| Low-entropy code | 88.3 | 101.4 | 107.3 |
 
-These are profile-specific development measurements. The matched GLM runs use
-256-token prefill chunks, a 24/21 PP split and no speculation; they do not
-predict concurrent-request throughput or imply cross-model comparisons.
-Greedy measurements are diagnostics; sampled performance is the primary tuning
-target. Use the lab's settings for the exact model and thinking mode, including
-penalties, rather than assuming checkpoint generation defaults cover them.
-[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next#api-usage)
-specifies T=1/top-p=0.95/top-k=20 with no presence penalty for thinking, and
-T=0.7/top-p=0.80/top-k=20/presence penalty=1.5 for non-thinking; both use
-min-p=0 and repetition penalty=1.
-[GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash#footnotes) publishes
-task-specific sampled recipes; our T=1/top-p=0.95 profile matches the checkpoint
-defaults and several lab evaluations. Speculative verification currently
-broadcasts history penalties across each block, so nonzero penalties do not yet
-have ordinary decoding's per-token semantics.
+Two steps leads these qualitative samples; three leads low-entropy code.
+One-step acceptance is 72–82%, but produces fewer tokens per verification.
+Its early/late control cycles stay at 19.51/19.58 ms. The old two-step collapse
+(7.9–15.8 tokens/s) was missing three-row HC/small-GEMM coverage: verification
+fell onto a slow generic route. Native one-through-four-row coverage removes
+that gap. A prior no-MTP run was about 71 tokens/s; it predates strict dispatch
+and is not a same-revision control for this table.
 
-Matched Qwen TP4 offline runs use the lab's thinking settings, EAGLE3/1/4 with
-classical rejection sampling, no overlap/radix caching, 8K prefill chunks,
-16K cache capacity and a 0.88 static fraction. Median TG rises from 70.1 to
-126.0 tokens/s at 1K and from 70.0 to 124.8 at 8K. Each uses three repetitions
-after warmup and 128 output tokens. The former 125.3 tokens/s result used greedy
-decoding and a different serving profile. These measurements establish a sampled
-speed gain, not exact output parity or broad quality equivalence.
+### GLM-5.3-Flash NVFP4, TP8
 
-Initial matched TP8 offline Engine runs on the fast branch improve TG from
-32.58 to 41.70 tokens/s at 128 prompt tokens and 32.50 to 41.52 at 2,048
-(about 28%). Each uses three measured repetitions, an excluded warmup and 64
-generated tokens. At 2K, PP remains approximately 674–675 tokens/s.
-Extending GEMV dispatch to the measured TP4 projection shapes raises TP4×PP2 TG
-from 23.45 to 25.00 tokens/s at 2K (6.6%); prefill remains approximately 1,080
-tokens/s. TP8 leads single-request TG, while TP4×PP2 leads longer-prompt prefill.
+| Category | No MTP | 2 steps | 3 steps | 4 steps | 5 steps, repeated |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Coding | 39.8 | 40.1 | 32.6 | 45.7 | 38.0 |
+| QA | 39.8 | 36.6 | 25.9 | 37.9 | 30.5 |
+| Writing | 39.9 | 36.5 | 25.0 | 43.9 | 28.2 |
+| Low-entropy code | 39.1 | 38.6 | 22.1 | 48.8 | 26.6 |
 
-Matched five-step MTP comparisons at 2K (TG tokens/s):
+Four is the best tested draft depth for this suite, although QA still trails
+ordinary decoding. Its early/late cycles stay at 80.93/80.77 ms. Three grows
+from 92.78 to 158.73 ms, and a fresh five-step control from 101.42 to 186.61 ms;
+the five-step slowdown was observed in two independent launches. Three accepts
+more drafts than four in every category yet runs slower. The cause of the
+cycle growth remains unresolved; acceptance alone does not explain it.
+The conditional depth descent stopped when three regressed; GLM one-step has
+not been tested. These TP8 results do not establish the best PP2 draft depth.
 
-| Layout | Sampling | Without MTP | With MTP |
-| --- | --- | ---: | ---: |
-| TP8 | Greedy | 41.4 | 48.8 |
-| TP4×PP2 | Greedy | 25.0 | 37.0 |
-| TP8 | Temperature 1, top-p 0.95 | 39.8 | 19.8 |
-| TP4×PP2 | Temperature 1, top-p 0.95 | 24.8 | 13.6 |
+### Measurement definition and provenance
 
-Five-step MTP helps greedy TG; it loses with sampling on these inputs.
-Greedy PP drops from 675.5 to 611.7 tokens/s at TP8 and from 1,088.1 to 958.6
-at TP4×PP2. Prefill cost offsets some decode saving on short answers.
-Runs use three repetitions after warmup, 64 forced output tokens, batch one,
-8,192-token cache capacity and a 0.92 static fraction. All 11 greedy output
-sequences per layout match their non-MTP controls; sampler checks compare with
-a CPU oracle and verify actual proposal probabilities. This does not establish
-broad model-quality or sampled-output parity. Extra draft weights and graphs
-need separate memory budgeting; the PP+MTP last quad has limited headroom.
+Both tables use concurrency 1, a 512-token output cap and twelve excluded
+32-token warmups per profile. `qualitative` has two prompts each for coding,
+QA and writing; `throughput_1k/low_entropy` has six repository-code completions.
+Masked placeholders are excluded. Thinking consumes the output budget, and
+sampled outputs/lengths can differ. Category rates are arithmetic means of
+per-request native decode throughput, not a full-dataset leaderboard score.
+Small single passes do not establish small speed gains or multi-user capacity.
 
-## Build and use
+The client was adapted to non-streaming SGLang
+[`return_meta_info`](python/sglang/srt/entrypoints/openai/serving_chat.py):
+`choices[0].meta_info.decode_throughput`, checked against
+`(completion_tokens - 1) / (e2e_latency - first_token_latency)`.
+Accepted/proposed draft counts exclude bonus tokens and are checked against
+verification histograms. The upstream client expects llama.cpp-specific
+`timings`; pointing it at SGLang without this extraction does not reproduce
+these metrics. Timing runs capture no logits/probability tensors. Raw responses,
+commands and validation remain in the maintainer's separate benchmark workspace;
+this repository contains the summary and reproducibility identifiers.
 
-For development, `SGLANG_DEBUG_V100_STRICT_DISPATCH=1` makes guarded V100
-dispatch reject fallback paths with the operation name, expected contract and
-tensor shape/dtype/device/layout. Native Qwen HC/small-GEMM verification now
-covers one through four rows. All development benchmark and kernel runs use
-strict mode; fix uncovered paths rather than disabling it. Default
-`0` preserves normal optional dispatch.
-The mode is deliberately strict, including guarded prefill calls and disabled
-fast-path options: a full-model run can stop at the first coverage gap during
-startup or execution. It covers the plugin's HC/mHC, dense linear, router,
-NVFP4 MoE, QSA attention/indexer and E5M2 cache dispatch boundaries, rather than
-every Torch operation or upstream backend. Explicit SM70 FP16 cuBLAS prefill,
-declared Qwen/GLM projections (including FP32 GLM indexer head weights),
-native CUDA HC combine and SM70 Marlin
-routes are valid primary backends, not implicit fallbacks. Native variants
-within a selected path still use their existing scheduling. It does not change sampling,
-precision or tensor contents.
+| Profile | GPUs / layout | Context/cache | Static fraction | Prefill chunk | KV format |
+| --- | --- | ---: | ---: | ---: | --- |
+| Qwen | Full-Gen3 NVLink quad, TP4 | 16,384 | 0.88 | 8,192 | FP8 E5M2 |
+| GLM | Both quads, TP8 | 8,192 | 0.92 | 256 | Ordinary FP16 MLA |
 
-Requires Python 3.12/uv, a CUDA 12.9 toolchain and SM70 GPUs. The project lock
-pins the Volta-compatible CUDA-12 stack and selected `sglang-kernel` build.
+All use FP16 activations/state, NVFP4 Marlin, no overlap/radix caching and
+classical rejection sampling with branch width one. Qwen uses thinking/xhigh,
+T=1/top-p=0.95/top-k=20. GLM uses max effort/clear thinking,
+T=1/top-p=0.95/unrestricted top-k. Both use min-p=0, additive penalties=0,
+repetition penalty=1 and request/server seed 531. A request seed does not force
+identical sampled sequences across speculative configurations.
+
+Qwen two/three-step source:
+[`ad9e6f8d`](https://github.com/heislera763/sglang-v100-plus/commit/ad9e6f8d326824a549317c196d5a8707e7b306ee).
+Qwen one-step and all GLM rows:
+[`3eb3b844`](https://github.com/heislera763/sglang-v100-plus/commit/3eb3b84455e094f66c6d5738b8817e321e8c466f).
+The intervening patch declares GLM library projections and changes diagnostic
+text/tests/README; Qwen numerical kernels are unchanged. Early/late controls
+accompany Qwen one-step and GLM two/three/four/repeated-five-step runs and are
+excluded from the category averages.
+
+<details>
+<summary>Pinned workload selection</summary>
+
+Client revision: `abeada335e2e78bd3fe63febafab7e900ce75810`.
+Dataset revision: `454f88454792dfa3ccfd7ef15fff248efde44cd1`.
+Select these `question_id` values and send their first `turns` entry as a user
+message; these rows each contain one real turn.
+
+```json
+{
+  "qualitative": {
+    "coding": ["0daf539b787c4dccbb547330a8b4c3d7", "135c7fe91faa48fd83ca5eac94c09f00"],
+    "qa": ["a3ac2c931db84417a211b7d8756b5ff1", "2caa2289a2574756bb51967df812c420"],
+    "writing": ["bec8b7f8659648118561e17008cc59cf", "5beba2e064e244a49a78aa83a0ae23e3"]
+  },
+  "throughput_1k/low_entropy": [
+    "2afab7aa17f54849bf304a71cd57a6e6", "b67d4a675bc64caabe13fbf924998256",
+    "ebe95e276bb242e3a85a447331e66ed4", "cfce22f2e1bd4d65b643630c5808ae4f",
+    "67851b996d744da99bec992aafda6d5f", "6f219a885333415793f1e804cb273112"
+  ]
+}
+```
+
+Checkpoints:
+[RadixArk/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4)
+and [RadixArk/GLM-5.3-Flash-NVFP4](https://huggingface.co/RadixArk/GLM-5.3-Flash-NVFP4/tree/f46cf340d35a22d0d83d0c1dac8957cf2b1bcd35).
+The transferred Qwen checkpoint has no retained Hub revision; it is identified
+by repository name, so exact weight provenance is less complete than GLM's.
+
+</details>
+
+### Historical prefill diagnostics
+
+Older offline Engine tests (2026-10-05, source `6b4bfc6b`) used 2,048 random
+input token IDs, 64 forced output tokens, greedy decoding and three measured
+repeats after warmup:
+
+| GLM layout | Prefill tokens/s | Generation tokens/s |
+| --- | ---: | ---: |
+| TP8 | 675.5 | 41.4 |
+| TP4×PP2, 24/21 layers | 1,088.1 | 25.0 |
+
+Both used cache/context 8,192, static fraction 0.92 and prefill chunks 256.
+These are synthetic execution diagnostics, useful for the measured prefill
+layout comparison. Their MTP acceptance is not representative of coherent
+text, and they are not the SPEED-Bench results above. Earlier Qwen figures near
+126 tokens/s used one padded natural web-service task, 128 forced output tokens
+and a different repetition protocol; they are a separate workload too.
+
+## Sampling and speculative decoding
+
+Use the exact model's lab settings. The
+[Qwen model card](https://huggingface.co/Qwen/Qwen3.8-Flash-Next#api-usage)
+recommends the thinking parameters above; non-thinking uses T=0.7/top-p=0.80,
+top-k=20 and presence penalty=1.5. The
+[GLM model card](https://huggingface.co/zai-org/GLM-5.3-Flash#footnotes)
+publishes task-specific recipes, and its
+[checkpoint defaults](https://huggingface.co/RadixArk/GLM-5.3-Flash-NVFP4/blob/f46cf340d35a22d0d83d0c1dac8957cf2b1bcd35/generation_config.json)
+use T=1/top-p=0.95. Our max-effort chat profile is one such sampled profile,
+not a universal recommendation for every task.
+
+One MTP head is called repeatedly: `D` draft steps means `D + 1` verification
+positions, including the bonus-token opportunity. Branch width one is
+`--speculative-eagle-topk 1`; it is separate from Qwen's sampling top-k of 20.
+More acceptance or shorter drafts need not mean more tokens/s. Current
+speculative penalties are broadcast across a verification block in
+[`eagle_utils.py`](python/sglang/srt/speculative/eagle_utils.py); nonzero history
+penalties do not yet have ordinary decoding's per-token semantics.
+
+TP8 GLM has realistic sampled performance evidence above. TP4×PP2 MTP has
+bounded earlier offline coverage of target/draft graphs, request reuse,
+rejection and temperature-1 sampling. Its proposal-probability relay and greedy
+prefill policy have focused regressions; eleven greedy sequences per layout
+matched their non-MTP controls in that earlier check. These checks preceded
+strict dispatch and do not establish current realistic sampled PP performance,
+concurrency, larger-context capacity or TP8/TP4 output parity.
+
+The next performance target is **GLM TP4×PP2 sampled MTP**, starting from the
+retained 24/21 split and comparing with a matched non-MTP control on coherent
+prompts. Draft depth must be measured for PP, rather than inherited from TP8.
+The last quad also hosts the draft model and has limited memory headroom.
+The experimental aggregate PP path requires `SGLANG_ENABLE_PP_SPEC=1`,
+EAGLE/top-k one and `--disable-overlap-schedule`; adaptive depth and attention
+DP are rejected by the current
+[PP compatibility checks](python/sglang/srt/arg_groups/validation_hook.py).
+
+## Build and development
+
+Requires Python 3.12/uv, CUDA 12.9 and SM70 GPUs. The lock pins the CUDA-12
+stack and selected `sglang-kernel` build. Setup builds the project-local SM70
+Marlin extension and applies its checked-in patches.
 
 ```bash
 git clone https://github.com/heislera763/sglang-v100-plus.git
 cd sglang-v100-plus
+git switch glm-5.3-flash-fast
 bash v100_lite/setup.sh
 ```
 
-Use normal SGLang model/scheduling flags with the guarded plugin entry point:
+All development runs use `SGLANG_DEBUG_V100_STRICT_DISPATCH=1`. Guarded HC/mHC,
+linear, router, NVFP4 MoE, QSA attention/indexer and E5M2 cache boundaries fail
+with tensor metadata when coverage is missing. Native Qwen HC/small GEMM covers
+one through four rows, allowing one/two/three draft steps. Declared SM70
+cuBLAS projections, native CUDA HC combine and Volta Marlin are valid primary
+backends. Strict mode does not promise the fastest variant at every shape or
+instrument every upstream operation. Default 0 preserves optional dispatch;
+development fixes gaps instead of turning the guard off.
+
+The examples below target `glm-5.3-flash-fast`. Common environment, from the
+repository root:
 
 ```bash
-SGLANG_PLUGINS=v100_lite SGLANG_V100_LITE=1 \
-  uv run --no-project .venv/bin/python -m sglang_v100_lite --help
-```
-
-Refer to upstream SGLang for API usage. Configure models, GPU selection and
-serving policy separately for your host.
-
-### Qwen3.8-Flash-Next: thinking + MTP
-
-Quick reference for `glm-5.3-flash-fast`, from the repository root. GPUs 4–7
-are this machine's full-Gen3 NVLink quad; choose a single NVLink quad on other
-hosts. This is the serving equivalent of the measured batch-one, 16K offline
-profile above, with the user's LAN endpoint and API key.
-
-```bash
-export CUDA_VISIBLE_DEVICES=4,5,6,7
 export CUDA_HOME=/usr/local/cuda-12.9
 export PATH="$PWD/.venv/bin:$CUDA_HOME/bin:$PATH"
 export TRITON_PTXAS_PATH="$CUDA_HOME/bin/ptxas"
 export TORCH_CUDA_ARCH_LIST=7.0 OMP_NUM_THREADS=4 MAX_JOBS=4
 export NCCL_P2P_LEVEL=PHB NCCL_NVLS_ENABLE=0
 export SGLANG_PLUGINS=v100_lite SGLANG_V100_LITE=1
+export SGLANG_DEBUG_V100_STRICT_DISPATCH=1
 export SGLANG_V100_MARLIN_DIR="$PWD/artifacts/marlin-v100/vllm"
 export SGLANG_JIT_CACHE_DIR="$PWD/.cache/jit"
 export SGLANG_V100_NVFP4_MOE_BUILD_DIR="$PWD/.cache/nvfp4_moe"
@@ -178,11 +255,20 @@ export SGLANG_V100_DECODE_CUDA_BUILD_DIR="$PWD/.cache/longctx"
 export SGLANG_SM70_DENSE_GEMV=1
 export SGLANG_MAMBA_CONV_DTYPE=float16 SGLANG_MAMBA_SSM_DTYPE=float16
 unset SGLANG_PP_LAYER_PARTITION SGLANG_ENABLE_PP_SPEC
+```
 
+### Qwen thinking + MTP, TP4
+
+Choose one NVLink quad; `4,5,6,7` is the measured machine's quad. This example
+uses the two-step qualitative profile; use three steps/four verification
+positions for the measured low-entropy code alternative.
+
+```bash
+export CUDA_VISIBLE_DEVICES=4,5,6,7
 uv run --no-project .venv/bin/python -m sglang_v100_lite \
   --model-path "$HOME/models/sglang/RadixArk-Qwen3.8-Flash-Next-NVFP4" \
   --served-model-name qwen3.8-flash-next --trust-remote-code \
-  --host 192.168.4.78 --port 9000 --api-key test-only \
+  --host 0.0.0.0 --port 9000 --api-key test-only --random-seed 531 \
   --tensor-parallel-size 4 --disable-overlap-schedule \
   --dtype float16 --quantization modelopt_fp4 \
   --moe-runner-backend marlin --fp4-gemm-backend marlin \
@@ -195,31 +281,76 @@ uv run --no-project .venv/bin/python -m sglang_v100_lite \
   --max-running-requests 1 --chunked-prefill-size 8192 \
   --cuda-graph-bs-decode 1 --disable-prefill-cuda-graph \
   --mamba-radix-cache-strategy extra_buffer --mamba-full-memory-ratio 0.2 \
-  --speculative-algorithm EAGLE --speculative-num-steps 3 \
-  --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+  --speculative-algorithm EAGLE --speculative-num-steps 2 \
+  --speculative-eagle-topk 1 --speculative-num-draft-tokens 3 \
   --speculative-use-rejection-sampling \
-  --default-chat-template-kwargs '{"enable_thinking":true,"reasoning_effort":"xhigh"}' \
+  --default-chat-template-kwargs '{"enable_thinking":true,"preserve_thinking":true,"reasoning_effort":"xhigh"}' \
   --preferred-sampling-params '{"temperature":1.0,"top_p":0.95,"top_k":20,"min_p":0.0,"presence_penalty":0.0,"frequency_penalty":0.0,"repetition_penalty":1.0}'
 ```
 
-OpenAI-compatible base URL: `http://192.168.4.78:9000/v1`, key `test-only`.
-Client-supplied settings override these defaults: keep thinking enabled,
-temperature 1, top-p 0.95, top-k 20, min-p 0, presence/frequency penalties 0
-and repetition penalty 1 in WebUI. The sampling top-k of 20 is separate from
-the MTP branch width of one. Larger contexts and concurrency need separate
-memory/performance checks; the former 262K profile is a different configuration.
+### GLM thinking + MTP, TP8
 
-## Upstream maintenance
+Map both NVLink quads to consecutive TP groups before evaluating PP. The order
+below matches the benchmark host. Use a local copy of the linked NVFP4
+checkpoint and the common environment above.
 
-The integrated upstream revision is recorded in `provenance.json`.
-`v100_lite/core-patches.json` enumerates the remaining core exceptions; verify
-`main` with `uv run --no-project .venv/bin/python v100_lite/check-core-diff.py`.
-Update and validate `main` first, then integrate it into the GLM branch.
-Keep speed experiments on `glm-5.3-flash-fast` and integrate validated changes
-from `glm-5.3-flash` into it.
-Prefer upstream implementations when equivalent fixes land. Keep fork-owned
-hardware adaptations in the plugin/public operators and new changes covered
-by focused numerical tests.
+```bash
+export CUDA_VISIBLE_DEVICES=1,0,2,3,4,5,6,7
+export SGLANG_OPT_USE_TILELANG_MHC_PRE=0 SGLANG_OPT_USE_TILELANG_MHC_POST=0
+export SGLANG_OPT_FUSE_MHC_POST_PRE=0 SGLANG_DSA_FUSE_TOPK=1
+export SGLANG_OPT_SM70_NVFP4_GEMV=1 SGLANG_OPT_SM70_MHC_PROJECTION=1
+uv run --no-project .venv/bin/python -m sglang_v100_lite \
+  --model-path "$HOME/models/sglang/RadixArk-GLM-5.3-Flash-NVFP4" \
+  --served-model-name glm5.3-flash --trust-remote-code --language-only \
+  --host 0.0.0.0 --port 9000 --api-key test-only --random-seed 531 \
+  --tensor-parallel-size 8 --disable-overlap-schedule \
+  --dtype float16 --quantization modelopt_fp4 \
+  --moe-runner-backend marlin --fp4-gemm-backend marlin \
+  --sampling-backend pytorch --reasoning-parser auto --tool-call-parser auto \
+  --mm-attention-backend sdpa --attention-backend dsa \
+  --dsa-prefill-backend triton --dsa-decode-backend triton \
+  --linear-attn-prefill-backend triton --linear-attn-decode-backend triton \
+  --page-size 64 --kv-cache-dtype auto --mamba-ssm-dtype float16 \
+  --mem-fraction-static 0.92 --context-length 8192 --max-total-tokens 8192 \
+  --max-running-requests 1 --chunked-prefill-size 256 --disable-radix-cache \
+  --disable-prefill-cuda-graph --cuda-graph-backend-decode full --cuda-graph-bs-decode 1 \
+  --mamba-radix-cache-strategy no_buffer --mamba-full-memory-ratio 0.2 \
+  --speculative-algorithm EAGLE --speculative-num-steps 4 \
+  --speculative-eagle-topk 1 --speculative-num-draft-tokens 5 \
+  --speculative-use-rejection-sampling \
+  --default-chat-template-kwargs '{"reasoning_effort":"max","clear_thinking":true}' \
+  --preferred-sampling-params '{"temperature":1.0,"top_p":0.95,"top_k":-1,"min_p":0.0,"presence_penalty":0.0,"frequency_penalty":0.0,"repetition_penalty":1.0}'
+```
+
+These are manual launch references, not installed services. Bind address,
+port, API key and model paths are host choices; the OpenAI base URL is
+`http://<server>:9000/v1`. Clients can override sampling/template defaults.
+For the next experimental PP evaluation, change TP8 to
+`--tensor-parallel-size 4 --pipeline-parallel-size 2`, set
+`SGLANG_PP_LAYER_PARTITION=24,21 SGLANG_ENABLE_PP_SPEC=1`, and retain no-overlap
+scheduling. The best tested four-step TP8 setting is only a starting candidate
+for PP.
+
+## Code organization and upstream maintenance
+
+- `v100_lite/sglang_v100_lite/`: opt-in runtime adapters and CUDA/Triton kernels.
+- `v100_lite/aot/` and `v100_lite/patches/`: native build and Marlin patches.
+- `python/sglang/kernels/ops/`: shared/public operators, including GLM additions.
+- `v100_lite/tests/gpu_checks.py`, `test/registered/` and `test/manual/`: focused
+  numerical, dispatch and distributed regressions.
+
+Services, transfer scripts, host runbooks, benchmark harnesses and raw experiment
+artifacts stay outside this source repository. The `v100_lite` package name is
+retained for now; its eventual rename is separate work.
+
+[v100_lite/core-patches.json](v100_lite/core-patches.json) enumerates the core
+exceptions. Verify maintained `main` with
+`uv run --no-project .venv/bin/python v100_lite/check-core-diff.py`.
+Update and validate `main` against upstream first, then integrate it into the
+GLM branches; integrate conservative GLM changes into the fast branch as well.
+Prefer upstream implementations when equivalent fixes land. Keep hardware
+adaptations in the plugin/public operators, with focused tests and provenance,
+so an upstream update can review a small set of deliberate exceptions.
 
 [Apache-2.0](LICENSE). Credit to SGLang, the original V100 fork,
 [marlin_v100](https://github.com/zhinianqin/marlin_v100), and the kernel projects
