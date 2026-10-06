@@ -7,6 +7,10 @@ from unittest.mock import Mock, call
 import torch
 
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.runtime_context import get_context
+from sglang.srt.speculative.eagle_info import EagleDraftInput
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -33,6 +37,30 @@ def _make_scheduler(**attrs):
 
 
 class TestPPCommOverlap(CustomTestCase):
+    def test_chain_relay_keeps_accept_indices_for_recurrent_state_commit(self):
+        """Earlier PP stages need accepted steps even when KV needs no compaction.
+
+        Omitting chain indices left their recurrent state at the prompt and
+        produced incorrect cold-cache Qwen tool arguments with PP + MTP.
+        """
+        scheduler = _make_scheduler(_pp_spec_relay=True)
+        accept_indices = torch.tensor([[0, 1, -1, -1], [4, 5, 6, -1]])
+        result = GenerationBatchResult(
+            logits_output=None,
+            next_token_ids=torch.tensor([[10, 11, -1, -1], [12, 13, 14, -1]]),
+            accept_lens=torch.tensor([2, 3]),
+            accept_index=accept_indices,
+            new_seq_lens=torch.tensor([302, 403]),
+            next_draft_input=EagleDraftInput(bonus_tokens=torch.tensor([11, 14])),
+        )
+        batch = SimpleNamespace(
+            spec_algorithm=SpeculativeAlgorithm.EAGLE, return_logprob=False
+        )
+        with get_context().override_server_args(speculative_eagle_topk=1):
+            payload = scheduler._pp_prepare_tensor_dict(result, batch)
+        self.assertIn("spec_accept_index", payload)
+        torch.testing.assert_close(payload["spec_accept_index"], accept_indices)
+
     def test_graph_proxy_send_records_forward_reuse_fence(self):
         comm_stream = FakeStream(4)
         work = Mock()

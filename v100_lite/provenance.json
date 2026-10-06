@@ -1,0 +1,104 @@
+{
+  "upstream": "84523d67851171fa20f7c68d3d6dc6cbf20c4423",
+  "v100_fork": "dca488908ee4e3f1bc676c3bf5dcd26ff049cfc3",
+  "files": {
+    "v100_lite/sglang_v100_lite/kernels/sm70_fp8_kv.py": {
+      "origin": "python/sglang/jit_kernel/sm70_fp8_kv.py",
+      "sha256": "58b3fc998a1c7712f02870c30a2e83a8a9d073d366b5f4a52b37d1775974504d"
+    },
+    "v100_lite/sglang_v100_lite/kernels/sm70_nvfp4_moe_decode.py": {
+      "origin": "python/sglang/jit_kernel/sm70_nvfp4_moe_decode.py",
+      "sha256": "c24c112f88c628d166734bcf90190654d1eb0a640a81e2a6e2288f8373e9dc27"
+    },
+    "v100_lite/sglang_v100_lite/kernels/csrc/sm70_nvfp4_moe_decode.cu": {
+      "origin": "python/sglang/jit_kernel/csrc/sm70_nvfp4_moe_decode.cu",
+      "sha256": "8d8d10ae4b382e91833c731fd265099d9936172a188cf8858f0f7c9211ae331c"
+    },
+    "v100_lite/sglang_v100_lite/kernels/csrc/sm70_fp8_e5m2_cache.cu": {
+      "origin": "python/sglang/jit_kernel/csrc/sm70_fp8_e5m2_cache.cu",
+      "sha256": "2c497fdb283cc1771643ebe678cc299d7e1949f4652a22e4a168873f63a12328"
+    },
+    "v100_lite/sglang_v100_lite/kernels/csrc/elementwise/sm70_small_gemm.cuh": {
+      "origin": "python/sglang/jit_kernel/csrc/elementwise/sm70_small_gemm.cuh",
+      "sha256": "a1d031dda6d019956749e18b57c991ab536af20b3169a521400912b90aa44476"
+    },
+    "v100_lite/sglang_v100_lite/kernels/csrc/elementwise/sm70_qsa_combine.cuh": {
+      "origin": "python/sglang/jit_kernel/csrc/elementwise/sm70_qsa_combine.cuh",
+      "sha256": "320baff0f8846f6b8ccbd006b4742a30f8be52d990a69a6f7e832c122f7325a7"
+    },
+    "v100_lite/sglang_v100_lite/kernels/csrc/elementwise/sm70_dense_gemv.cuh": {
+      "origin": "python/sglang/jit_kernel/csrc/elementwise/sm70_dense_gemv.cuh",
+      "sha256": "a8cdbf962b85319dca150ffb48985a0815b4de54e7dce26443f5ee54bfb5a829"
+    },
+    "v100_lite/sglang_v100_lite/kernels/qsa_cuda.py": {
+      "origin": "python/sglang/srt/layers/attention/tilelang_fa_v100/_decode_cuda.py",
+      "sha256": "9b3bef58a08c04c3edeb0648144c570fa28da2bb3144d34ceb09dae2aba984bb"
+    },
+    "v100_lite/sglang_v100_lite/kernels/moe_marlin.py": {
+      "origin": "python/sglang/jit_kernel/moe_wna16_marlin.py",
+      "sha256": "42c4af1a80d18b5dcdaa589e03afaec310c3477669e5bb3323247c9ead568cf3"
+    },
+    "v100_lite/aot/pyproject.toml": {
+      "origin": "sgl-kernel/pyproject.toml",
+      "sha256": "aea2c56826c8da8d696ff1c7b1ce3d2e013410f4dadaa2e204fe920f4e1a3554"
+    }
+  },
+  "hashes_describe": "Original source content before compatibility edits; origin revision defaults to v100_fork unless specified.",
+  "marlin_cutlass_revision": "f3fde58372d33e9a5650ba7b80fc48b3b49d40c8",
+  "current_upstream": "affa261e3d289fe4f907c9b2e8d773fef0d36dba",
+  "upstream_backports": {
+    "python/sglang/kernels/aot/csrc/moe/moe_align_kernel.cu": {
+      "commit": "fc9bdc8a3e60a0896e58d84ac261cc470ab4a24c",
+      "change": "Bound vector padding stores and fill the scalar tail"
+    }
+  },
+  "consolidated": {
+    "v100_lite/sglang_v100_lite/kernels/gdn.py": [
+      {
+        "origin": "python/sglang/srt/layers/attention/linear/kernels/gdn_chunked_tilelang.py",
+        "sha256": "e382cdd6e3f4631a2c08e8f6e02bb4729488d7f81429f69a14682169f08a7f7a"
+      },
+      {
+        "origin": "python/sglang/srt/layers/attention/linear/kernels/gdn_tilelang.py",
+        "sha256": "de6c0c90aa5d881623263654dc1c0790f18907b9e337bf7b903809d40fd30fb9"
+      }
+    ],
+    "v100_lite/sglang_v100_lite/kernels/attention.py": [
+      {
+        "origin": "python/sglang/srt/layers/attention/tilelang_fa_v100/_kernels_paged.py",
+        "sha256": "62b4230538e7462e4b383963ee78c04eb01da6ac12512786c60e0174c40f1801",
+        "adaptation": "Only shared settings or the QSA combine function retained; ordinary paged MHA code omitted."
+      },
+      {
+        "origin": "python/sglang/srt/layers/attention/tilelang_fa_v100/_kernels_paged_decode.py",
+        "sha256": "e8efa9a6b8cc982b1eedc67ca4bbe855d9c9096043b2016a0a6cf676c3e8a1a6",
+        "adaptation": "Only shared settings or the QSA combine function retained; ordinary paged MHA code omitted."
+      },
+      {
+        "origin": "python/sglang/srt/layers/attention/tilelang_fa_v100/_kernels_dense_d256.py",
+        "sha256": "52866ecac00e57fb70ad19563a4a9b21b2d54e60eefb7c52f226087ba7b70c80"
+      }
+    ],
+    "v100_lite/sglang_v100_lite/kernels/gemm.py": [
+      {
+        "origin": "python/sglang/jit_kernel/sm70_dense_gemv.py",
+        "sha256": "9e789443e39c2dd31ba1ceff8f70a0ff05b9800d8ad342569d2980519eaaf2ed"
+      },
+      {
+        "origin": "python/sglang/jit_kernel/sm70_small_gemm.py",
+        "sha256": "1a6b11090d154a7094eb7fb1d6e6eaed571140ba7a4477b04f6e28b4b52e2612"
+      }
+    ],
+    "v100_lite/sglang_v100_lite/kernels/fusions.py": [
+      {
+        "origin": "python/sglang/jit_kernel/sm70_qsa_combine.py",
+        "sha256": "9defb3b4636ea4c9b7d7b4959965bf580610b1aa72dd913f2b6824fd440f1f67"
+      }
+    ],
+    "v100_lite/aot/ops.cc": [
+      "mainline common_extension.cc registrations",
+      "reference common_extension.cc speculative registrations"
+    ]
+  },
+  "current_kernel_version": "0.4.9+v100"
+}

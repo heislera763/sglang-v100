@@ -30,13 +30,15 @@ def _index_k_bytes(*, kv_heads: int, head_dim: int, dtype: torch.dtype) -> int:
 
 
 # ``--qsa-indexer-dtype`` choices. The pending key ring stays bf16 regardless.
-QSA_INDEXER_DTYPE_CHOICES = ("auto", "bfloat16", "fp8_e4m3")
+QSA_INDEXER_DTYPE_CHOICES = ("auto", "bfloat16", "float16", "fp8_e4m3")
 
 
 def resolve_qsa_indexer_dtype(name: str) -> torch.dtype:
     """Storage dtype of the compressed QSA indexer cache for a CLI value."""
     if name in ("auto", "bfloat16"):
         return torch.bfloat16
+    if name == "float16":
+        return torch.float16
     if name == "fp8_e4m3":
         return torch.float8_e4m3fn
     raise ValueError(
@@ -144,9 +146,9 @@ class QSATokenToKVPool(HybridLinearKVPool):
         self.qsa_index_kv_heads = int(qsa_index_kv_heads)
         self.qsa_token_topk = int(qsa_token_topk)
         self.qsa_block_topk = self.qsa_token_topk // self.qsa_compress_ratio
-        if qsa_indexer_dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+        if qsa_indexer_dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn):
             raise ValueError(
-                "QSA compressed indexer cache dtype must be bfloat16 or "
+                "QSA compressed indexer cache dtype must be float16, bfloat16 or "
                 f"float8_e4m3fn, got {qsa_indexer_dtype}"
             )
         # Storage dtype of the compressed keys and the index Q (the GEMM operands).
