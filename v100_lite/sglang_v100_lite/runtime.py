@@ -10,7 +10,7 @@ from sgl_kernel.sampling import (
 )
 from sgl_kernel.utils import _to_tensor_scalar_tuple
 
-from .dispatch import reject_fallback
+from .dispatch import eager_extend, in_prefill, reject_fallback
 
 
 def install():
@@ -58,6 +58,11 @@ def install():
             raise ValueError("The enabled SM70 profile requires float16 model weights")
 
     hooks = [
+        (
+            "sglang.srt.model_executor.runner.eager_runner.EagerRunner._execute_extend",
+            eager_extend,
+            HookType.AROUND,
+        ),
         ("sglang.kernels.ops.layernorm.mhc._mhc_pre_torch", mhc_pre, HookType.AROUND),
         ("sglang.kernels.ops.layernorm.mhc._mhc_post_torch", mhc_post, HookType.AROUND),
         (
@@ -249,9 +254,7 @@ def mix(original, self, hyper_input):
         and hyper_input.is_cuda
         and torch.cuda.get_device_capability(hyper_input.device) == (7, 0)
     ):
-        from sglang.srt.runtime_context import get_forward
-
-        if get_forward().is_extend_in_batch:
+        if in_prefill():
             # Prefill deliberately uses FP16 cuBLAS, not the small persistent
             # decode kernel. Keep the upstream prefill equations and rounding.
             if self.config.hc_per_branch_norm:

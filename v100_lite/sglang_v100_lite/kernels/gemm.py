@@ -150,9 +150,9 @@ def blas_supported(x, weight, bias=None):
             return True
     elif x.shape[1:] == (4, 2560) and weight.shape == (2560, 2560):
         return True
-    from sglang.srt.runtime_context import get_forward
+    from sglang_v100_lite.dispatch import in_prefill
 
-    return get_forward().is_extend_in_batch
+    return in_prefill()
 
 
 @cache_once

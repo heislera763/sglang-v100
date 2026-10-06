@@ -21,11 +21,41 @@ with patch.object(
 ):
     import sglang_v100_lite
     from sglang_v100_lite import glm_mhc, mqa, qsa, quantization, runtime
-    from sglang_v100_lite.dispatch import V100FallbackError
+    from sglang_v100_lite.dispatch import (
+        V100FallbackError,
+        eager_extend,
+        in_prefill,
+        prefill_scope,
+    )
     from sglang_v100_lite.kernels import sm70_fp8_kv
 
 
 class TestV100StrictDispatch(CustomTestCase):
+    def test_prefill_scope_excludes_verify_and_restores_after_errors(self):
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        def check(owner, batch):
+            return in_prefill()
+
+        self.assertFalse(in_prefill())
+        with prefill_scope(True):
+            self.assertTrue(
+                eager_extend(
+                    check, None, SimpleNamespace(forward_mode=ForwardMode.EXTEND)
+                )
+            )
+            self.assertFalse(
+                eager_extend(
+                    check, None, SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY)
+                )
+            )
+            self.assertTrue(in_prefill())
+            with self.assertRaisesRegex(RuntimeError, "test failure"):
+                with prefill_scope(False):
+                    raise RuntimeError("test failure")
+            self.assertTrue(in_prefill())
+        self.assertFalse(in_prefill())
+
     def test_inactive_plugin_cannot_silently_ignore_strict_mode(self):
         with patch.object(
             sglang_v100_lite, "os", SimpleNamespace(environ={"SGLANG_V100_LITE": "0"})
