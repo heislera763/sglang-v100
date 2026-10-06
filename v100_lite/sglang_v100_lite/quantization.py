@@ -1,12 +1,125 @@
 """SM70 NVFP4 layout and dispatch, retaining mainline loading and MoE APIs."""
 
-from pathlib import Path
 import os
+from pathlib import Path
+
 import torch
 
 
 def minimum_capability(original, cls):
     return 70
+
+
+def prepare_nvfp4_dense(original, layer):
+    from sglang.srt.layers.utils import copy_or_rebind_param
+
+    if layer.params_dtype != torch.float16 or layer.quant_config.group_size != 16:
+        raise ValueError("V100 dense NVFP4 requires FP16 activations and group_size=16")
+    n, k = layer.output_size_per_partition, layer.input_size_per_partition
+    padded_n, padded_k = min(
+        (
+            ((n + 63) // 64 * 64, (k + 127) // 128 * 128),
+            ((n + 127) // 128 * 128, (k + 63) // 64 * 64),
+        ),
+        key=lambda nk: (nk[0] * nk[1], nk[0] + nk[1]),
+    )
+    weight = torch.nn.functional.pad(
+        layer.weight, (0, (padded_k - k) // 2, 0, padded_n - n)
+    )
+    # FP8 indexing/padding is not native arithmetic on Volta; pad byte storage.
+    scales = torch.nn.functional.pad(
+        layer.weight_scale.view(torch.uint8), (0, (padded_k - k) // 16, 0, padded_n - n)
+    ).view(torch.float8_e4m3fn)
+    encoded, factor = sm70_nvfp4_marlin_process_scales(
+        scales.T.contiguous()[None], torch.float16
+    )
+    global_scale = (
+        sm70_nvfp4_marlin_process_global_scale(
+            layer.weight_global_scale, torch.float16
+        ).reshape(-1)
+        / factor
+    )
+    copy_or_rebind_param(layer, "weight", _dense_repack(weight[None])[0])
+    copy_or_rebind_param(layer, "weight_scale", encoded[0])
+    copy_or_rebind_param(layer, "weight_global_scale", global_scale)
+    layer.workspace = torch.zeros(
+        torch.cuda.get_device_properties(weight.device).multi_processor_count * 4,
+        device=weight.device,
+        dtype=torch.int32,
+    )
+    if getattr(layer, "bias", None) is not None:
+        raise ValueError("V100 dense NVFP4 bias has not been validated")
+
+
+def dense_marlin_gemm(
+    original,
+    a,
+    c,
+    b_q_weight,
+    b_scales,
+    global_scale,
+    b_zeros,
+    g_idx,
+    perm,
+    workspace,
+    b_q_type,
+    size_m,
+    size_n,
+    size_k,
+    is_k_full=True,
+    use_atomic_add=False,
+    use_fp32_reduce=False,
+    is_zp_float=False,
+):
+    from sglang.srt.runtime_context import get_buffer
+
+    from .kernels.moe_marlin import moe_wna16_marlin_gemm
+
+    if a.dtype != torch.float16 or global_scale is None:
+        raise ValueError("V100 dense Marlin hook requires FP16 NVFP4")
+    # The installed NVFP4 extension includes the expert GEMM. A single expert
+    # with one route per token computes the same dense multiplication, using
+    # its existing logical scale layout and repacked weight format.
+    block = 32
+    padded = (size_m + block - 1) // block * block
+
+    def make_routes():
+        return (
+            torch.arange(padded, device=a.device, dtype=torch.int32),
+            torch.zeros(padded // block, device=a.device, dtype=torch.int32),
+            torch.full((1,), padded, device=a.device, dtype=torch.int32),
+            torch.ones((size_m, 1), device=a.device, dtype=torch.float32),
+        )
+
+    # Immutable routing metadata is identical for every dense layer with this
+    # batch shape. Keep it owned by the runtime, rather than allocating/filling
+    # four tensors (including a host-to-device copy) for every GEMM.
+    routes = get_buffer(f"v100_dense_routes:{a.device}:{size_m}", make_routes)
+    return moe_wna16_marlin_gemm(
+        a,
+        c,
+        b_q_weight[None],
+        None,
+        b_scales[None],
+        global_scale.reshape(1),
+        b_zeros,
+        g_idx,
+        perm,
+        workspace,
+        *routes,
+        block,
+        1,
+        False,
+        False,
+        b_q_type,
+        size_m,
+        size_n,
+        size_k,
+        is_k_full,
+        use_atomic_add,
+        use_fp32_reduce,
+        is_zp_float,
+    )
 
 
 def _dense_repack(weight):

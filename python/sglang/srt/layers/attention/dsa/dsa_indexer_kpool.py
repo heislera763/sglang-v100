@@ -186,14 +186,26 @@ class IndexerKPool(MultiPlatformOp):
             torch.zeros(self.index_kpool, self.head_dim, dtype=torch.float32)
         )
         self.index_kpool_compress_gate = nn.Parameter(
-            torch.empty(self.head_dim, self.hidden_size, dtype=torch.bfloat16)
+            torch.empty(
+                self.head_dim,
+                self.hidden_size,
+                dtype=torch.float16
+                if is_cuda() and torch.cuda.get_device_capability() == (7, 0)
+                else torch.bfloat16,
+            )
         )
 
         if is_cuda() and self.alt_stream is not None:
             self.compress_gate_stream = torch.cuda.Stream()
 
         if is_cuda():
-            self.sm_count = deep_gemm.get_num_sms()
+            self.sm_count = (
+                torch.cuda.get_device_properties(
+                    torch.cuda.current_device()
+                ).multi_processor_count
+                if torch.cuda.get_device_capability() == (7, 0)
+                else deep_gemm.get_num_sms()
+            )
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
 
         self.wq_b = ReplicatedLinear(

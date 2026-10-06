@@ -174,6 +174,31 @@ for _grp, _mod, _fn in [
     )
 del _grp, _mod, _fn
 
+# Software-FP8 DSA primitives for the opt-in V100 runtime.
+for _fn in ("fp8_quantize_sm70", "kpool_compress_sm70", "mqa_logits_sm70"):
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn}",
+            backend=(
+                KernelBackend.TORCH
+                if _fn == "mqa_logits_sm70"
+                else KernelBackend.TRITON
+            ),
+            target=f"sglang.kernels.ops.attention.dsa.sm70_indexer:{_fn}",
+            capabilities={CapabilityRequirement.cuda(min_sm=(7, 0), max_sm=(7, 0))},
+        )
+    )
+del _fn
+
+register_kernel(
+    KernelSpec(
+        op="attention.pool4_decode_sm70",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.dsa.sm70_pool4_decode:pool4_decode_sm70",
+        capabilities={CapabilityRequirement.cuda(min_sm=(7, 0), max_sm=(7, 0))},
+    )
+)
+
 # DeepSeek DSA / DSV4 kernels migrated in Phase 2.5 (RFC #29630);
 # registered for inventory. Import them from their modules.
 for _mod, _fn in [

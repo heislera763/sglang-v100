@@ -1,8 +1,9 @@
 """Opt-in SM70 integration using mainline plugin hooks."""
 
 import os
-import torch
+
 import msgspec
+import torch
 from sgl_kernel.sampling import (
     _top_k_renorm_probs_internal,
     _top_p_renorm_probs_internal,
@@ -15,50 +16,190 @@ def install():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
         raise RuntimeError("SGLANG_V100_LITE=1 requires an SM70 CUDA device")
     import sgl_kernel.elementwise as norm_ops
+
     import sglang.srt.layers.layernorm as norms
-    from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
     from sglang.srt.arg_groups.choices import add_linear_attn_kernel_backend_choices
+    from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
-    from .quantization import prepare_nvfp4_moe, minimum_capability, marlin_gemm, moe_runner
+
+    from .quantization import (
+        dense_marlin_gemm,
+        marlin_gemm,
+        minimum_capability,
+        moe_runner,
+        prepare_nvfp4_dense,
+        prepare_nvfp4_moe,
+    )
 
     norm_ops._has_flashinfer = False
     norms._flashinfer_layernorm_available = False
     norms._flashinfer_rmsnorm_quant_available = False
     QSATokenToKVPool.index_state_dtype = torch.float16
     add_linear_attn_kernel_backend_choices(["tilelang_v100"])
-    from .qsa import QwenSparseAttnBackend, project_qk, mqa_decode
+    from .glm_dsa import (
+        SM70IndexerKPool,
+        SM70SparseAttnBackend,
+        sm70_dsa_cache_default,
+        sm70_dsa_constraints,
+    )
+    from .glm_kda import SM70KDAKernel
+    from .glm_mhc import mhc_post, mhc_pre
     from .mqa import qsa_mqa_prefill
-    from .ple import _gather_ple_embedding_from_pinned_kernel, Qwen4ExpPinnedHostEmbedding
+    from .ple import (
+        Qwen4ExpPinnedHostEmbedding,
+        _gather_ple_embedding_from_pinned_kernel,
+    )
+    from .qsa import QwenSparseAttnBackend, mqa_decode, project_qk
 
     def legacy_dtype(original, model_config):
         if model_config.dtype != torch.float16:
             raise ValueError("The enabled SM70 profile requires float16 model weights")
 
     hooks = [
-        ('flashinfer.sampling.top_k_renorm_probs', top_k_renorm_probs, HookType.REPLACE),
-        ('flashinfer.sampling.top_p_renorm_probs', top_p_renorm_probs, HookType.REPLACE),
-        ('sglang.srt.model_executor.model_runner_components.load_model_utils.maybe_downgrade_dtype_for_legacy_gpu', legacy_dtype, HookType.AROUND),
-        ('sglang.srt.layers.quantization.modelopt_quant.ModelOptFp4Config.get_min_capability', minimum_capability, HookType.AROUND),
-        ('sglang.srt.layers.quantization.modelopt_quant.prepare_moe_nvfp4_layer_for_marlin', prepare_nvfp4_moe, HookType.AROUND),
-        ('sglang.kernels.ops.moe.moe_wna16_marlin.moe_wna16_marlin_gemm', marlin_gemm, HookType.AROUND),
-        ('sglang.srt.layers.attention.linear.gdn_backend.GDNKernelDispatcher.__init__', dispatcher_init, HookType.AROUND),
-        ('sglang.srt.layers.moe.moe_runner.base.FusedOpPool.get_fused_func', moe_runner, HookType.AROUND),
-        ('sglang.kernels.ops.moe.moe_fused_gate.moe_fused_gate', route_top10, HookType.AROUND),
-        ('sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent.fused_sigmoid_gating_delta_rule_update_kernel.run', round_verify_state, HookType.AROUND),
-        ('sglang.srt.mem_cache.memory_pool.MHATokenToKVPool.set_kv_buffer', store, HookType.AROUND),
-        ('sglang.srt.server_args.prepare_server_args', arguments, HookType.AROUND),
-        ('sglang.srt.layers.attention.qwen_sparse_attn_backend.QwenSparseAttnBackend', QwenSparseAttnBackend, HookType.REPLACE),
-        ('sglang.srt.layers.attention.qsa.qsa_indexer.QSAIndexer.project_qk', project_qk, HookType.AROUND),
-        ('sglang.srt.layers.attention.qsa.mqa.qsa_mqa_decode', mqa_decode, HookType.AROUND),
-        ('sglang.srt.layers.attention.qsa.mqa.qsa_mqa_prefill', qsa_mqa_prefill, HookType.REPLACE),
-        ('sglang.srt.models.qwen4_exp._gather_ple_embedding_from_pinned_kernel', _gather_ple_embedding_from_pinned_kernel, HookType.REPLACE),
-        ('sglang.srt.models.qwen4_exp.Qwen4ExpPinnedHostEmbedding', Qwen4ExpPinnedHostEmbedding, HookType.REPLACE),
-        ('sglang.srt.layers.quantization.unquant.UnquantizedLinearMethod.apply', apply_unquant, HookType.AROUND),
-        ('sglang.srt.layers.hyperconnection.GatedResidual.__init__', initialize, HookType.AROUND),
-        ('sglang.srt.layers.hyperconnection.GatedResidual.mix', mix, HookType.AROUND),
-        ('sglang.srt.layers.hyperconnection.GatedResidual.combine', combine, HookType.AROUND),
-        ('sglang.srt.models.qwen4_exp.Qwen4ExpNGramEmbedding._finish_embedding_lookup', embedding_output, HookType.AROUND),
-
+        ("sglang.kernels.ops.layernorm.mhc._mhc_pre_torch", mhc_pre, HookType.AROUND),
+        ("sglang.kernels.ops.layernorm.mhc._mhc_post_torch", mhc_post, HookType.AROUND),
+        (
+            "sglang.srt.layers.quantization.marlin_utils_fp4.prepare_nvfp4_layer_for_marlin",
+            prepare_nvfp4_dense,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.kernels.ops.gemm.gptq_marlin.gptq_marlin_gemm",
+            dense_marlin_gemm,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.arg_groups.overrides._dsa_kv_cache_dtype_default",
+            sm70_dsa_cache_default,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.arg_groups.overrides._check_dsa_backend_constraints",
+            sm70_dsa_constraints,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.layers.attention.dsa.dsa_indexer_kpool.IndexerKPool",
+            SM70IndexerKPool,
+            HookType.REPLACE,
+        ),
+        (
+            "sglang.srt.layers.attention.dsa_backend.DeepseekSparseAttnBackend",
+            SM70SparseAttnBackend,
+            HookType.REPLACE,
+        ),
+        (
+            "sglang.srt.layers.attention.linear.kernels.kda_triton.TritonKDAKernel",
+            SM70KDAKernel,
+            HookType.REPLACE,
+        ),
+        (
+            "flashinfer.sampling.top_k_renorm_probs",
+            top_k_renorm_probs,
+            HookType.REPLACE,
+        ),
+        (
+            "flashinfer.sampling.top_p_renorm_probs",
+            top_p_renorm_probs,
+            HookType.REPLACE,
+        ),
+        (
+            "sglang.srt.model_executor.model_runner_components.load_model_utils.maybe_downgrade_dtype_for_legacy_gpu",
+            legacy_dtype,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.layers.quantization.modelopt_quant.ModelOptFp4Config.get_min_capability",
+            minimum_capability,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.layers.quantization.modelopt_quant.prepare_moe_nvfp4_layer_for_marlin",
+            prepare_nvfp4_moe,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.kernels.ops.moe.moe_wna16_marlin.moe_wna16_marlin_gemm",
+            marlin_gemm,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.layers.attention.linear.gdn_backend.GDNKernelDispatcher.__init__",
+            dispatcher_init,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.layers.moe.moe_runner.base.FusedOpPool.get_fused_func",
+            moe_runner,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.kernels.ops.moe.moe_fused_gate.moe_fused_gate",
+            route_top10,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent.fused_sigmoid_gating_delta_rule_update_kernel.run",
+            round_verify_state,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.mem_cache.memory_pool.MHATokenToKVPool.set_kv_buffer",
+            store,
+            HookType.AROUND,
+        ),
+        ("sglang.srt.server_args.prepare_server_args", arguments, HookType.AROUND),
+        (
+            "sglang.srt.layers.attention.qwen_sparse_attn_backend.QwenSparseAttnBackend",
+            QwenSparseAttnBackend,
+            HookType.REPLACE,
+        ),
+        (
+            "sglang.srt.layers.attention.qsa.qsa_indexer.QSAIndexer.project_qk",
+            project_qk,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.layers.attention.qsa.mqa.qsa_mqa_decode",
+            mqa_decode,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.layers.attention.qsa.mqa.qsa_mqa_prefill",
+            qsa_mqa_prefill,
+            HookType.REPLACE,
+        ),
+        (
+            "sglang.srt.models.qwen4_exp._gather_ple_embedding_from_pinned_kernel",
+            _gather_ple_embedding_from_pinned_kernel,
+            HookType.REPLACE,
+        ),
+        (
+            "sglang.srt.models.qwen4_exp.Qwen4ExpPinnedHostEmbedding",
+            Qwen4ExpPinnedHostEmbedding,
+            HookType.REPLACE,
+        ),
+        (
+            "sglang.srt.layers.quantization.unquant.UnquantizedLinearMethod.apply",
+            apply_unquant,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.layers.hyperconnection.GatedResidual.__init__",
+            initialize,
+            HookType.AROUND,
+        ),
+        ("sglang.srt.layers.hyperconnection.GatedResidual.mix", mix, HookType.AROUND),
+        (
+            "sglang.srt.layers.hyperconnection.GatedResidual.combine",
+            combine,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.models.qwen4_exp.Qwen4ExpNGramEmbedding._finish_embedding_lookup",
+            embedding_output,
+            HookType.AROUND,
+        ),
     ]
     for target, replacement, kind in hooks:
         HookRegistry.register(target, replacement, kind)
@@ -115,7 +256,7 @@ def mix(original, self, hyper_input):
         normed, self.input_mix_weight_down.weight, self.input_mix_weight_up.weight
     ):
         return original(self, hyper_input)
-    from .kernels.sm70_hc_mix import gate_supported, hc_down_with_gate, hc_down, hc_up
+    from .kernels.sm70_hc_mix import gate_supported, hc_down, hc_down_with_gate, hc_up
 
     gate = None
     if getattr(self, "_split_combine_ok", False) and gate_supported(
@@ -191,6 +332,7 @@ def store(
 
     if self.dtype == torch.float8_e5m2 and not self.use_hnd and dcp_kv_mask is None:
         from sglang.srt.mem_cache.memory_pool import unwrap_write_loc
+
         from .kernels.sm70_fp8_kv import write_fp8_e5m2_cache_sm70
 
         loc, _, _ = unwrap_write_loc(loc_info)
@@ -215,7 +357,7 @@ def store(
 
 
 def apply_unquant(original, self, layer, x, bias=None):
-    from .kernels.gemm import supported, linear_dense
+    from .kernels.gemm import linear_dense, supported
 
     if supported(x, layer.weight, bias):
         return linear_dense(x, layer.weight)
@@ -229,9 +371,11 @@ def dispatcher_init(
     from sglang.srt.runtime_context import get_exec
 
     mamba = get_exec().mamba
-    use_tilelang = prefill_backend.is_custom() and (
-        mamba.linear_attn_prefill_backend or mamba.linear_attn_backend
-    ) == "tilelang_v100"
+    use_tilelang = (
+        prefill_backend.is_custom()
+        and (mamba.linear_attn_prefill_backend or mamba.linear_attn_backend)
+        == "tilelang_v100"
+    )
     original(
         self,
         decode_backend,
@@ -257,12 +401,22 @@ def round_verify_state(original, *args, **kwargs):
     split_grid = kwargs.get("SPLIT_N_HV_GRID", False)
     sequences = grid[1] if split_grid else grid[2] // kwargs["HV"]
     if (
-        states is not None and states.dtype == torch.float16
+        states is not None
+        and states.dtype == torch.float16
         and kwargs["q"].dtype == torch.float16
-        and (kwargs["B"], sequences, kwargs["H"], kwargs["HV"], kwargs["K"], kwargs["V"])
+        and (
+            kwargs["B"],
+            sequences,
+            kwargs["H"],
+            kwargs["HV"],
+            kwargs["K"],
+            kwargs["V"],
+        )
         == (1, 1, 4, 12, 128, 128)
-        and kwargs["T"] in (2, 4) and kwargs["DISABLE_STATE_UPDATE"]
-        and not kwargs["IS_KDA"] and not kwargs["HAS_EAGLE_TREE_CUSTOM_ATTN_MASK"]
+        and kwargs["T"] in (2, 4)
+        and kwargs["DISABLE_STATE_UPDATE"]
+        and not kwargs["IS_KDA"]
+        and not kwargs["HAS_EAGLE_TREE_CUSTOM_ATTN_MASK"]
     ):
         # Preserve the fork's TP4 verification tile and the full launch grid.
         kwargs["BV"] = 8
@@ -271,17 +425,30 @@ def round_verify_state(original, *args, **kwargs):
 
 
 def route_top10(original, scores, bias, topk, *args, **kwargs):
-    defaults = dict(scoring_func="softmax", num_fused_shared_experts=0,
-                    renormalize=True, routed_scaling_factor=1.0,
-                    apply_routed_scaling_factor_on_output=False,
-                    num_token_non_padded=None, packed_out=None, sqrtsoftplus_log1p=False)
+    defaults = dict(
+        scoring_func="softmax",
+        num_fused_shared_experts=0,
+        renormalize=True,
+        routed_scaling_factor=1.0,
+        apply_routed_scaling_factor_on_output=False,
+        num_token_non_padded=None,
+        packed_out=None,
+        sqrtsoftplus_log1p=False,
+    )
     if (
-        not args and bias is None and topk == 10
+        not args
+        and bias is None
+        and topk == 10
         and kwargs.get("scoring_func") == "softmax"
-        and all(key in defaults and value == defaults[key] for key, value in kwargs.items())
-        and scores.is_cuda and scores.dtype in (torch.float16, torch.float32)
-        and scores.ndim == 2 and scores.shape[0] in (1, 2, 4)
-        and scores.shape[1] == 512 and scores.is_contiguous()
+        and all(
+            key in defaults and value == defaults[key] for key, value in kwargs.items()
+        )
+        and scores.is_cuda
+        and scores.dtype in (torch.float16, torch.float32)
+        and scores.ndim == 2
+        and scores.shape[0] in (1, 2, 4)
+        and scores.shape[1] == 512
+        and scores.is_contiguous()
     ):
         from .kernels.sm70_nvfp4_moe_decode import sm70_topk10_softmax
 

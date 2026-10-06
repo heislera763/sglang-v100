@@ -42,10 +42,10 @@ _SM70_MARLIN_MOE_ENV_NAMES = (
     "SM70_MARLIN_MOE_METADATA_CACHE",
 )
 _sm70_marlin_user_tuning = any(os.getenv(name) for name in _SM70_MARLIN_MOE_ENV_NAMES)
-_sm70_qwen38_tuning_stage = None
+_sm70_nvfp4_tuning_stage = None
 
 
-def _configure_sm70_qwen38_nvfp4_stage(
+def _configure_sm70_nvfp4_stage(
     b_scales: torch.Tensor,
     moe_block_size: int,
     top_k: int,
@@ -53,7 +53,7 @@ def _configure_sm70_qwen38_nvfp4_stage(
     size_n: int,
     size_k: int,
 ) -> None:
-    """Select the measured TP4 decode geometry before CUDA-graph capture.
+    """Select the measured Qwen TP4 / GLM TP8 decode geometry before CUDA-graph capture.
 
     marlin_v100 reads these variables synchronously when its host launcher is
     called.  SGLang captures the resulting kernels in the decode CUDA graph,
@@ -62,7 +62,7 @@ def _configure_sm70_qwen38_nvfp4_stage(
     shapes clear the override and retain marlin_v100's generic/model selectors.
     """
 
-    global _sm70_qwen38_tuning_stage
+    global _sm70_nvfp4_tuning_stage
     if not _IS_SM70 or _sm70_marlin_user_tuning:
         return
 
@@ -109,7 +109,27 @@ def _configure_sm70_qwen38_nvfp4_stage(
         stage = 2
         values = ("64x256x32x4x64x64x32", "1", "lane_vectors")
 
-    if stage == _sm70_qwen38_tuning_stage:
+    # GLM's small decode matrices otherwise use the generic 256x32 N/K
+    # tile, leaving too little work in flight. Keep split-K at one: the
+    # extension's split path accumulates partials with FP16 atomics.
+    elif b_scales.dtype == torch.float8_e4m3fn and (
+        (
+            size_m == 1
+            and top_k == 1
+            and (size_n, size_k)
+            in ((512, 4096), (3072, 4096), (4096, 1024), (4096, 256))
+        )
+        or (
+            moe_block_size == 8
+            and size_m == 1
+            and top_k == 8
+            and (size_n, size_k) == (512, 4096)
+        )
+    ):
+        stage = 5
+        values = ("32x64x64x4x32x64x16", "1", "vector_words")
+
+    if stage == _sm70_nvfp4_tuning_stage:
         return
     if values is None:
         for name in _SM70_MARLIN_MOE_ENV_NAMES:
@@ -117,7 +137,7 @@ def _configure_sm70_qwen38_nvfp4_stage(
     else:
         for name, value in zip(_SM70_MARLIN_MOE_ENV_NAMES, values):
             os.environ[name] = value
-    _sm70_qwen38_tuning_stage = stage
+    _sm70_nvfp4_tuning_stage = stage
 
 
 def _load_marlin_v100_op():
@@ -207,9 +227,75 @@ def moe_wna16_marlin_gemm(
     # convert None to an empty tensor (the kernel treats a present-but-empty
     # global_scale as an nvfp4-only input and rejects it for GPTQ/AWQ).
     if _IS_SM70:
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.quantization.utils import get_scalar_types
+        from sglang.srt.runtime_context import get_schedule
+
+        dense_gemv = (
+            size_m == top_k == 1
+            and b_q_weight.shape[0] == 1
+            and (size_n, size_k)
+            in ((512, 4096), (3072, 4096), (4096, 1024), (4096, 256))
+        )
+        routed_gemv = (
+            b_q_weight.shape[0] == 288
+            and moe_block_size == 8
+            and (
+                (size_m, top_k, size_n, size_k)
+                in ((1, 8, 512, 4096), (8, 1, 4096, 256))
+            )
+            and sorted_token_ids.numel() == 64
+            and expert_ids.numel() == 8
+        )
+        if (
+            envs.SGLANG_OPT_SM70_NVFP4_GEMV.get()
+            and get_schedule().disable_overlap_schedule
+            and (dense_gemv or routed_gemv)
+            and a.dtype == torch.float16
+            and b_scales.dtype == torch.float8_e4m3fn
+            and global_scale_or_none is not None
+            and b_q_type.id == get_scalar_types()[1].float4_e2m1f.id
+            and all(
+                x is None
+                for x in (b_bias_or_none, b_zeros_or_none, g_idx_or_none, perm_or_none)
+            )
+            and not is_ep
+            and is_k_full
+            and not is_zp_float
+        ):
+            from sglang.kernels.ops.gemm.sm70_nvfp4_gemv import sm70_nvfp4_gemv
+            from sglang.srt.runtime_context import get_buffer
+
+            # Scratch is shared by shapes, not layers; graph replay uses the
+            # same stream and each GEMV consumes its partials before reuse.
+            routes = expert_ids.numel()
+            bn = 16 if dense_gemv and (size_n, size_k) == (4096, 256) else 32
+            bk = 128
+            partials = get_buffer(
+                f"v100_nvfp4_gemv:{a.device}:{routes}:{size_k}:{size_n}",
+                lambda: torch.empty(
+                    (routes, size_k // bk, size_n), device=a.device, dtype=torch.float32
+                ),
+            )
+            return sm70_nvfp4_gemv(
+                a,
+                c,
+                b_q_weight,
+                b_scales,
+                global_scale_or_none,
+                sorted_token_ids,
+                expert_ids,
+                topk_weights,
+                moe_block_size,
+                top_k,
+                mul_topk_weights,
+                partials,
+                bn,
+                bk,
+            )
         op = _load_marlin_v100_op()
         if op is not None:
-            _configure_sm70_qwen38_nvfp4_stage(
+            _configure_sm70_nvfp4_stage(
                 b_scales,
                 moe_block_size,
                 top_k,

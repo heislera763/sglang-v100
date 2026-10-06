@@ -580,3 +580,12 @@ register_kernel(
         target="sglang.kernels.ops.layernorm.rms_normalize_hip:rms_normalize_triton",
     )
 )
+
+register_kernel(
+    KernelSpec(
+        op="layernorm.mhc_pre_sm70",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.layernorm.mhc_sm70:mhc_pre_sm70",
+        capabilities={CapabilityRequirement.cuda(min_sm=(7, 0), max_sm=(7, 0))},
+    )
+)

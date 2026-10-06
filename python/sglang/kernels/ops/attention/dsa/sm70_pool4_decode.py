@@ -1,0 +1,241 @@
+"""Device-driven pool4 cache updates/gathers for SM70 decode and graph replay."""
+
+import torch
+import triton
+import triton.language as tl
+
+from sglang.kernels.ops.attention.dsa.sm70_indexer import (
+    _hadamard_stage,
+    _quantize_row,
+)
+
+
+@triton.jit
+def _pool4_decode_write(
+    K,
+    G,
+    APE,
+    TAIL_K,
+    TAIL_G,
+    CACHE,
+    REQS,
+    LENGTHS,
+    TABLE,
+    K_ROW: tl.constexpr,
+    K_COL: tl.constexpr,
+    G_ROW: tl.constexpr,
+    G_COL: tl.constexpr,
+    A_ROW: tl.constexpr,
+    A_COL: tl.constexpr,
+    TAIL_SIZE: tl.constexpr,
+    CACHE_STRIDE: tl.constexpr,
+    TABLE_STRIDE: tl.constexpr,
+    ROUND_SCALE: tl.constexpr,
+):
+    b = tl.program_id(0)
+    req = tl.load(REQS + b).to(tl.int64)
+    length = tl.load(LENGTHS + b).to(tl.int32)
+    if (length > 0) & (req >= 0):
+        prefix = length - 1
+        slot = prefix % 4
+        cols = tl.arange(0, 128)
+        key = tl.load(K + b * K_ROW + cols * K_COL).to(tl.bfloat16).to(tl.float32)
+        gate = tl.load(G + b * G_ROW + cols * G_COL).to(tl.float32)
+        if length % 4 == 0:
+            slots = tl.arange(0, 4)
+            closed_tail_pos = (prefix - slot + slots) % TAIL_SIZE
+            previous_k = tl.load(
+                TAIL_K
+                + req * TAIL_SIZE * 128
+                + closed_tail_pos[:, None] * 128
+                + cols[None, :],
+                mask=slots[:, None] < slot,
+                other=0,
+            ).to(tl.float32)
+            previous_g = tl.load(
+                TAIL_G
+                + req * TAIL_SIZE * 128
+                + closed_tail_pos[:, None] * 128
+                + cols[None, :],
+                mask=slots[:, None] < slot,
+                other=0,
+            ).to(tl.float32)
+            keys = tl.where(slots[:, None] == slot, key[None, :], previous_k)
+            scores = tl.where(slots[:, None] == slot, gate[None, :], previous_g)
+            scores += tl.load(APE + slots[:, None] * A_ROW + cols[None, :] * A_COL).to(
+                tl.float32
+            )
+            prob = tl.exp(scores - tl.max(scores, 0)[None, :])
+            prob = prob / tl.sum(prob, 0)[None, :]
+            x = tl.sum(prob * keys, 0).to(tl.bfloat16).to(tl.float32)
+            x = _hadamard_stage(x, 64, 1)
+            x = _hadamard_stage(x, 32, 2)
+            x = _hadamard_stage(x, 16, 4)
+            x = _hadamard_stage(x, 8, 8)
+            x = _hadamard_stage(x, 4, 16)
+            x = _hadamard_stage(x, 2, 32)
+            x = _hadamard_stage(x, 1, 64)
+            encoded, scale = _quantize_row(
+                (x * 128**-0.5).to(tl.bfloat16).to(tl.float32), ROUND_SCALE
+            )
+            pool_id = prefix // 4
+            physical = tl.load(TABLE + req * TABLE_STRIDE + pool_id // 64 * 256).to(
+                tl.int64
+            )
+            page = physical // 64
+            offset = pool_id % 64
+            tl.store(CACHE + page * CACHE_STRIDE + offset * 128 + cols, encoded)
+            scale_ptr = (CACHE + page * CACHE_STRIDE + 8192 + offset * 4).to(
+                tl.pointer_type(tl.float32)
+            )
+            tl.store(scale_ptr, scale)
+        else:
+            tail_pos = prefix % TAIL_SIZE
+            tl.store(TAIL_K + req * TAIL_SIZE * 128 + tail_pos * 128 + cols, key)
+            tl.store(TAIL_G + req * TAIL_SIZE * 128 + tail_pos * 128 + cols, gate)
+
+
+@triton.jit
+def _decode_e4m3fn(encoded):
+    bits = encoded.to(tl.int32)
+    exponent = (bits >> 3) & 15
+    mantissa = bits & 7
+    normal = ((exponent + 120) << 23) | (mantissa << 20)
+    value = tl.where(
+        exponent == 0,
+        mantissa.to(tl.float32) * 2**-9,
+        normal.to(tl.float32, bitcast=True),
+    )
+    value = tl.where((bits & 127) == 127, float("nan"), value)
+    # Multiplication preserves negative zero for the FP8 sign bit.
+    return value * tl.where((bits & 128) != 0, -1.0, 1.0)
+
+
+@triton.jit
+def _pool4_decode_gather(
+    CACHE,
+    TABLE,
+    REQS,
+    LENGTHS,
+    K_OUT,
+    S_OUT,
+    POOLS,
+    CACHE_STRIDE: tl.constexpr,
+    TABLE_STRIDE: tl.constexpr,
+    MAX_POOLS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    b = tl.program_id(0)
+    req = tl.load(REQS + b).to(tl.int64)
+    length = tl.load(LENGTHS + b).to(tl.int32)
+    pools = tl.where(req >= 0, length // 4, 0)
+    if tl.program_id(1) == 0:
+        tl.store(POOLS + b, pools)
+    ids = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    valid = (ids < pools) & (ids < MAX_POOLS)
+    cols = tl.arange(0, 128)
+    physical = tl.load(
+        TABLE + req * TABLE_STRIDE + ids // 64 * 256, mask=valid, other=0
+    ).to(tl.int64)
+    pages = physical // 64
+    offsets = ids % 64
+    encoded = tl.load(
+        CACHE + pages[:, None] * CACHE_STRIDE + offsets[:, None] * 128 + cols[None, :],
+        mask=valid[:, None],
+        other=0,
+    )
+    keys = _decode_e4m3fn(encoded)
+    scale_ptr = (CACHE + pages * CACHE_STRIDE + 8192 + offsets * 4).to(
+        tl.pointer_type(tl.float32)
+    )
+    scales = tl.load(scale_ptr, mask=valid, other=0)
+    tl.store(
+        K_OUT + (b * MAX_POOLS + ids[:, None]) * 128 + cols[None, :],
+        keys,
+        mask=(ids < MAX_POOLS)[:, None],
+    )
+    tl.store(S_OUT + b * MAX_POOLS + ids, scales, mask=ids < MAX_POOLS)
+
+
+def pool4_decode_sm70(
+    keys,
+    gates,
+    ape,
+    tail_keys,
+    tail_gates,
+    cache,
+    token_table,
+    request_ids,
+    seq_lens,
+    round_scale=False,
+):
+    """Append one key per request, close pools on-device, and gather FP16 keys.
+
+    The gathered capacity depends only on token-table width, never host length.
+    Invalid entries are zeroed and accompanied by a device-side pool count.
+    Cache and tail storage are request-owned; all addresses survive graph replay.
+    """
+    batch = keys.shape[0]
+    if keys.shape != (batch, 128) or gates.shape != keys.shape or ape.shape != (4, 128):
+        raise ValueError(
+            "SM70 decode requires one 128-wide key/gate per request and pool4 APE"
+        )
+    if (
+        tail_keys.shape != tail_gates.shape
+        or tail_keys.shape[-1] != 128
+        or tail_keys.shape[1] < 4
+    ):
+        raise ValueError(
+            "SM70 decode requires matching 128-wide tail rings of at least four slots"
+        )
+    if not (
+        tail_keys.is_contiguous()
+        and tail_gates.is_contiguous()
+        and cache.is_contiguous()
+    ):
+        raise ValueError("SM70 decode cache and tail rings must be contiguous")
+    if cache.dtype != torch.uint8 or cache.shape[1] != 8448:
+        raise ValueError(
+            "SM70 pool4 decode requires 64-slot row-major FP8/FP32 cache pages"
+        )
+    capacity = token_table.shape[1] // 4
+    gathered = torch.empty(
+        (batch, capacity, 128), dtype=torch.float16, device=keys.device
+    )
+    scales = torch.empty((batch, capacity), dtype=torch.float32, device=keys.device)
+    pools = torch.empty((batch,), dtype=torch.int32, device=keys.device)
+    _pool4_decode_write[(batch,)](
+        keys,
+        gates,
+        ape,
+        tail_keys,
+        tail_gates,
+        cache,
+        request_ids,
+        seq_lens,
+        token_table,
+        *keys.stride(),
+        *gates.stride(),
+        *ape.stride(),
+        tail_keys.shape[1],
+        cache.stride(0),
+        token_table.stride(0),
+        round_scale,
+        num_warps=4,
+        enable_fp_fusion=False,
+    )
+    _pool4_decode_gather[(batch, triton.cdiv(capacity, 16))](
+        cache,
+        token_table,
+        request_ids,
+        seq_lens,
+        gathered,
+        scales,
+        pools,
+        cache.stride(0),
+        token_table.stride(0),
+        capacity,
+        16,
+        num_warps=4,
+    )
+    return gathered, scales, pools

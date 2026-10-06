@@ -1,10 +1,10 @@
-"""Triton sparse MLA decode kernel with FP8 and BF16 KV cache support.
+"""Triton sparse MLA decode kernel with FP8, BF16 and FP16 KV cache support.
 
 Adapted from aiter's unified_attention_sparse_mla kernel for DSA shapes:
-  q:       [bs, H, DIM]     fp8/bf16 (DIM=576 = D_V+D_TAIL)
-  kv:      [num_pages, 1, DIM]  fp8/bf16
+  q:       [bs, H, DIM]     fp8/bf16/fp16 (DIM=D_V+D_TAIL)
+  kv:      [num_pages, 1, DIM]  fp8/bf16/fp16
   indices: [bs, 1, topk]    int32
-  output:  [1, bs, H, D_V]  bf16
+  output:  [1, bs, H, D_V]  fp16 for fp16 queries, bf16 otherwise
 
 Two variants:
   1. Base: single-pass per-token kernel (adapted from aiter)
@@ -58,6 +58,7 @@ def _get_splitk_bufs(
     d_v: int,
     device: torch.device,
     workspace: _SplitKWorkspace | None = None,
+    dtype: torch.dtype = torch.bfloat16,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if workspace is None:
         stream_id = int(torch.cuda.current_stream(device).cuda_stream)
@@ -66,7 +67,11 @@ def _get_splitk_bufs(
     needed_lse = bs * kv_splits * h_padded
     needed_acc = bs * kv_splits * h_padded * d_v
     for lse_buf, acc_buf in reversed(workspace):
-        if lse_buf.numel() >= needed_lse and acc_buf.numel() >= needed_acc:
+        if (
+            acc_buf.dtype == dtype
+            and lse_buf.numel() >= needed_lse
+            and acc_buf.numel() >= needed_acc
+        ):
             lse = lse_buf[:needed_lse].view(bs, kv_splits, h_padded)
             acc = acc_buf[:needed_acc].view(bs, kv_splits, h_padded, d_v)
             return lse, acc
@@ -75,7 +80,7 @@ def _get_splitk_bufs(
     # round up so a growing shape sequence adds O(log range) buffers, not one each.
     capacity_lse = _next_pow2(max(needed_lse, 2 * _cu_count(device) * 16))
     lse_buf = torch.empty(capacity_lse, dtype=torch.float32, device=device)
-    acc_buf = torch.empty(capacity_lse * d_v, dtype=torch.bfloat16, device=device)
+    acc_buf = torch.empty(capacity_lse * d_v, dtype=dtype, device=device)
     workspace.append((lse_buf, acc_buf))
     lse = lse_buf[:needed_lse].view(bs, kv_splits, h_padded)
     acc = acc_buf[:needed_acc].view(bs, kv_splits, h_padded, d_v)
@@ -118,10 +123,11 @@ def _sparse_mla_decode_fused_kernel(
 
     h_offs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
     h_mask = h_offs < H
-    dt = tl.arange(0, D_TAIL)
+    if D_TAIL > 0:
+        dt = tl.arange(0, D_TAIL)
     g = tl.arange(0, _G)
 
-    input_type = kv_ptr.dtype.element_ty if USE_FP8_DOT else tl.bfloat16
+    input_type = kv_ptr.dtype.element_ty
     if USE_FP8_DOT:
         p_dot_scale = 1.0 / fp8_max
     else:
@@ -152,11 +158,12 @@ def _sparse_mla_decode_fused_kernel(
             mask=h_mask[:, None],
             other=0.0,
         ).to(input_type)
-    q_tail = tl.load(
-        q_rope_ptr + t * STRIDE_QR_T + h_offs[:, None] * STRIDE_QR_H + dt[None, :],
-        mask=h_mask[:, None],
-        other=0.0,
-    ).to(input_type)
+    if D_TAIL > 0:
+        q_tail = tl.load(
+            q_rope_ptr + t * STRIDE_QR_T + h_offs[:, None] * STRIDE_QR_H + dt[None, :],
+            mask=h_mask[:, None],
+            other=0.0,
+        ).to(input_type)
 
     neg_large = -3.4028234663852886e38
     m_i = tl.full((BLOCK_H,), neg_large, dtype=tl.float32)
@@ -207,11 +214,12 @@ def _sparse_mla_decode_fused_kernel(
                 mask=valid[:, None],
                 other=0.0,
             ).to(input_type)
-        kv_tail = tl.load(
-            kv_base + (D_V + dt)[None, :],
-            mask=valid[:, None],
-            other=0.0,
-        ).to(input_type)
+        if D_TAIL > 0:
+            kv_tail = tl.load(
+                kv_base + (D_V + dt)[None, :],
+                mask=valid[:, None],
+                other=0.0,
+            ).to(input_type)
 
         scores = tl.dot(q0, tl.trans(kv0))
         if NUM_GROUPS >= 2:
@@ -220,7 +228,8 @@ def _sparse_mla_decode_fused_kernel(
             scores += tl.dot(q2, tl.trans(kv2))
         if NUM_GROUPS >= 4:
             scores += tl.dot(q3, tl.trans(kv3))
-        scores += tl.dot(q_tail, tl.trans(kv_tail))
+        if D_TAIL > 0:
+            scores += tl.dot(q_tail, tl.trans(kv_tail))
         scores = scores * qk_scale
         scores = tl.where(valid[None, :], scores, neg_large)
 
@@ -263,25 +272,25 @@ def _sparse_mla_decode_fused_kernel(
     o_base = out_ptr + t * H * D_V
     tl.store(
         o_base + h_offs[:, None] * D_V + g[None, :],
-        acc0.to(tl.bfloat16),
+        acc0.to(out_ptr.dtype.element_ty),
         mask=h_mask[:, None],
     )
     if NUM_GROUPS >= 2:
         tl.store(
             o_base + h_offs[:, None] * D_V + (_G + g)[None, :],
-            acc1.to(tl.bfloat16),
+            acc1.to(out_ptr.dtype.element_ty),
             mask=h_mask[:, None],
         )
     if NUM_GROUPS >= 3:
         tl.store(
             o_base + h_offs[:, None] * D_V + (2 * _G + g)[None, :],
-            acc2.to(tl.bfloat16),
+            acc2.to(out_ptr.dtype.element_ty),
             mask=h_mask[:, None],
         )
     if NUM_GROUPS >= 4:
         tl.store(
             o_base + h_offs[:, None] * D_V + (3 * _G + g)[None, :],
-            acc3.to(tl.bfloat16),
+            acc3.to(out_ptr.dtype.element_ty),
             mask=h_mask[:, None],
         )
 
@@ -317,10 +326,11 @@ def _sparse_mla_decode_split_kernel(
 
     h_offs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
     h_mask = h_offs < H
-    dt = tl.arange(0, D_TAIL)
+    if D_TAIL > 0:
+        dt = tl.arange(0, D_TAIL)
     g = tl.arange(0, _G)
 
-    input_type = kv_ptr.dtype.element_ty if USE_FP8_DOT else tl.bfloat16
+    input_type = kv_ptr.dtype.element_ty
     if USE_FP8_DOT:
         p_dot_scale = 1.0 / fp8_max
     else:
@@ -351,11 +361,12 @@ def _sparse_mla_decode_split_kernel(
             mask=h_mask[:, None],
             other=0.0,
         ).to(input_type)
-    q_tail = tl.load(
-        q_rope_ptr + t * STRIDE_QR_T + h_offs[:, None] * STRIDE_QR_H + dt[None, :],
-        mask=h_mask[:, None],
-        other=0.0,
-    ).to(input_type)
+    if D_TAIL > 0:
+        q_tail = tl.load(
+            q_rope_ptr + t * STRIDE_QR_T + h_offs[:, None] * STRIDE_QR_H + dt[None, :],
+            mask=h_mask[:, None],
+            other=0.0,
+        ).to(input_type)
 
     tiles_per_segment = tl.cdiv(topk, KV_SPLITS * BLOCK_K)
     if pid_k * tiles_per_segment * BLOCK_K >= topk:
@@ -409,11 +420,12 @@ def _sparse_mla_decode_split_kernel(
                 mask=valid[:, None],
                 other=0.0,
             ).to(input_type)
-        kv_tail = tl.load(
-            kv_base + (D_V + dt)[None, :],
-            mask=valid[:, None],
-            other=0.0,
-        ).to(input_type)
+        if D_TAIL > 0:
+            kv_tail = tl.load(
+                kv_base + (D_V + dt)[None, :],
+                mask=valid[:, None],
+                other=0.0,
+            ).to(input_type)
 
         scores = tl.dot(q0, tl.trans(kv0))
         if NUM_GROUPS >= 2:
@@ -422,7 +434,8 @@ def _sparse_mla_decode_split_kernel(
             scores += tl.dot(q2, tl.trans(kv2))
         if NUM_GROUPS >= 4:
             scores += tl.dot(q3, tl.trans(kv3))
-        scores += tl.dot(q_tail, tl.trans(kv_tail))
+        if D_TAIL > 0:
+            scores += tl.dot(q_tail, tl.trans(kv_tail))
         scores = scores * qk_scale
         scores = tl.where(valid[None, :], scores, neg_large)
 
@@ -466,32 +479,34 @@ def _sparse_mla_decode_split_kernel(
 
     lse = tl.where(has_data, tl.log2(l_i) + m_i, neg_large)
 
-    H_padded = tl.cdiv(H, BLOCK_H) * BLOCK_H
+    # The common reduction/workspace contract pads heads to sixteen even when
+    # the launch uses a smaller logical head tile.
+    H_padded = tl.cdiv(H, 16) * 16
     lse_base = t * KV_SPLITS * H_padded + pid_k * H_padded
     tl.store(lse_partial_ptr + lse_base + h_offs, lse, mask=h_mask)
 
     ap_base = t * KV_SPLITS * H_padded * D_V + pid_k * H_padded * D_V
     tl.store(
         acc_partial_ptr + ap_base + h_offs[:, None] * D_V + g[None, :],
-        acc0.to(tl.bfloat16),
+        acc0.to(acc_partial_ptr.dtype.element_ty),
         mask=h_mask[:, None],
     )
     if NUM_GROUPS >= 2:
         tl.store(
             acc_partial_ptr + ap_base + h_offs[:, None] * D_V + (_G + g)[None, :],
-            acc1.to(tl.bfloat16),
+            acc1.to(acc_partial_ptr.dtype.element_ty),
             mask=h_mask[:, None],
         )
     if NUM_GROUPS >= 3:
         tl.store(
             acc_partial_ptr + ap_base + h_offs[:, None] * D_V + (2 * _G + g)[None, :],
-            acc2.to(tl.bfloat16),
+            acc2.to(acc_partial_ptr.dtype.element_ty),
             mask=h_mask[:, None],
         )
     if NUM_GROUPS >= 4:
         tl.store(
             acc_partial_ptr + ap_base + h_offs[:, None] * D_V + (3 * _G + g)[None, :],
-            acc3.to(tl.bfloat16),
+            acc3.to(acc_partial_ptr.dtype.element_ty),
             mask=h_mask[:, None],
         )
 
@@ -508,15 +523,16 @@ def triton_sparse_mla_decode_splitk(
 ) -> torch.Tensor:
     """Split-K Triton sparse MLA decode (DSv4 pattern).
 
-    q_nope:  [bs, H, d_v] fp8/bf16
-    q_rope:  [bs, H, d_tail] fp8/bf16
-    kv:      [num_pages, 1, DIM] fp8/bf16
+    q_nope:  [bs, H, d_v] fp8/bf16/fp16
+    q_rope:  [bs, H, d_tail] fp8/bf16/fp16; d_tail may be zero
+    kv:      [num_pages, 1, DIM] fp8/bf16/fp16
     indices: [bs, 1, topk] int32
     workspace: backend-owned grow-only split-K buffers for graph-safe reuse
-    returns: [1, bs, H, d_v] bf16
+    returns: [1, bs, H, d_v], fp16 for fp16 inputs and bf16 otherwise
     """
     is_fp8 = _validate_input_dtypes(q_nope, q_rope, kv)
     use_fp8_dot = is_fp8
+    out_dtype = torch.float16 if q_nope.dtype == torch.float16 else torch.bfloat16
     bs, H, d_v_in = q_nope.shape
     assert d_v_in == d_v
     d_tail = q_rope.shape[-1]
@@ -533,6 +549,20 @@ def triton_sparse_mla_decode_splitk(
 
     BLOCK_H = 16
     BLOCK_K = _sparse_mla_block_k(kv)
+    sm70_glm_decode = (
+        bs == 1
+        and H == 8
+        and d_v == 512
+        and d_tail == 0
+        and kv.dtype == torch.float16
+        and torch.version.hip is None
+        and torch.cuda.get_device_capability(kv.device) == (7, 0)
+    )
+    if sm70_glm_decode:
+        # GLM TP8: a 64-row tile spills ~2400 registers on Volta. A 16-row
+        # tile cuts local-memory traffic while retaining the same split cap
+        # and indexed softmax/value computation, including invalid slots.
+        BLOCK_K = min(BLOCK_K, 16)
     n_head_blocks = (H + BLOCK_H - 1) // BLOCK_H
     h_padded = n_head_blocks * BLOCK_H
 
@@ -587,7 +617,7 @@ def triton_sparse_mla_decode_splitk(
         fused_num_warps = 4
         if optimize_gfx950_fp8:
             fused_num_warps = _gfx950_sparse_mla_num_warps(base_ctas, 1, num_cu)
-        out = torch.empty(bs, H, d_v, device=q_nope.device, dtype=torch.bfloat16)
+        out = torch.empty(bs, H, d_v, device=q_nope.device, dtype=out_dtype)
         with _no_async_copy():
             _sparse_mla_decode_fused_kernel[(bs, n_head_blocks)](
                 q_nope,
@@ -621,6 +651,18 @@ def triton_sparse_mla_decode_splitk(
             )
         return out.unsqueeze(0)
 
+    if (
+        sm70_glm_decode
+        and q_nope.dtype == torch.float16
+        and out_dtype == torch.float16
+        and topk == 2051
+        and kv_splits == 32
+    ):
+        # Exact intermediate, graph, and all-rank real-input gates cover this
+        # GLM TP8 shape. Keep the 16-head storage/reduction stride above while
+        # dropping unused logical rows to remove compiler-reported spills.
+        BLOCK_H = 8
+
     tiles_per_split = (topk + kv_splits * BLOCK_K - 1) // (kv_splits * BLOCK_K)
     active_splits = (topk + tiles_per_split * BLOCK_K - 1) // (
         tiles_per_split * BLOCK_K
@@ -631,9 +673,9 @@ def triton_sparse_mla_decode_splitk(
         split_num_warps = _gfx950_sparse_mla_num_warps(base_ctas, active_splits, num_cu)
 
     lse_partial, acc_partial = _get_splitk_bufs(
-        bs, kv_splits, h_padded, d_v, q_nope.device, workspace
+        bs, kv_splits, h_padded, d_v, q_nope.device, workspace, dtype=out_dtype
     )
-    out = torch.empty(bs, H, d_v, device=q_nope.device, dtype=torch.bfloat16)
+    out = torch.empty(bs, H, d_v, device=q_nope.device, dtype=out_dtype)
 
     grid_split = (bs, n_head_blocks, kv_splits)
     with _no_async_copy():

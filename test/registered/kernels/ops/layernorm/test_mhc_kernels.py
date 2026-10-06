@@ -4,11 +4,127 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import sglang.kernels.ops.layernorm.mhc as mhc
+from sglang.kernels.ops.layernorm import mhc
 from sglang.kernels.ops.layernorm.mhc import mhc_fused_post_pre, mhc_post, mhc_pre
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
+
+
+@pytest.mark.parametrize(
+    "tokens,iterations,fuse_projection",
+    [
+        (0, 20, False),
+        (1, 1, False),
+        (17, 20, False),
+        (256, 20, False),
+        (1, 1, True),
+        (1, 20, True),
+    ],
+)
+def test_fp16_mhc_matches_torch(tokens, iterations, fuse_projection):
+    """Guard FP32 gates and input/output channel orientation in FP16 mHC.
+
+    A transposed residual mixing matrix or a BF16/FP16 parameter cast can
+    silently produce plausible model output. Compare the whole pre/post pair
+    with the independent unfused implementation, including distinct epsilons
+    and a non-default post multiplier.
+    """
+    if not torch.cuda.is_available() or torch.version.hip is not None:
+        pytest.skip("CUDA FP16 mHC coverage")
+    from sglang.kernels.ops.layernorm.mhc_post_split_h import mhc_post_split_h
+    from sglang.kernels.ops.layernorm.mhc_sm70 import mhc_pre_sm70
+
+    torch.manual_seed(533)
+    residual = torch.randn(tokens, 4, 4096, device="cuda", dtype=torch.float16)
+    fn = torch.randn(24, 16384, device="cuda") * 0.015
+    scale = torch.tensor([0.5, 0.7, 0.9], device="cuda")
+    base = torch.randn(24, device="cuda") * 0.3
+    args = (residual, fn, scale, base, 1e-6, 1e-5, 1e-7, 1.7, iterations)
+    reference = mhc._mhc_pre_torch(*args)
+    actual = mhc_pre_sm70(*args, fuse_projection=fuse_projection)
+    for got, expected in zip(actual, reference):
+        assert got.dtype == expected.dtype
+        torch.testing.assert_close(got, expected, atol=0.002, rtol=0.001)
+    post, comb, layer = actual
+    torch.testing.assert_close(
+        comb.sum(-2), torch.ones_like(comb.sum(-2)), atol=1e-5, rtol=0
+    )
+    x = torch.randn_like(layer)
+    expected = mhc._mhc_post_torch(x, residual, reference[0], reference[1])
+    got = mhc_post_split_h(x, residual, post, comb)
+    torch.testing.assert_close(got, expected, atol=0.002, rtol=0.001)
+
+
+def test_fp16_mhc_projection_graph_refresh():
+    """Decode graphs must read current residuals and FP32 learned parameters."""
+    if not torch.cuda.is_available() or torch.version.hip is not None:
+        pytest.skip("CUDA FP16 mHC coverage")
+    from sglang.kernels.ops.layernorm.mhc_sm70 import mhc_pre_sm70
+
+    torch.manual_seed(534)
+    residual = torch.randn(1, 4, 4096, device="cuda", dtype=torch.float16)
+    fn = torch.randn(24, 16384, device="cuda") * 0.015
+    scale = torch.tensor([0.5, 0.7, 0.9], device="cuda")
+    base = torch.randn(24, device="cuda") * 0.3
+    args = (residual, fn, scale, base, 1e-6, 1e-5, 1e-7, 1.7, 20)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            mhc_pre_sm70(*args, fuse_projection=True)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = mhc_pre_sm70(*args, fuse_projection=True)
+    for magnitude in (0.0, 0.25, 2.0):
+        residual.copy_(torch.randn_like(residual) * magnitude)
+        fn.copy_(torch.randn_like(fn) * 0.015)
+        base.copy_(torch.randn_like(base) * 0.3)
+        graph.replay()
+        expected = mhc._mhc_pre_torch(*args)
+        for got, ref in zip(actual, expected):
+            assert torch.isfinite(got).all()
+            torch.testing.assert_close(got, ref, atol=0.002, rtol=0.001)
+
+
+@pytest.mark.parametrize("iterations,rms_eps", [(1, 1e-6), (20, 1e-6), (20, 1e-5)])
+def test_fp16_mhc_pointwise_exact_graph_refresh(iterations, rms_eps):
+    """Pointwise fusion must retain default reductions and exact outputs.
+
+    Changing cast/square precision, mean reduction order, rsqrt semantics or
+    graph input refresh can otherwise hide behind the approximate mHC tests.
+    """
+    if not torch.cuda.is_available() or torch.version.hip is not None:
+        pytest.skip("CUDA FP16 mHC coverage")
+    from sglang.kernels.ops.layernorm.mhc_sm70 import mhc_pre_sm70
+
+    torch.manual_seed(536)
+    residual = torch.randn(1, 4, 4096, device="cuda", dtype=torch.float16)
+    fn = torch.randn(24, 16384, device="cuda") * 0.015
+    scale = torch.tensor([0.5, 0.7, 0.9], device="cuda")
+    base = torch.randn(24, device="cuda") * 0.3
+    args = (residual, fn, scale, base, rms_eps, 1e-5, 1e-7, 1.7, iterations)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            mhc_pre_sm70(*args, fuse_pointwise=True)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = mhc_pre_sm70(*args, fuse_pointwise=True)
+    for magnitude in (0.0, 2**-15, 0.25, 1.0, 32.0):
+        for _ in range(8):
+            residual.copy_(torch.randn_like(residual) * magnitude)
+            fn.copy_(torch.randn_like(fn) * 0.015)
+            base.copy_(torch.randn_like(base) * 0.3)
+            eager = mhc_pre_sm70(*args, fuse_pointwise=True)
+            reference = mhc_pre_sm70(*args)
+            graph.replay()
+            for outputs in (eager, captured):
+                for actual, expected in zip(outputs, reference):
+                    assert torch.equal(actual, expected)
 
 
 @pytest.fixture

@@ -23,6 +23,21 @@ _SM120 = frozenset({CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 0))})
 _SM12X = frozenset({CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 9))})
 _KDA_PACKAGE = "sglang.kernels.kda_kernels"
 
+register_kernel(
+    KernelSpec(
+        op="gemm.sm70_nvfp4_gemv",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.sm70_nvfp4_gemv:sm70_nvfp4_gemv",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(7, 0), max_sm=(7, 0))}
+        ),
+        format_signature=FormatSignature(
+            supported_dtypes=("float16",),
+            description="Single-row routed GEMV over SM70 Marlin NVFP4 weights and encoded scales",
+        ),
+    )
+)
+
 
 def _prefer_torch_rowwise_fp8(
     mat_a: torch.Tensor,

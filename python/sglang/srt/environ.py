@@ -906,6 +906,12 @@ class Envs:
     # not compatible with runtime weight updates or EPLB expert rearrangement,
     # both of which assume the checkpoint's halves layout.
     SGLANG_OPT_FUSE_SWIGLU_INTERLEAVED = EnvBool(False)
+    # V100 plugin: measured batch-one GLM NVFP4 projections only.
+    SGLANG_OPT_SM70_NVFP4_GEMV = EnvBool(False)
+    # V100 plugin: fuse the batch-one GLM FP32 mHC projection and RMS partials.
+    SGLANG_OPT_SM70_MHC_PROJECTION = EnvBool(False)
+    # Keep cuBLAS projection and torch mean; fuse only surrounding pointwise work.
+    SGLANG_OPT_SM70_MHC_POINTWISE = EnvBool(False)
     # Fuse the `residual_add + RMSNorm + zero-pad` triplet that appears
     # before the MoE block for models whose MoE input hidden_size must be
     # padded up to a stride (e.g. GPT-OSS MXFP4 needs pad to multiple of

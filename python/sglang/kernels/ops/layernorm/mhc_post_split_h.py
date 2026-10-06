@@ -33,8 +33,8 @@ def mhc_post_split_h(
     *,
     block_size: int | None = None,
 ) -> torch.Tensor:
-    """Same result as the TileLang post kernel for contiguous BF16 HC=4 inputs."""
-    assert x.dtype == residual.dtype == torch.bfloat16
+    """HC=4 post-mix for contiguous BF16 or FP16 inputs; FP32 accumulation."""
+    assert x.dtype == residual.dtype and x.dtype in (torch.bfloat16, torch.float16)
     assert post.dtype == comb.dtype == torch.float32
     assert residual.shape == (x.shape[0], 4, x.shape[1])
     assert all(t.is_contiguous() for t in (x, residual, post, comb))

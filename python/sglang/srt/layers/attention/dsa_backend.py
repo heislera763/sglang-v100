@@ -14,17 +14,6 @@ from typing import (
 
 import torch
 
-from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
-from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
-from sglang.srt.runtime_context import (
-    get_buffer,
-    get_exec,
-    get_parallel,
-    get_platform,
-    get_spec,
-)
-
-logger = logging.getLogger(__name__)
 from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
     concat_cast_kv_fp8_pad,
     dequantize_k_cache_paged,
@@ -46,7 +35,10 @@ from sglang.kernels.ops.attention.utils import (
 from sglang.kernels.ops.kvcache.cache_ops import concat_and_cast_q_fp8_pad
 from sglang.srt.configs.model_config import (
     get_dsa_index_kpool,
+    get_dsa_index_topk,
+    is_deepseek_dsa,
 )
+from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.dsa_backend_kpool import (
@@ -85,6 +77,13 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.runtime_context import (
+    get_buffer,
+    get_exec,
+    get_parallel,
+    get_platform,
+    get_spec,
+)
 from sglang.srt.utils import (
     is_cuda,
     is_gfx95_supported,
@@ -94,10 +93,20 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
+logger = logging.getLogger(__name__)
+
 _IS_GFX95 = is_gfx95_supported()
 
 if is_cuda():
-    import deep_gemm
+    try:
+        import deep_gemm
+    except ModuleNotFoundError as error:
+        # Model discovery imports this module even for backends that do not
+        # use DeepGEMM. Keep that optional dependency out of discovery, while
+        # preserving errors from missing dependencies inside DeepGEMM itself.
+        if error.name != "deep_gemm":
+            raise
+        deep_gemm = None
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -1141,10 +1150,14 @@ class DeepseekSparseAttnBackend(
 
         paged_mqa_schedule_metadata = None
         paged_mqa_ctx_lens_2d = None
-        if is_cuda() and (
-            forward_batch.forward_mode.is_decode_or_idle()
-            or forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend_v2()
+        if (
+            is_cuda()
+            and self.device_sm_major >= 9
+            and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            )
         ):
             paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                 forward_batch.forward_mode,
@@ -1535,10 +1548,14 @@ class DeepseekSparseAttnBackend(
 
         paged_mqa_schedule_metadata = None
         paged_mqa_ctx_lens_2d = None
-        if is_cuda() and (
-            forward_mode.is_decode_or_idle()
-            or forward_mode.is_target_verify()
-            or forward_mode.is_draft_extend_v2()
+        if (
+            is_cuda()
+            and self.device_sm_major >= 9
+            and (
+                forward_mode.is_decode_or_idle()
+                or forward_mode.is_target_verify()
+                or forward_mode.is_draft_extend_v2()
+            )
         ):
             paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                 forward_mode, cache_seqlens_int32, seqlens_expanded, bs
