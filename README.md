@@ -32,6 +32,21 @@ GLM-5.3-Flash NVFP4 support, software FP8 indexing, sparse MLA, FP16 mHC and KDA
 compatibility. GLM currently uses eager prefill and batch-one decode graphs;
 MTP and multi-user throughput remain unvalidated.
 
+`glm-5.3-flash-fast` builds on the GLM branch and prioritizes speed over exact
+reference token/logit parity. Batch-one SM70 NVFP4 GEMV and fused mHC
+projection/RMS are enabled by default for their supported shapes. Checkpoint
+weights, quantization and model architecture are unchanged; accumulation order
+changes can alter generated tokens. Development gates remain numerical
+agreement with independent operator references, finite outputs, bounded
+generation smoke checks and full-model performance measurements. These checks
+do not establish broad quality equivalence.
+
+Set `SGLANG_OPT_SM70_NVFP4_GEMV=0 SGLANG_OPT_SM70_MHC_PROJECTION=0` to compare
+against the unfused paths. The alternative `SGLANG_OPT_SM70_MHC_POINTWISE=1`
+requires `SGLANG_OPT_SM70_MHC_PROJECTION=0`; the two mHC implementations are
+mutually exclusive. Existing shape/dtype/scheduling guards retain the fallback
+paths for unsupported cases.
+
 Preliminary batch-one measurements on eight 32 GB V100s:
 
 | Model/profile | Prompt tokens | PP tokens/s | TG tokens/s |
@@ -43,6 +58,11 @@ Preliminary batch-one measurements on eight 32 GB V100s:
 These are profile-specific development measurements. The matched GLM runs use
 256-token prefill chunks, a 24/21 PP split and no speculation; they do not
 predict concurrent-request throughput or imply cross-model comparisons.
+
+Initial matched TP8 offline Engine runs on the fast branch improve TG from
+32.58 to 41.70 tokens/s at 128 prompt tokens and 32.50 to 41.52 at 2,048
+(about 28%). Each uses three measured repetitions, an excluded warmup and 64
+generated tokens. At 2K, PP remains approximately 674–675 tokens/s.
 
 ## Build and use
 
@@ -71,6 +91,8 @@ The integrated upstream revision is recorded in `provenance.json`.
 `v100_lite/core-patches.json` enumerates the remaining core exceptions; verify
 `main` with `uv run --no-project .venv/bin/python v100_lite/check-core-diff.py`.
 Update and validate `main` first, then integrate it into the GLM branch.
+Keep speed experiments on `glm-5.3-flash-fast` and integrate validated changes
+from `glm-5.3-flash` into it.
 Prefer upstream implementations when equivalent fixes land. Keep fork-owned
 hardware adaptations in the plugin/public operators and new changes covered
 by focused numerical tests.
