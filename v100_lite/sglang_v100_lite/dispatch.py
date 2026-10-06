@@ -25,6 +25,6 @@ def reject_fallback(operation: str, reason: str, **tensors) -> None:
     raise V100FallbackError(
         f"V100 strict dispatch rejected fallback for {operation}: {reason}."
         + metadata
-        + " Add native coverage or explicitly disable "
-        "SGLANG_DEBUG_V100_STRICT_DISPATCH to allow the existing fallback."
+        + " Add native coverage or explicitly select a supported SM70 backend; "
+        "development tests must keep SGLANG_DEBUG_V100_STRICT_DISPATCH=1."
     )

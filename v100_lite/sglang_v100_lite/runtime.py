@@ -242,14 +242,41 @@ def initialize(original, self, config, *args, **kwargs):
 
 def mix(original, self, hyper_input):
     if (
+        hyper_input.ndim == 2
+        and hyper_input.shape[0] > 4
+        and hyper_input.shape[1] == 10240
+        and hyper_input.dtype == torch.float16
+        and hyper_input.is_cuda
+        and torch.cuda.get_device_capability(hyper_input.device) == (7, 0)
+    ):
+        from sglang.srt.runtime_context import get_forward
+
+        if get_forward().is_extend_in_batch:
+            # Prefill deliberately uses FP16 cuBLAS, not the small persistent
+            # decode kernel. Keep the upstream prefill equations and rounding.
+            if self.config.hc_per_branch_norm:
+                normed = self.hc_norm(hyper_input)
+            else:
+                normed = self.hc_norm(
+                    hyper_input.unflatten(-1, (self.hc_count, self.hidden_size))
+                ).flatten(-2)
+            result = self._mix_compute(
+                normed,
+                self.input_mix_weight_down.weight,
+                self.input_mix_weight_up.weight,
+                self.hc_count,
+                self.hidden_size,
+            ).to(self.params_dtype)
+            return result, (hyper_input, normed)
+    if (
         hyper_input.ndim != 2
-        or hyper_input.shape[0] not in (1, 2, 4)
+        or hyper_input.shape[0] not in (1, 2, 3, 4)
         or hyper_input.shape[1] != 10240
         or hyper_input.dtype != torch.float16
     ):
         reject_fallback(
             "qwen.hc_mix",
-            "native HC requires FP16 [rows, 10240] with rows in (1, 2, 4)",
+            "native HC requires FP16 [rows, 10240] with rows in (1, 2, 3, 4)",
             hyper_input=hyper_input,
         )
         return original(self, hyper_input)
@@ -293,9 +320,49 @@ def combine(original, self, block_output, residuals):
         from .kernels.sm70_hc_mix import hc_apply_gate
 
         return hc_apply_gate(block_output, residuals[0], residuals[2])
+    if (
+        len(residuals) == 2
+        and block_output.is_cuda
+        and block_output.dtype == torch.float16
+        and block_output.ndim == 2
+        and block_output.shape[1] == 2560
+        and torch.cuda.get_device_capability(block_output.device) == (7, 0)
+        and all(
+            x.shape == (block_output.shape[0], 10240)
+            and x.dtype == block_output.dtype
+            and x.device == block_output.device
+            and x.is_contiguous()
+            for x in residuals
+        )
+        and self.block_inject_weight.weight.shape == (4, 10240)
+        and self.block_inject_weight.weight.dtype == block_output.dtype
+        and self.block_inject_weight.weight.device == block_output.device
+        and self.block_inject_weight.weight.is_contiguous()
+    ):
+        from sglang.kernels.ops.elementwise.hc_combine import (
+            hc_combine,
+            hc_combine_split,
+        )
+
+        # Both are native FP16 CUDA kernels supported on SM70. Preserve the
+        # original split/unsplit policy without delegating backend selection.
+        op = (
+            hc_combine_split
+            if self._split_combine_ok and block_output.shape[0] <= 32
+            else hc_combine
+        )
+        return op(
+            block_output,
+            residuals[0],
+            residuals[1],
+            self.block_inject_weight.weight,
+            4,
+            2560,
+        )
     reject_fallback(
         "qwen.hc_combine",
-        "native fused combine requires the three-part state from the HC gate path",
+        "native combine requires the HC gate state or contiguous SM70 FP16 "
+        "[rows, 2560] output, [rows, 10240] residuals and [4, 10240] injection weights",
         output=block_output,
     )
     return original(self, block_output, residuals)
@@ -321,7 +388,7 @@ def sm70_hc_down_gemv_silu_supported(
         and (
             x.shape[0] == 1
             or (
-                x.shape[0] in (2, 4)
+                x.shape[0] in (2, 3, 4)
                 and os.environ.get("SGLANG_SM70_HC_NATIVE", "1") == "1"
                 and os.environ.get("SGLANG_SM70_MTP_HC", "1") == "1"
                 and x.data_ptr() % 16 == 0
@@ -385,15 +452,17 @@ def store(
 
 
 def apply_unquant(original, self, layer, x, bias=None):
-    from .kernels.gemm import linear_dense, supported
+    from .kernels.gemm import blas_supported, linear_dense, supported
 
     if supported(x, layer.weight, bias):
         return linear_dense(x, layer.weight)
+    if blas_supported(x, layer.weight, bias):
+        return torch.nn.functional.linear(x, layer.weight, bias)
     reject_fallback(
         "gemm.unquantized_linear",
         "native dense/small GEMM requires SGLANG_SM70_DENSE_GEMV=1, "
         "aligned contiguous SM70 FP16 input/weights, no bias and a tuned "
-        "shape (rows 1, 2 or 4); batched shapes require SGLANG_SM70_MTP_SMALL_GEMM=1",
+        "shape (rows 1, 2, 3 or 4); batched shapes require SGLANG_SM70_MTP_SMALL_GEMM=1",
         input=x,
         weight=layer.weight,
         bias=bias,
@@ -450,7 +519,7 @@ def round_verify_state(original, *args, **kwargs):
             kwargs["V"],
         )
         == (1, 1, 4, 12, 128, 128)
-        and kwargs["T"] in (2, 4)
+        and kwargs["T"] in (2, 3, 4)
         and kwargs["DISABLE_STATE_UPDATE"]
         and not kwargs["IS_KDA"]
         and not kwargs["HAS_EAGLE_TREE_CUSTOM_ATTN_MASK"]
@@ -483,17 +552,32 @@ def route_top10(original, scores, bias, topk, *args, **kwargs):
         and scores.is_cuda
         and scores.dtype in (torch.float16, torch.float32)
         and scores.ndim == 2
-        and scores.shape[0] in (1, 2, 4)
+        and scores.shape[0] > 0
         and scores.shape[1] == 512
         and scores.is_contiguous()
     ):
         from .kernels.sm70_nvfp4_moe_decode import sm70_topk10_softmax
 
         return sm70_topk10_softmax(scores)
+    if (
+        scores.is_cuda
+        and scores.dtype in (torch.float16, torch.float32)
+        and scores.ndim == 2
+        and scores.shape[1] == 288
+        and topk == 8
+        and bias is not None
+        and bias.shape == (288,)
+        and bias.device == scores.device
+        and bias.dtype in (torch.float16, torch.float32)
+        and torch.cuda.get_device_capability(scores.device) == (7, 0)
+    ):
+        # GLM's biased top-8 is the mainline FP32 Triton router on SM70.
+        # Its SM100-only radix branch cannot activate on this device.
+        return original(scores, bias, topk, *args, **kwargs)
     reject_fallback(
         "moe.top10_router",
         "native router requires contiguous CUDA FP16/FP32 [rows, 512], "
-        "rows in (1, 2, 4), topk=10, no bias and default softmax routing options",
+        "positive rows, topk=10, no bias and default softmax routing options",
         scores=scores,
         bias=bias,
     )

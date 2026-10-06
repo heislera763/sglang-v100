@@ -54,7 +54,7 @@ def gate_supported(x, weight):
     # The caller has already checked the exact SM70 mix geometry and dtype.
     return (
         os.environ.get("SGLANG_SM70_MTP_HC_GATE", "1") == "1"
-        and x.shape[0] in (2, 4)
+        and x.shape[0] in (2, 3, 4)
         and weight.shape == (4, 10240)
         and weight.device == x.device
         and weight.dtype == torch.float16

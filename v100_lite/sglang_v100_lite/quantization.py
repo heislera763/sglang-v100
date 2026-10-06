@@ -244,6 +244,19 @@ def moe_runner(original, cls, dispatch_name, runner_name):
                     topk.topk_weights.view(-1),
                 )
                 return StandardCombineInput(hidden_states=output)
+        if (
+            h.is_cuda
+            and h.dtype == torch.float16
+            and h.ndim == 2
+            and (h.shape[0] > 4 or h.shape[1] != 2560)
+            and quant.weight_bits == 4
+            and quant.w13_scales.dtype == quant.w2_scales.dtype == torch.float8_e4m3fn
+            and torch.cuda.get_device_capability(h.device) == (7, 0)
+        ):
+            # GLM and prefill use the explicitly selected SM70 Marlin backend.
+            # Its GEMM hook is replaced by marlin_gemm; an unavailable native
+            # extension raises instead of choosing a stock newer-GPU kernel.
+            return fn(dispatch, quant, config)
         reject_fallback(
             "moe.nvfp4_decode",
             "native Qwen MoE requires SGLANG_V100_NVFP4_MOE_DECODE=1, "

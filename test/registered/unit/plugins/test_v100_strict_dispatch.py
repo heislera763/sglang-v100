@@ -36,15 +36,15 @@ class TestV100StrictDispatch(CustomTestCase):
                 with self.assertRaisesRegex(V100FallbackError, "plugin.activation"):
                     sglang_v100_lite.register()
 
-    def test_three_row_hc_regression(self):
-        """Two-step MTP must expose the missing three-row HC specialization."""
-        x = torch.ones(3, 10240, dtype=torch.float16)
+    def test_uncovered_hc_rows_fail(self):
+        """Extending small-batch coverage must not reopen silent fallback."""
+        x = torch.ones(5, 10240, dtype=torch.float16)
         original = lambda owner, tensor: tensor.sum(-1)
         with envs.SGLANG_DEBUG_V100_STRICT_DISPATCH.override(False):
             torch.testing.assert_close(runtime.mix(original, None, x), x.sum(-1))
         with envs.SGLANG_DEBUG_V100_STRICT_DISPATCH.override(True):
             with self.assertRaisesRegex(
-                V100FallbackError, r"qwen.hc_mix.*rows in \(1, 2, 4\).*(3, 10240)"
+                V100FallbackError, r"qwen.hc_mix.*rows in \(1, 2, 3, 4\).*(5, 10240)"
             ):
                 runtime.mix(original, None, x)
 

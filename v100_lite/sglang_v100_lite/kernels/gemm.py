@@ -30,7 +30,7 @@ def supported(x: torch.Tensor, weight: torch.Tensor, bias=None) -> bool:
         and weight.dtype == torch.float16
         and weight.device == x.device
         and x.ndim == 2
-        and x.shape[0] in (1, 2, 4)
+        and x.shape[0] in (1, 2, 3, 4)
         and weight.ndim == 2
         and x.shape[1] == weight.shape[1]
         and bias is None
@@ -101,12 +101,58 @@ _SMALL_CONFIGS = {
     (4, 62080, 2560): (128, 32),
 }
 
+# Each row has independent accumulators; reuse the validated four-row geometry.
+_SMALL_CONFIGS.update(
+    {(3, n, k): config for (rows, n, k), config in _SMALL_CONFIGS.items() if rows == 4}
+)
+_SMALL_CONFIGS[(3, 1, 2560)] = (64, 32)
+
 
 def shape_supported(x, weight):
     return (
         os.environ.get("SGLANG_SM70_MTP_SMALL_GEMM", "1") == "1"
         and (x.shape[0], *weight.shape) in _SMALL_CONFIGS
     )
+
+
+def blas_supported(x, weight, bias=None):
+    """Explicit FP16 Volta library paths, separate from small decode kernels.
+
+    Known small-kernel shapes must use that implementation or fail. cuBLAS
+    is the selected backend for prefill, Qwen's four-bank embedding projection,
+    the two untuned Qwen projections, and GLM's vocabulary projection.
+    """
+    if not (
+        x.is_cuda
+        and x.dtype == weight.dtype == torch.float16
+        and x.device == weight.device
+        and x.ndim in (2, 3)
+        and weight.ndim == 2
+        and x.shape[-1] == weight.shape[1]
+        and x.is_contiguous()
+        and weight.is_contiguous()
+        and (bias is None or (bias.device == x.device and bias.dtype == x.dtype))
+        and torch.cuda.get_device_capability(x.device) == (7, 0)
+    ):
+        return False
+    if x.ndim == 2:
+        rows = x.shape[0]
+        shape = tuple(weight.shape)
+        native_small = (rows, *shape) in _SMALL_CONFIGS or (
+            rows == 1
+            and (shape in _DENSE_CONFIGS or (shape[1] == 2560 and shape[0] >= 32768))
+        )
+        if native_small:
+            return False
+        if rows in (2, 3, 4) and shape in ((1, 2560), (10240, 2560)):
+            return True
+        if weight.shape[1] == 4096 and weight.shape[0] >= 16384:
+            return True
+    elif x.shape[1:] == (4, 2560) and weight.shape == (2560, 2560):
+        return True
+    from sglang.srt.runtime_context import get_forward
+
+    return get_forward().is_extend_in_batch
 
 
 @cache_once
