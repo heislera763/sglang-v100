@@ -141,24 +141,32 @@ quantize activations to FP8 or reproduce native W8A8 arithmetic. Other modules
 retain the existing Volta attention/GDN/HC paths, and the FP8 n-gram table stays
 offloaded to pinned host memory.
 
-The measured configuration is **TP8 + EP8**: attention spans eight GPUs and
-each rank stores 64 complete experts. The checkpoint's 128×128 scale blocks
-fit its 640-wide experts; splitting that width into ordinary TP4/TP8 shards of
-160/80 would cross scale-block boundaries. This profile avoids that reshaping
-and leaves memory for caches and the draft. Native three-head QSA variants
-cover TP8 without padding to the TP4 six-head layout.
+Two placements work on all eight GPUs. **TP8 + EP8** spans both quads and
+stores 64 complete experts per rank. **TP4 × PP2 + EP4** keeps tensor/expert
+collectives within each NVLink quad, splits the 48 target layers **24/24**, and
+stores 128 complete experts per rank in each stage. The last stage also hosts
+the MTP draft. Both use GPU order `1,0,2,3,4,5,6,7` on the measured host.
+The checkpoint's 128×128 scale blocks fit its 640-wide experts; ordinary
+TP4/TP8 expert shards of 160/80 would cross scale-block boundaries. EP preserves
+whole experts instead. Native QSA covers three heads for TP8 and six for TP4.
 
-| Qwen FP8, TP8 + EP8 | Prefill tokens/s | Generation tokens/s |
-| --- | ---: | ---: |
-| Ordinary decoding | 3,249 | 36.1 |
-| Two-step MTP | 3,112 | 59.6 |
+| Qwen FP8 layout | MTP | Prefill tokens/s | Generation tokens/s |
+| --- | --- | ---: | ---: |
+| TP8 + EP8 | Off | 3,249 | 36.1 |
+| TP8 + EP8 | Two steps | 3,112 | 59.6 |
+| TP4 × PP2 + EP4 | Off | 5,832 | 38.8 |
+| TP4 × PP2 + EP4 | Two steps | 5,620 | 46.4 |
 
-Two-step MTP improves generation by 65%, with 61% accepted
-draft tokens and about 4% lower prefill throughput.
+PP2 improves prefill by about 80% with either decoding mode. TP8 remains faster
+for generation with MTP: 59.6 versus 46.4 tokens/s. Two-step MTP improves
+generation by 65% on TP8 and 20% on PP2, with respectively 61% and 58% accepted
+draft tokens (excluding bonus tokens), and about 4% lower prefill throughput.
 
 These use the same near-8K inputs, sampled thinking settings and measurement
-protocol above. Two steps is the initial MTP setting tested here, not an
-exhaustive FP8 depth optimum. The NVFP4 TP4 table uses a different placement,
+protocol above: nine measured requests per placement/mode, all producing 512
+tokens, with no cached prompt tokens or retractions. These are single-request
+results; two steps is the initial MTP setting tested here, not an exhaustive
+FP8 depth optimum. The NVFP4 TP4 table uses a different placement,
 so these results do not isolate quantization alone. Focused GPU checks cover
 finite E4M3 encodings, block scales, gated expert outputs, masked EP routes,
 graph replay and three-head dense/sparse attention against numerical references.
@@ -178,6 +186,13 @@ SM70 environment/cache/sampling settings. The JSON override skips vision
 loading; the CLI `--language-only` flag enables a separate encoder workflow
 that this model does not currently support. Ordinary decoding omits all
 speculative flags. `setup.sh` builds both NVFP4 and FP8 expert kernels.
+
+For TP4 × PP2, replace the TP8/EP8 arguments with
+`--tensor-parallel-size 4 --pipeline-parallel-size 2 --expert-parallel-size 4`
+and set `SGLANG_PP_LAYER_PARTITION=24,24`. For PP2 with MTP, also set
+`SGLANG_ENABLE_PP_SPEC=1`; retain two draft steps, three verification positions,
+top-k one, rejection sampling and `--disable-overlap-schedule`. Ordinary PP2
+omits the speculative flags and leaves `SGLANG_ENABLE_PP_SPEC` unset.
 
 ## Sampling and speculative decoding
 
