@@ -87,9 +87,31 @@ cycle growth remains unresolved; acceptance alone does not explain it.
 The conditional depth descent stopped when three regressed; GLM one-step has
 not been tested. These TP8 results do not establish the best PP2 draft depth.
 
+### GLM-5.3-Flash NVFP4, TP4×PP2
+
+Matched sampled SPEED-Bench runs, 24/21 layers, strict dispatch enabled:
+
+| Category | No MTP | 4 steps | TG gain | Draft acceptance |
+| --- | ---: | ---: | ---: | ---: |
+| Coding | 24.9 | 36.7 | 47% | 69% |
+| QA | 24.9 | 31.3 | 26% | 58% |
+| Writing | 24.9 | 29.3 | 18% | 58% |
+| Low-entropy code | 24.8 | 30.9 | 24% | 70% |
+
+MTP helps every category, but these PP rates trail the recent TP8 four-step
+rates. On the excluded same-prompt early/late controls, non-MTP stays at
+24.91/24.93 tokens/s. MTP falls from 34.61 to 28.17 tokens/s as its mean
+verification cycle grows from 102.54 to 133.39 ms, despite acceptance rising
+from 64% to 69%. This run establishes cycle growth under fixed prompt/settings,
+not its cause or repeatability. The six approximately 1K-token code prompts
+have median server first-token latency 1.03 s without MTP and 2.10 s with it;
+this includes more than pure prefill execution. No requests failed, and strict
+dispatch found no uncovered route. Four is the only draft depth tested in this
+current PP suite; concurrency and larger contexts remain unmeasured.
+
 ### Measurement definition and provenance
 
-Both tables use concurrency 1, a 512-token output cap and twelve excluded
+All SPEED-Bench tables use concurrency 1, a 512-token output cap and twelve excluded
 32-token warmups per profile. `qualitative` has two prompts each for coding,
 QA and writing; `throughput_1k/low_entropy` has six repository-code completions.
 Masked placeholders are excluded. Thinking consumes the output budget, and
@@ -112,9 +134,11 @@ this repository contains the summary and reproducibility identifiers.
 | --- | --- | ---: | ---: | ---: | --- |
 | Qwen | Full-Gen3 NVLink quad, TP4 | 16,384 | 0.88 | 8,192 | FP8 E5M2 |
 | GLM | Both quads, TP8 | 8,192 | 0.92 | 256 | Ordinary FP16 MLA |
+| GLM PP | One TP4 group per quad, PP2 | 8,192 | 0.92 | 256 | Ordinary FP16 MLA |
 
-All use FP16 activations/state, NVFP4 Marlin, no overlap/radix caching and
-classical rejection sampling with branch width one. Qwen uses thinking/xhigh,
+All use FP16 activations/state, NVFP4 Marlin and no overlap/radix caching.
+Speculative profiles use classical rejection sampling with branch width one.
+Qwen uses thinking/xhigh,
 T=1/top-p=0.95/top-k=20. GLM uses max effort/clear thinking,
 T=1/top-p=0.95/unrestricted top-k. Both use min-p=0, additive penalties=0,
 repetition penalty=1 and request/server seed 531. A request seed does not force
@@ -122,12 +146,14 @@ identical sampled sequences across speculative configurations.
 
 Qwen two/three-step source:
 [`ad9e6f8d`](https://github.com/heislera763/sglang-v100-plus/commit/ad9e6f8d326824a549317c196d5a8707e7b306ee).
-Qwen one-step and all GLM rows:
+Qwen one-step and GLM TP8 rows:
 [`3eb3b844`](https://github.com/heislera763/sglang-v100-plus/commit/3eb3b84455e094f66c6d5738b8817e321e8c466f).
 The intervening patch declares GLM library projections and changes diagnostic
-text/tests/README; Qwen numerical kernels are unchanged. Early/late controls
-accompany Qwen one-step and GLM two/three/four/repeated-five-step runs and are
-excluded from the category averages.
+text/tests/README; Qwen numerical kernels are unchanged. Both PP profiles use
+[`41807a4a`](https://github.com/heislera763/sglang-v100-plus/commit/41807a4a0a457c0d51d44ef0f4ab230a702e32b0),
+which changes only the README from `3eb3b844`. Early/late controls accompany
+Qwen one-step, GLM two/three/four/repeated-five-step and both PP runs; they are
+excluded from category averages.
 
 <details>
 <summary>Pinned workload selection</summary>
@@ -198,17 +224,18 @@ speculative penalties are broadcast across a verification block in
 [`eagle_utils.py`](python/sglang/srt/speculative/eagle_utils.py); nonzero history
 penalties do not yet have ordinary decoding's per-token semantics.
 
-TP8 GLM has realistic sampled performance evidence above. TP4×PP2 MTP has
-bounded earlier offline coverage of target/draft graphs, request reuse,
-rejection and temperature-1 sampling. Its proposal-probability relay and greedy
+TP8 and TP4×PP2 GLM have realistic sampled performance evidence above.
+TP4×PP2 MTP also has bounded earlier offline coverage of target/draft graphs,
+request reuse, rejection and temperature-1 sampling. Its proposal-probability relay and greedy
 prefill policy have focused regressions; eleven greedy sequences per layout
 matched their non-MTP controls in that earlier check. These checks preceded
-strict dispatch and do not establish current realistic sampled PP performance,
-concurrency, larger-context capacity or TP8/TP4 output parity.
+strict dispatch and do not establish concurrency, larger-context capacity or
+TP8/TP4 output parity.
 
-The next performance target is **GLM TP4×PP2 sampled MTP**, starting from the
-retained 24/21 split and comparing with a matched non-MTP control on coherent
-prompts. Draft depth must be measured for PP, rather than inherited from TP8.
+The next performance task is to attribute **PP MTP cycle growth** to target
+verification, draft execution or relay/scheduling costs before further tuning.
+Retain the 24/21 split. Draft depth must be measured for PP, rather than
+inherited from TP8.
 The last quad also hosts the draft model and has limited memory headroom.
 The experimental aggregate PP path requires `SGLANG_ENABLE_PP_SPEC=1`,
 EAGLE/top-k one and `--disable-overlap-schedule`; adaptive depth and attention
@@ -325,11 +352,11 @@ uv run --no-project .venv/bin/python -m sglang_v100_lite \
 These are manual launch references, not installed services. Bind address,
 port, API key and model paths are host choices; the OpenAI base URL is
 `http://<server>:9000/v1`. Clients can override sampling/template defaults.
-For the next experimental PP evaluation, change TP8 to
+For the tested experimental PP profile, change TP8 to
 `--tensor-parallel-size 4 --pipeline-parallel-size 2`, set
 `SGLANG_PP_LAYER_PARTITION=24,21 SGLANG_ENABLE_PP_SPEC=1`, and retain no-overlap
-scheduling. The best tested four-step TP8 setting is only a starting candidate
-for PP.
+scheduling. Four steps works in this bounded PP suite; it is not a measured
+PP optimum.
 
 ## Code organization and upstream maintenance
 
