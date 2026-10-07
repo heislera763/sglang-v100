@@ -37,6 +37,6 @@ if [[ ! -d $CUTLASS_DIR ]]; then
   git clone --depth 1 --branch v4.2.1 https://github.com/NVIDIA/cutlass.git "$CUTLASS_DIR"
 fi
 [[ -f $CUTLASS_DIR/include/cute/tensor.hpp && -f $CUTLASS_DIR/include/cutlass/cutlass.h ]]
-export CMAKE_ARGS="-DMARLIN_V100_NVFP4_ONLY=ON -DCMAKE_CUDA_ARCHITECTURES=70 -DCMAKE_CUDA_FLAGS=-gencode=arch=compute_70,code=sm_70"
+export CMAKE_ARGS="-DMARLIN_V100_NVFP4_ONLY=ON -DMARLIN_V100_FP8=ON -DCMAKE_CUDA_ARCHITECTURES=70 -DCMAKE_CUDA_FLAGS=-gencode=arch=compute_70,code=sm_70"
 build_python="$PWD/.venv/bin/python"
 (cd "$marlin" && "$build_python" setup.py build_ext --inplace)

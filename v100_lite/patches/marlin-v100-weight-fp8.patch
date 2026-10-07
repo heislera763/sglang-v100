@@ -1,0 +1,40 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -130,6 +130,7 @@
+ 
+ # The Qwen serving profile needs repacking and NVFP4 MoE, not other families.
+ option(MARLIN_V100_NVFP4_ONLY "Build only the NVFP4 MoE serving profile" OFF)
++option(MARLIN_V100_FP8 "Include weight-only FP8 in the reduced serving build" OFF)
+ if(MARLIN_V100_NVFP4_ONLY)
+   set(MARLIN_V100_DENSE_SRC
+     "csrc/torch_bindings_marlin.cpp"
+@@ -141,6 +142,10 @@
+     "csrc/moe/grouped_topk_kernels.cu"
+     "csrc/moe/marlin_moe_wna16/ops.cu"
+     "csrc/moe/marlin_moe_wna16/sm70_marlin_nvfp4_gemm.cu")
++  if(MARLIN_V100_FP8)
++    list(APPEND MARLIN_V100_MOE_SRC
++      "csrc/moe/marlin_moe_wna16/sm70_marlin_fp8_gemm.cu")
++  endif()
+ endif()
+ 
+ define_extension_target(
+@@ -168,3 +173,7 @@
+ if(MARLIN_V100_NVFP4_ONLY)
+   target_compile_definitions(_moe_C PRIVATE MARLIN_V100_NVFP4_ONLY)
+ endif()
++
++if(MARLIN_V100_FP8)
++  target_compile_definitions(_moe_C PRIVATE MARLIN_V100_FP8)
++endif()
+--- a/csrc/moe/marlin_moe_wna16/ops.cu
++++ b/csrc/moe/marlin_moe_wna16/ops.cu
+@@ -427,6 +427,8 @@
+         mul_topk_weights, size_m, size_n, size_k, group_size);
+   }
+ 
++  #endif
++  #if !defined(MARLIN_V100_NVFP4_ONLY) || defined(MARLIN_V100_FP8)
+   if (b_type == vllm::kFE4M3fn) {
+     TORCH_CHECK(group_size == -1 || group_size == 128,
+                 "SM70 Marlin MoE fp8_e4m3 supports only group_size -1 or "

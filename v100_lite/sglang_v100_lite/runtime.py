@@ -18,12 +18,18 @@ def install():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
         raise RuntimeError("SGLANG_V100_LITE=1 requires an SM70 CUDA device")
     import sgl_kernel.elementwise as norm_ops
-
     import sglang.srt.layers.layernorm as norms
     from sglang.srt.arg_groups.choices import add_linear_attn_kernel_backend_choices
     from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
+    from .fp8 import (
+        apply_fp8_moe,
+        create_fp8_moe_runner,
+        fp8_marlin_scalar_type,
+        fp8_minimum_capability,
+        prepare_fp8_moe,
+    )
     from .quantization import (
         dense_marlin_gemm,
         marlin_gemm,
@@ -58,6 +64,31 @@ def install():
             raise ValueError("The enabled SM70 profile requires float16 model weights")
 
     hooks = [
+        (
+            "sglang.srt.layers.quantization.fp8.Fp8Config.get_min_capability",
+            fp8_minimum_capability,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.layers.quantization.fp8.Fp8MoEMethod.create_moe_runner",
+            create_fp8_moe_runner,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.layers.quantization.fp8.Fp8MoEMethod.process_weights_after_loading",
+            prepare_fp8_moe,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.layers.quantization.fp8.Fp8MoEMethod.apply",
+            apply_fp8_moe,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe.get_scalar_type",
+            fp8_marlin_scalar_type,
+            HookType.AROUND,
+        ),
         (
             "sglang.srt.model_executor.runner.eager_runner.EagerRunner._execute_extend",
             eager_extend,

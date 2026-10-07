@@ -30,6 +30,7 @@ Current measured profiles use eager prefill and batch-one decode graphs.
 | `main` | Established Qwen and SM70 compatibility |
 | `glm-5.3-flash` | GLM compatibility and conservative operator paths |
 | `glm-5.3-flash-fast` | GLM speed work; floating-point reduction differences are accepted |
+| `qwen-3.8-flash-next-fp8` | Official Qwen FP8 checkpoint through SM70 W8A16 experts |
 
 On the fast branch, batch-one NVFP4 GEMV and fused mHC projection/RMS are on
 by default for supported shapes. The checkpoint and model architecture stay
@@ -97,7 +98,7 @@ Raw responses, commands and benchmark tooling stay outside this source repo.
 <details>
 <summary>Reproducibility identifiers</summary>
 
-Runtime source:
+Runtime source for the NVFP4 matrix:
 [`cf7f7e9f`](https://github.com/heislera763/sglang-v100-plus/commit/cf7f7e9fa42baf4fe683ab0444183b7ca8e2e409),
 PyTorch `2.13.0+cu126`, CUDA runtime 12.6.
 Inputs come from [NVIDIA SPEED-Bench](https://huggingface.co/datasets/nvidia/SPEED-Bench/tree/454f88454792dfa3ccfd7ef15fff248efde44cd1),
@@ -129,6 +130,54 @@ The transferred Qwen checkpoint has no retained Hub revision, so its exact
 weight provenance is less complete than GLM's.
 
 </details>
+
+### Official Qwen FP8 on Volta
+
+The `qwen-3.8-flash-next-fp8` branch supports
+[Qwen/Qwen3.8-Flash-Next-FP8](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8/tree/236dfdf285828023ca3bcd3f37366c58a3469b13)
+through **W8A16**: E4M3 expert weights remain compressed in GPU memory, are
+unpacked/scaled inside SM70 Marlin, and multiply FP16 activations. It does not
+quantize activations to FP8 or reproduce native W8A8 arithmetic. Other modules
+retain the existing Volta attention/GDN/HC paths, and the FP8 n-gram table stays
+offloaded to pinned host memory.
+
+The measured configuration is **TP8 + EP8**: attention spans eight GPUs and
+each rank stores 64 complete experts. The checkpoint's 128×128 scale blocks
+fit its 640-wide experts; splitting that width into ordinary TP4/TP8 shards of
+160/80 would cross scale-block boundaries. This profile avoids that reshaping
+and leaves memory for caches and the draft. Native three-head QSA variants
+cover TP8 without padding to the TP4 six-head layout.
+
+| Qwen FP8, TP8 + EP8 | Prefill tokens/s | Generation tokens/s |
+| --- | ---: | ---: |
+| Ordinary decoding | 3,249 | 36.1 |
+| Two-step MTP | 3,112 | 59.6 |
+
+Two-step MTP improves generation by 65%, with 61% accepted
+draft tokens and about 4% lower prefill throughput.
+
+These use the same near-8K inputs, sampled thinking settings and measurement
+protocol above. Two steps is the initial MTP setting tested here, not an
+exhaustive FP8 depth optimum. The NVFP4 TP4 table uses a different placement,
+so these results do not isolate quantization alone. Focused GPU checks cover
+finite E4M3 encodings, block scales, gated expert outputs, masked EP routes,
+graph replay and three-head dense/sparse attention against numerical references.
+
+Check out `qwen-3.8-flash-next-fp8` before building. Use the Qwen launch reference
+below with all eight GPUs visible. Replace the model/quantization/placement
+arguments with:
+
+```bash
+--model-path "$HOME/models/sglang/Qwen-Qwen3.8-Flash-Next-FP8" \
+--quantization fp8 --tensor-parallel-size 8 --expert-parallel-size 8 \
+--json-model-override-args '{"language_model_only":true}'
+```
+
+Omit `--fp4-gemm-backend`; retain `--moe-runner-backend marlin` and the shared
+SM70 environment/cache/sampling settings. The JSON override skips vision
+loading; the CLI `--language-only` flag enables a separate encoder workflow
+that this model does not currently support. Ordinary decoding omits all
+speculative flags. `setup.sh` builds both NVFP4 and FP8 expert kernels.
 
 ## Sampling and speculative decoding
 

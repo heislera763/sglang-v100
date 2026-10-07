@@ -19,6 +19,13 @@ _DENSE_CONFIGS = {
     (1, 2560): (256, 32, 8),
     (10240, 2560): (64, 32, 8),
     (2560, 2560): (128, 32, 8),
+    # Qwen TP8: GDN/QSA projections, shared expert and vocabulary shard.
+    (2048, 2560): (64, 32, 8),
+    (12, 2560): (64, 32, 8),
+    (2560, 768): (128, 32, 8),
+    (160, 2560): (256, 32, 8),
+    (2560, 80): (128, 8, 4),
+    (31040, 2560): (64, 32, 8),
 }
 
 
@@ -100,6 +107,18 @@ _SMALL_CONFIGS = {
     (2, 62080, 2560): (128, 32),
     (4, 62080, 2560): (128, 32),
 }
+
+for _rows in (2, 4):
+    _SMALL_CONFIGS.update(
+        {
+            (_rows, 2048, 2560): (64, 32),
+            (_rows, 12, 2560): (64, 32),
+            (_rows, 2560, 768): (128, 16),
+            (_rows, 160, 2560): (256, 32),
+            (_rows, 2560, 80): (128, 8),
+            (_rows, 31040, 2560): (128, 32),
+        }
+    )
 
 # Each row has independent accumulators; reuse the validated four-row geometry.
 _SMALL_CONFIGS.update(

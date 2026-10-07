@@ -61,7 +61,7 @@ class QwenSparseAttnBackend(BaseQSA):
             and q.dtype == torch.float16
             and q.ndim == 3
             and q.shape[0] > 0
-            and q.shape[1:] == (6, 256)
+            and q.shape[1:] in ((3, 256), (6, 256))
             and topk_indices.ndim == 2
             and topk_indices.shape[0] == q.shape[0]
             and topk_indices.shape[1] > 0
@@ -83,7 +83,7 @@ class QwenSparseAttnBackend(BaseQSA):
         metadata,
         topk_indices,
     ) -> bool:
-        """Exact direct-cache QSA decode/verify specialization for Qwen3.8 TP4."""
+        """Exact direct-cache QSA decode/verify specialization for Qwen3.8 TP4/TP8."""
         forward_mode = forward_batch.forward_mode
         return (
             (
@@ -94,7 +94,7 @@ class QwenSparseAttnBackend(BaseQSA):
             and torch.cuda.get_device_capability(q.device) == (7, 0)
             and q.dtype == torch.float16
             and q.ndim == 3
-            and q.shape[1:] == (6, 256)
+            and q.shape[1:] in ((3, 256), (6, 256))
             and q.shape[0] == metadata.sequence_lengths.numel()
             and topk_indices.ndim == 2
             and topk_indices.shape[0] == q.shape[0]
@@ -141,7 +141,7 @@ class QwenSparseAttnBackend(BaseQSA):
             if (
                 no_prefix
                 and max(int(n) for n in lengths) <= limit
-                and q3.shape[1:] == (6, 256)
+                and q3.shape[1:] in ((3, 256), (6, 256))
             ):
                 if save_kv_cache:
                     pool.set_kv_buffer(layer, forward_batch.out_cache_loc, k, v)
@@ -212,7 +212,7 @@ class QwenSparseAttnBackend(BaseQSA):
             return out.reshape(q.shape[0], -1)
         reject_fallback(
             "qsa.paged_attention",
-            "native decode/verify requires SM70 FP16 [rows, 6, 256], "
+            "native decode/verify requires SM70 FP16 [rows, 3|6, 256], "
             "matching row metadata/indices and E5M2 [pages, 1, 256] cache",
             query=q,
             key_cache=kb,

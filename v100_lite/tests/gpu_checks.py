@@ -1,6 +1,7 @@
 """GPU references for the SM70 operators and FP16 MTP recurrence."""
 
 import torch
+from sglang.srt.runtime_context import get_context
 from sglang_v100_lite.quantization import prepare_nvfp4_moe
 from sglang_v100_lite.kernels.sm70_nvfp4_moe_decode import sm70_nvfp4_moe_decode
 from sglang_v100_lite.kernels.sm70_fp8_kv import write_fp8_e5m2_cache_sm70
@@ -8,6 +9,10 @@ from sglang_v100_lite.kernels.sm70_fp8_kv import write_fp8_e5m2_cache_sm70
 assert torch.cuda.get_device_capability() == (7, 0)
 torch.manual_seed(12)
 device = "cuda"
+# Native Marlin dispatch reads the same published schedule as model execution.
+get_context().override_server_args(
+    model_path="dummy", disable_overlap_schedule=True
+).install()
 # Integer E5M2 cache conversion must match Torch's software conversion, including
 # ties and negative values. Values stay in finite FP16's ordinary model range.
 x = torch.randn(17, 1, 256, device=device, dtype=torch.float16) * 4
@@ -64,7 +69,18 @@ print("Native top-10 router: ids, ties and weights agree with Torch and mainline
 def original_router(*args, **kwargs):
     return "fallback"
 for options in ({"renormalize": False}, {"packed_out": torch.empty(1, device=device)}, {"routed_scaling_factor": 2.0}):
-    assert route_top10(original_router, scores, None, 10, scoring_func="softmax", **options) == "fallback"
+    from sglang.srt.environ import envs
+    from sglang_v100_lite.dispatch import V100FallbackError
+
+    if envs.SGLANG_DEBUG_V100_STRICT_DISPATCH.get():
+        try:
+            route_top10(original_router, scores, None, 10, scoring_func="softmax", **options)
+        except V100FallbackError:
+            pass
+        else:
+            raise AssertionError("Unsupported router options must fail in strict mode")
+    else:
+        assert route_top10(original_router, scores, None, 10, scoring_func="softmax", **options) == "fallback"
 
 # Qwen TP4 MoE shape. A synthetic checkpoint and a dequantized Torch reference
 # test packing, the unusual S0E5M3 scale layout, gating, and weighted summation.

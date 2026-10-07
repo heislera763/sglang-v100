@@ -124,19 +124,23 @@ def dense_marlin_gemm(
     )
 
 
-def _dense_repack(weight):
+def _dense_repack(weight, num_bits=4):
     directory = Path(os.environ["SGLANG_V100_MARLIN_DIR"])
     libraries = list(directory.glob("_C*.so"))
     if not libraries:
         raise RuntimeError("Build the SM70 dense Marlin extension before loading NVFP4")
     torch.ops.load_library(str(libraries[0]))
     e, n, packed_k = weight.shape
-    k = packed_k * 2
+    k = packed_k * (8 // num_bits)
     inputs = weight.contiguous().view(torch.int32).transpose(1, 2).contiguous()
     perm = torch.empty(0, device=weight.device, dtype=torch.int32)
-    result = torch.empty((e, k // 16, n * 2), device=weight.device, dtype=torch.int32)
+    result = torch.empty(
+        (e, k // 16, n * (num_bits // 2)), device=weight.device, dtype=torch.int32
+    )
     for i in range(e):
-        result[i] = torch.ops._C.gptq_marlin_repack(inputs[i], perm, k, n, 4, False)
+        result[i] = torch.ops._C.gptq_marlin_repack(
+            inputs[i], perm, k, n, num_bits, False
+        )
     return result
 
 
@@ -196,6 +200,14 @@ def moe_runner(original, cls, dispatch_name, runner_name):
     def run(dispatch, quant, config):
         h = dispatch.hidden_states
         topk = dispatch.topk_output
+        if (
+            h.dtype == torch.float16
+            and quant.weight_bits == 8
+            and getattr(quant.w13_scales, "_sm70_fp8_scale", False)
+            and getattr(quant.w2_scales, "_sm70_fp8_scale", False)
+        ):
+            # Explicit SM70 W8A16 Marlin backend, including mapped EP rows.
+            return fn(dispatch, quant, config)
         supported = (
             h.dtype == torch.float16
             and h.ndim == 2
