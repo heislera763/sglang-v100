@@ -45,12 +45,15 @@ These alternatives have their own numerical/performance behavior.
 
 ## Preliminary performance
 
-Maintainer measurements on eight 32 GB V100 SXM2s, **2026-10-06**. Numbers below
+Maintainer measurements on eight 32 GB V100 SXM2s, **2026-10-06–07**. Numbers below
 are generation tokens/s on real chat prompts, using the pinned
 [llama.cpp SPEED-Bench HTTP client](https://github.com/ggml-org/llama.cpp/blob/abeada335e2e78bd3fe63febafab7e900ce75810/tools/server/bench/speed-bench/README.md)
 and [NVIDIA SPEED-Bench dataset](https://huggingface.co/datasets/nvidia/SPEED-Bench).
 These links identify the workload and methodology; the GPU results are this
 fork's measurements, not NVIDIA or the model labs' published performance.
+The host's disabled fan controller was corrected on October 7. Only the GLM
+four-step TP8/PP2 columns have been repeated since that correction; other
+figures remain historical, with draft-depth rankings requiring confirmation.
 
 ### Qwen3.8-Flash-Next NVFP4, TP4
 
@@ -71,20 +74,23 @@ and is not a same-revision control for this table.
 
 ### GLM-5.3-Flash NVFP4, TP8
 
-| Category | No MTP | 2 steps | 3 steps | 4 steps | 5 steps, repeated |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Coding | 39.8 | 40.1 | 32.6 | 45.7 | 38.0 |
-| QA | 39.8 | 36.6 | 25.9 | 37.9 | 30.5 |
-| Writing | 39.9 | 36.5 | 25.0 | 43.9 | 28.2 |
-| Low-entropy code | 39.1 | 38.6 | 22.1 | 48.8 | 26.6 |
+Four steps was repeated after the cooling correction; other columns remain
+historical.
 
-Four is the best tested draft depth for this suite, although QA still trails
-ordinary decoding. Its early/late cycles stay at 80.93/80.77 ms. Three grows
-from 92.78 to 158.73 ms, and a fresh five-step control from 101.42 to 186.61 ms;
-the five-step slowdown was observed in two independent launches. Three accepts
-more drafts than four in every category yet runs slower. These runs preceded
-correction of a disabled fan controller on the benchmark host; the slower
-depths need matched repeats before attributing cycle growth to software.
+| Category | No MTP | 2 steps | 3 steps | 4 steps, retested | 5 steps, repeated |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Coding | 39.8 | 40.1 | 32.6 | 45.6 | 38.0 |
+| QA | 39.8 | 36.6 | 25.9 | 37.9 | 30.5 |
+| Writing | 39.9 | 36.5 | 25.0 | 43.8 | 28.2 |
+| Low-entropy code | 39.1 | 38.6 | 22.1 | 48.7 | 26.6 |
+
+The four-step rerun reproduces historical category speeds within 0.3%, with
+stable early/late cycles of 80.93/80.97 ms. All twelve messages and speculation
+counts match the older run. Four led the historical depth sweep, although QA
+trailed ordinary decoding. Historical three-step cycles grew from 92.78 to
+158.73 ms and a fresh five-step control from 101.42 to 186.61 ms; those slower
+depths need repeats under corrected cooling before establishing a ranking or
+attributing cycle growth to software.
 The conditional depth descent stopped when three regressed; GLM one-step has
 not been tested. These TP8 results do not establish the best PP2 draft depth.
 
@@ -115,8 +121,9 @@ mapping and workload no longer reproduce those stalls. Treat the older
 slowdowns as cooling-confounded, rather than inherent PP/MTP overhead. Four
 post-suite profiled requests per order show attention below 9.3 ms and no
 local kernel over 100 ms on any rank in the captured prefill windows.
-These PP rates still trail the historical TP8 four-step rates; a matched
-post-correction TP8 control is pending. Four is the only draft depth tested
+These PP rates trail the corrected-cooling TP8 four-step rates. On the same
+post-suite 1,002-token probe, TP8 prefill takes 1.67 s versus PP2's 1.19 s.
+Four is the only draft depth tested
 in this PP suite; concurrency and larger-context capacity remain unmeasured.
 
 ### Measurement definition and provenance
@@ -156,7 +163,7 @@ identical sampled sequences across speculative configurations.
 
 Qwen two/three-step source:
 [`ad9e6f8d`](https://github.com/heislera763/sglang-v100-plus/commit/ad9e6f8d326824a549317c196d5a8707e7b306ee).
-Qwen one-step and GLM TP8 rows:
+Qwen one-step and historical GLM TP8 rows:
 [`3eb3b844`](https://github.com/heislera763/sglang-v100-plus/commit/3eb3b84455e094f66c6d5738b8817e321e8c466f).
 The intervening patch declares GLM library projections and changes diagnostic
 text/tests/README; Qwen numerical kernels are unchanged. The PP baseline and
@@ -164,7 +171,9 @@ first MTP run use
 [`41807a4a`](https://github.com/heislera763/sglang-v100-plus/commit/41807a4a0a457c0d51d44ef0f4ab230a702e32b0),
 and the corrected-cooling PP runs use
 [`3b41bc32`](https://github.com/heislera763/sglang-v100-plus/commit/3b41bc3260e1a5a0f70435d5b689cbaebc4cec51).
-Both revisions change only the README from `3eb3b844`. Early/late controls accompany
+The corrected-cooling TP8 four-step run uses
+[`4b6a4140`](https://github.com/heislera763/sglang-v100-plus/commit/4b6a41405f385f535a0a2976e9c4f492491650ba).
+These later revisions change only the README from `3eb3b844`. Early/late controls accompany
 Qwen one-step, GLM two/three/four/repeated-five-step and both PP runs; they are
 excluded from category averages.
 
@@ -245,8 +254,9 @@ matched their non-MTP controls in that earlier check. These checks preceded
 strict dispatch and do not establish concurrency, larger-context capacity or
 TP8/TP4 output parity.
 
-The next performance task is a matched TP8 control after the cooling correction,
-then a PP draft-depth sweep using stable full-model timing.
+The next performance task is to recheck the historical TP8 three/five-step
+regressions under corrected cooling, then sweep PP draft depth using stable
+full-model timing.
 Retain the 24/21 split. Draft depth must be measured for PP, rather than
 inherited from TP8.
 The last quad also hosts the draft model and has limited memory headroom.
