@@ -51,48 +51,50 @@ are generation tokens/s on real chat prompts, using the pinned
 and [NVIDIA SPEED-Bench dataset](https://huggingface.co/datasets/nvidia/SPEED-Bench).
 These links identify the workload and methodology; the GPU results are this
 fork's measurements, not NVIDIA or the model labs' published performance.
-The host's disabled fan controller was corrected on October 7. Only the GLM
-four-step TP8/PP2 columns have been repeated since that correction; other
-figures remain historical, with draft-depth rankings requiring confirmation.
+The host's disabled fan controller was corrected on October 7. All Qwen columns,
+GLM TP8 three/four/five-step and PP2 four-step columns were measured afterward.
+GLM no-MTP and two-step columns remain historical pending confirmation.
 
 ### Qwen3.8-Flash-Next NVFP4, TP4
 
-| Category | 1 draft step | 2 draft steps | 3 draft steps |
-| --- | ---: | ---: | ---: |
-| Coding | 87.6 | 109.1 | 98.6 |
-| QA | 92.8 | 107.9 | 93.2 |
-| Writing | 91.1 | 106.4 | 102.8 |
-| Low-entropy code | 88.3 | 101.4 | 107.3 |
+| Category | No MTP | 1 draft step | 2 draft steps | 3 draft steps |
+| --- | ---: | ---: | ---: | ---: |
+| Coding | 71.0 | 88.8 | 105.3 | 102.3 |
+| QA | 71.3 | 93.9 | 103.5 | 107.7 |
+| Writing | 71.0 | 91.0 | 104.9 | 99.2 |
+| Low-entropy code | 70.8 | 88.2 | 99.1 | 101.8 |
 
-Two steps leads these qualitative samples; three leads low-entropy code.
-One-step acceptance is 72–82%, but produces fewer tokens per verification.
-Its early/late control cycles stay at 19.51/19.58 ms. The old two-step collapse
-(7.9–15.8 tokens/s) was missing three-row HC/small-GEMM coverage: verification
-fell onto a slow generic route. Native one-through-four-row coverage removes
-that gap. A prior no-MTP run was about 71 tokens/s; it predates strict dispatch
-and is not a same-revision control for this table.
+Two steps leads coding/writing; three leads QA/low-entropy code in this small
+pass. Two-step gains over the fresh no-MTP baseline are 40–48%; one step gives
+25–32% despite 72–82% acceptance. Early/late cycle times stay at 19.20/19.28 ms
+for one step, 22.09/22.11 for two and 25.16/25.11 for three. No-MTP controls
+stay at 71.20/71.06 tokens/s. Sampled outputs and acceptance differ from earlier
+runs, so the changed category rates do not establish a cooling effect or
+universal depth ranking. The old two-step collapse (7.9–15.8 tokens/s) was
+missing three-row HC/small-GEMM coverage; native one-through-four-row coverage
+removes that gap.
 
 ### GLM-5.3-Flash NVFP4, TP8
 
-Four steps was repeated after the cooling correction; other columns remain
-historical.
+Three/four/five steps were repeated after the cooling correction; no-MTP and
+two-step columns remain historical.
 
-| Category | No MTP | 2 steps | 3 steps | 4 steps, retested | 5 steps, repeated |
+| Category | No MTP | 2 steps | 3 steps | 4 steps | 5 steps |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Coding | 39.8 | 40.1 | 32.6 | 45.6 | 38.0 |
-| QA | 39.8 | 36.6 | 25.9 | 37.9 | 30.5 |
-| Writing | 39.9 | 36.5 | 25.0 | 43.8 | 28.2 |
-| Low-entropy code | 39.1 | 38.6 | 22.1 | 48.7 | 26.6 |
+| Coding | 39.8 | 40.1 | 44.2 | 45.6 | 38.7 |
+| QA | 39.8 | 36.6 | 39.2 | 37.9 | 35.5 |
+| Writing | 39.9 | 36.5 | 44.7 | 43.8 | 36.5 |
+| Low-entropy code | 39.1 | 38.6 | 45.1 | 48.7 | 42.0 |
 
-The four-step rerun reproduces historical category speeds within 0.3%, with
-stable early/late cycles of 80.93/80.97 ms. All twelve messages and speculation
-counts match the older run. Four led the historical depth sweep, although QA
-trailed ordinary decoding. Historical three-step cycles grew from 92.78 to
-158.73 ms and a fresh five-step control from 101.42 to 186.61 ms; those slower
-depths need repeats under corrected cooling before establishing a ranking or
-attributing cycle growth to software.
-The conditional depth descent stopped when three regressed; GLM one-step has
-not been tested. These TP8 results do not establish the best PP2 draft depth.
+The old three/five-step slowdown disappears under corrected cooling. Early/late
+cycles stay at 72.85/72.89 ms for three steps, 80.93/80.97 for four and
+101.29/101.33 for five. Three-step category speeds recover by 36–104%; five-step
+speeds by 2–58%; four remains within 0.3% of the old run. Each depth reproduces
+all twelve historical messages and speculation counts. Four leads coding and
+low-entropy code; three is slightly ahead on QA/writing; five trails both in
+every category. Small single-pass differences do not establish universal
+rankings. GLM one-step has not been tested, and these TP8 results do not
+establish the best PP2 draft depth.
 
 ### GLM-5.3-Flash NVFP4, TP4×PP2
 
@@ -161,21 +163,18 @@ T=1/top-p=0.95/unrestricted top-k. Both use min-p=0, additive penalties=0,
 repetition penalty=1 and request/server seed 531. A request seed does not force
 identical sampled sequences across speculative configurations.
 
-Qwen two/three-step source:
-[`ad9e6f8d`](https://github.com/heislera763/sglang-v100-plus/commit/ad9e6f8d326824a549317c196d5a8707e7b306ee).
-Qwen one-step and historical GLM TP8 rows:
+Historical GLM TP8 no-MTP/two-step source:
 [`3eb3b844`](https://github.com/heislera763/sglang-v100-plus/commit/3eb3b84455e094f66c6d5738b8817e321e8c466f).
-The intervening patch declares GLM library projections and changes diagnostic
-text/tests/README; Qwen numerical kernels are unchanged. The PP baseline and
-first MTP run use
+The historical PP no-MTP baseline uses
 [`41807a4a`](https://github.com/heislera763/sglang-v100-plus/commit/41807a4a0a457c0d51d44ef0f4ab230a702e32b0),
 and the corrected-cooling PP runs use
 [`3b41bc32`](https://github.com/heislera763/sglang-v100-plus/commit/3b41bc3260e1a5a0f70435d5b689cbaebc4cec51).
 The corrected-cooling TP8 four-step run uses
 [`4b6a4140`](https://github.com/heislera763/sglang-v100-plus/commit/4b6a41405f385f535a0a2976e9c4f492491650ba).
-These later revisions change only the README from `3eb3b844`. Early/late controls accompany
-Qwen one-step, GLM two/three/four/repeated-five-step and both PP runs; they are
-excluded from category averages.
+Qwen no-MTP/one/two/three-step and GLM TP8 three/five-step repeats use
+[`0cfeda26`](https://github.com/heislera763/sglang-v100-plus/commit/0cfeda26e47b43ab06f0cc050c6c5f83a475e32e).
+These later revisions change only the README from `3eb3b844`. All fresh profiles
+include excluded same-prompt early/late controls.
 
 <details>
 <summary>Pinned workload selection</summary>
@@ -254,9 +253,8 @@ matched their non-MTP controls in that earlier check. These checks preceded
 strict dispatch and do not establish concurrency, larger-context capacity or
 TP8/TP4 output parity.
 
-The next performance task is to recheck the historical TP8 three/five-step
-regressions under corrected cooling, then sweep PP draft depth using stable
-full-model timing.
+The next performance task is to complete the matched GLM no-MTP/two-step
+controls, then sweep PP draft depth using stable full-model timing.
 Retain the 24/21 split. Draft depth must be measured for PP, rather than
 inherited from TP8.
 The last quad also hosts the draft model and has limited memory headroom.
@@ -310,8 +308,8 @@ unset SGLANG_PP_LAYER_PARTITION SGLANG_ENABLE_PP_SPEC
 ### Qwen thinking + MTP, TP4
 
 Choose one NVLink quad; `4,5,6,7` is the measured machine's quad. This example
-uses the two-step qualitative profile; use three steps/four verification
-positions for the measured low-entropy code alternative.
+uses the two-step coding/writing profile; three steps/four verification
+positions is the measured QA/low-entropy alternative in this small suite.
 
 ```bash
 export CUDA_VISIBLE_DEVICES=4,5,6,7
