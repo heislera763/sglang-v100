@@ -95,6 +95,45 @@ def fp8_marlin_scalar_type(original, num_bits, has_zp, scales=None, global_scale
 
 def apply_fp8_moe(original, method, layer, dispatch_output):
     from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+    from sglang.srt.layers.moe.topk import TopKOutputChecker
+    from sglang.srt.runtime_context import get_parallel, get_schedule, get_spec
+
+    config = method.moe_runner_config
+    hidden = dispatch_output.hidden_states
+    topk = dispatch_output.topk_output
+    if (
+        get_schedule().disable_overlap_schedule
+        and get_parallel().tp_size == 4
+        and get_parallel().pp_size == 2
+        and get_spec().speculative_algorithm is None
+        and hidden.shape == (1, 2560)
+        and hidden.dtype == torch.float16
+        and TopKOutputChecker.format_is_standard(topk)
+        and topk.topk_ids.shape == (1, 10)
+        and layer.w13_weight.shape[1:] == (160, 5120)
+        and layer.w2_weight.shape[1:] == (40, 10240)
+        and config.is_gated
+        and config.activation == "silu"
+        and not config.apply_router_weight_on_input
+        and config.routed_scaling_factor is None
+        and config.gemm1_alpha is None
+        and config.gemm1_clamp_limit is None
+        and config.swiglu_limit is None
+    ):
+        from .kernels.sm70_fp8_moe_decode import fp8_moe_decode
+
+        return StandardCombineInput(
+            hidden_states=fp8_moe_decode(
+                hidden,
+                layer.w13_weight,
+                layer.w2_weight,
+                layer.w13_weight_scale_inv,
+                layer.w2_weight_scale_inv,
+                topk.topk_ids,
+                topk.topk_weights,
+            )
+        )
 
     mapping = layer.dispatcher.local_expert_mapping
     quant = MarlinMoeQuantInfo(

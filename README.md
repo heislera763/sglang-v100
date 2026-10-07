@@ -78,7 +78,9 @@ weights use Marlin. GPU order is `4,5,6,7` for Qwen and
 `1,0,2,3,4,5,6,7` for both GLM layouts.
 
 Sampling is T=1/top-p=0.95, min-p=0, additive penalties=0, repetition penalty=1
-and request/server seed 531. Qwen uses thinking/xhigh and top-k=20; GLM uses
+and request/server seed 531. Deterministic mode is off: the PyTorch sampler
+uses its ordinary RNG, and the request-specific seed is inactive in this mode.
+Qwen uses thinking/xhigh and top-k=20; GLM uses
 max effort/clear thinking and unrestricted top-k. MTP uses branch width one
 and classical rejection sampling. A seed does not force identical sampled
 sequences across speculative configurations.
@@ -154,13 +156,33 @@ whole experts instead. Native QSA covers three heads for TP8 and six for TP4.
 | --- | --- | ---: | ---: |
 | TP8 + EP8 | Off | 3,249 | 36.1 |
 | TP8 + EP8 | Two steps | 3,112 | 59.6 |
-| TP4 × PP2 + EP4 | Off | 5,832 | 38.8 |
+| TP4 × PP2 + EP4 | Off | 5,847 | 46.4 |
 | TP4 × PP2 + EP4 | Two steps | 5,620 | 46.4 |
 
 PP2 improves prefill by about 80% with either decoding mode. TP8 remains faster
 for generation with MTP: 59.6 versus 46.4 tokens/s. Two-step MTP improves
-generation by 65% on TP8 and 20% on PP2, with respectively 61% and 58% accepted
-draft tokens (excluding bonus tokens), and about 4% lower prefill throughput.
+generation by 65% on TP8, with 61% accepted draft tokens (excluding bonus
+tokens). PP2's earlier MTP measurement had 58% acceptance; it now roughly
+matches the optimized ordinary-decoding rate. The other three rows predate
+the ordinary PP2 decode optimization and retain their existing execution paths.
+
+Ordinary TP4 × PP2 now uses a native four-kernel vector expert path for one
+token, retaining E4M3 weights, FP16 dequantization/activation boundaries and
+FP32 partial sums. It avoids padding a single token into a generic GEMM and
+combines activation and route reduction work. Nine fresh requests confirmed
+**19.6% faster generation**, up from 38.8 tokens/s, with unchanged prefill
+throughput; the new run used excluded 64-token warmups. Numerical checks cover
+independent dequantized-weight references and live ten-route graph masking.
+
+Two independent one-request microbatches also work: two measured pairs gave
+**76.2 aggregate generation tokens/s**, with **38–42 tokens/s per request**.
+Nsight Systems confirms simultaneous stage execution during generation;
+one ordinary request executes the stages in sequence. This small concurrency
+check uses the same near-8K inputs and 512-token outputs. Set
+`--max-running-requests 2 --pp-max-micro-batch-size 1 --prefill-max-requests 1`
+and `--max-total-tokens 24576`; retain the 12288 per-request context limit,
+2048 prefill chunks and batch-one decode graphs. Broader concurrency remains
+unmeasured.
 
 These use the same near-8K inputs, sampled thinking settings and measurement
 protocol above: nine measured requests per placement/mode, all producing 512

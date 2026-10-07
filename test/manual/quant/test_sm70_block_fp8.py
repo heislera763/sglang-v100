@@ -210,6 +210,93 @@ class TestSM70BlockFP8(CustomTestCase):
                         torch.testing.assert_close(
                             actual, expected.half(), rtol=0.005, atol=0.003
                         )
+                        if rows == 1:
+                            from sglang_v100_lite.kernels.sm70_fp8_moe_decode import (
+                                fp8_moe_decode,
+                            )
+
+                            vector = fp8_moe_decode(
+                                x,
+                                layer.w13_weight,
+                                layer.w2_weight,
+                                layer.w13_weight_scale_inv,
+                                layer.w2_weight_scale_inv,
+                                ids,
+                                weights,
+                            )
+                            torch.testing.assert_close(
+                                vector, expected.half(), rtol=0.005, atol=0.003
+                            )
+                            vector_graph = torch.cuda.CUDAGraph()
+                            with torch.cuda.graph(vector_graph):
+                                replay = fp8_moe_decode(
+                                    x,
+                                    layer.w13_weight,
+                                    layer.w2_weight,
+                                    layer.w13_weight_scale_inv,
+                                    layer.w2_weight_scale_inv,
+                                    ids,
+                                    weights,
+                                )
+                            vector_graph.replay()
+                            torch.testing.assert_close(
+                                replay, expected.half(), rtol=0.005, atol=0.003
+                            )
+                            # Real EP decode retains ten global route slots.
+                            # Masked slots may contain stale scratch from the
+                            # preceding layer or graph replay and must vanish.
+                            ten_ids = torch.full(
+                                (1, 10), -1, device="cuda", dtype=torch.int32
+                            )
+                            ten_ids[0, [0, 3, 6, 9]] = torch.arange(
+                                e, device="cuda", dtype=torch.int32
+                            )
+                            ten_weights = torch.rand(
+                                (1, 10), device="cuda", dtype=torch.float32
+                            )
+                            ten_expected = torch.zeros_like(x, dtype=torch.float32)
+                            for route, expert in zip((0, 3, 6, 9), range(e)):
+                                gu = F.linear(x, reference["w13"][expert])
+                                gate, up = gu.float().chunk(2, dim=-1)
+                                act = (F.silu(gate) * up).half()
+                                down = F.linear(act, reference["w2"][expert])
+                                ten_expected += (
+                                    (down.float() * ten_weights[0, route])
+                                    .half()
+                                    .float()
+                                )
+                            ten_actual = fp8_moe_decode(
+                                x,
+                                layer.w13_weight,
+                                layer.w2_weight,
+                                layer.w13_weight_scale_inv,
+                                layer.w2_weight_scale_inv,
+                                ten_ids,
+                                ten_weights,
+                            )
+                            torch.testing.assert_close(
+                                ten_actual, ten_expected.half(), rtol=0.005, atol=0.003
+                            )
+                            live_graph = torch.cuda.CUDAGraph()
+                            with torch.cuda.graph(live_graph):
+                                live_out = fp8_moe_decode(
+                                    x,
+                                    layer.w13_weight,
+                                    layer.w2_weight,
+                                    layer.w13_weight_scale_inv,
+                                    layer.w2_weight_scale_inv,
+                                    ten_ids,
+                                    ten_weights,
+                                )
+                            saved_ids = ten_ids.clone()
+                            ten_ids.fill_(-1)
+                            live_graph.replay()
+                            self.assertEqual(int(torch.count_nonzero(live_out)), 0)
+                            ten_ids.copy_(saved_ids)
+                            live_graph.replay()
+                            torch.testing.assert_close(
+                                live_out, ten_expected.half(), rtol=0.005, atol=0.003
+                            )
                         if masked:
                             self.assertEqual(int(torch.count_nonzero(actual[0])), 0)
                         if rows == 3 and masked:
