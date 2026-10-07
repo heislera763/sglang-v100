@@ -91,23 +91,34 @@ not been tested. These TP8 results do not establish the best PP2 draft depth.
 
 Matched sampled SPEED-Bench runs, 24/21 layers, strict dispatch enabled:
 
-| Category | No MTP | 4 steps | TG gain | Draft acceptance |
+| Category | No MTP | 4 steps, first | 4 steps, repeated | Draft acceptance |
 | --- | ---: | ---: | ---: | ---: |
-| Coding | 24.9 | 36.7 | 47% | 69% |
-| QA | 24.9 | 31.3 | 26% | 58% |
-| Writing | 24.9 | 29.3 | 18% | 58% |
-| Low-entropy code | 24.8 | 30.9 | 24% | 70% |
+| Coding | 24.9 | 36.7 | 36.8 | 69% |
+| QA | 24.9 | 31.3 | 32.3 | 58% |
+| Writing | 24.9 | 29.3 | 32.6 | 58% |
+| Low-entropy code | 24.8 | 30.9 | 36.5 | 70% |
 
 MTP helps every category, but these PP rates trail the recent TP8 four-step
 rates. On the excluded same-prompt early/late controls, non-MTP stays at
 24.91/24.93 tokens/s. MTP falls from 34.61 to 28.17 tokens/s as its mean
 verification cycle grows from 102.54 to 133.39 ms, despite acceptance rising
-from 64% to 69%. This run establishes cycle growth under fixed prompt/settings,
-not its cause or repeatability. The six approximately 1K-token code prompts
-have median server first-token latency 1.03 s without MTP and 2.10 s with it;
-this includes more than pure prefill execution. No requests failed, and strict
+from 64% to 69%. The exact suite replay grows from 102.29 to 115.85 ms; all
+twelve generated messages and speculation counts match the first run despite
+different timings. The six approximately 1K-token code prompts have median
+server first-token latency 1.03 s without MTP and 2.10 s with it in the first
+run; this includes more than pure prefill execution.
+
+Focused warmed repeats of one coherent 1,002-token prompt instead measure
+1.03 s without MTP and 1.20 s with it, about 16–17% prompt-processing overhead.
+The MTP timing stays near 1.20 s after eight 512-token generations and after
+crossing 2K context. The original doubled prefill time is history-dependent,
+not an established inherent MTP cost. A post-suite trace localizes stalls to
+PP0 TP2 (GPU `05:00.0` on this host): the same attention kernel's recorded
+duration reaches 104 ms versus about 9 ms fresh, while peers wait in their
+collectives. The reason that rank stalls is unresolved; the trace does not
+establish a PCIe, thermal or kernel-code fault. No requests failed, and strict
 dispatch found no uncovered route. Four is the only draft depth tested in this
-current PP suite; concurrency and larger contexts remain unmeasured.
+current PP suite; concurrency and larger-context capacity remain unmeasured.
 
 ### Measurement definition and provenance
 
@@ -149,9 +160,12 @@ Qwen two/three-step source:
 Qwen one-step and GLM TP8 rows:
 [`3eb3b844`](https://github.com/heislera763/sglang-v100-plus/commit/3eb3b84455e094f66c6d5738b8817e321e8c466f).
 The intervening patch declares GLM library projections and changes diagnostic
-text/tests/README; Qwen numerical kernels are unchanged. Both PP profiles use
+text/tests/README; Qwen numerical kernels are unchanged. The PP baseline and
+first MTP run use
 [`41807a4a`](https://github.com/heislera763/sglang-v100-plus/commit/41807a4a0a457c0d51d44ef0f4ab230a702e32b0),
-which changes only the README from `3eb3b844`. Early/late controls accompany
+and the PP replay/focused repeats use
+[`00c5a57c`](https://github.com/heislera763/sglang-v100-plus/commit/00c5a57c8ae29e98c551712f0e97a9751144387e).
+Both revisions change only the README from `3eb3b844`. Early/late controls accompany
 Qwen one-step, GLM two/three/four/repeated-five-step and both PP runs; they are
 excluded from category averages.
 
@@ -232,8 +246,8 @@ matched their non-MTP controls in that earlier check. These checks preceded
 strict dispatch and do not establish concurrency, larger-context capacity or
 TP8/TP4 output parity.
 
-The next performance task is to attribute **PP MTP cycle growth** to target
-verification, draft execution or relay/scheduling costs before further tuning.
+The next performance task is to explain **PP0 TP2 local-kernel stalls** in
+mixed-workload runs before further tuning.
 Retain the 24/21 split. Draft depth must be measured for PP, rather than
 inherited from TP8.
 The last quad also hosts the draft model and has limited memory headroom.
