@@ -132,8 +132,9 @@ For FP8 PP2 MTP, keep HC/metadata flags and 4096-token chunks, set
 The metadata flag also enables the tested first-stage commit graph, with live
 request/acceptance buffers refreshed each round; tracking and broader batching
 keep eager commits. Both TP4 groups use their quad's NVLink peers and CPU socket.
-The current sampled profile improves generation roughly11% over ordinary
-decode; prefill remains slower because the draft also processes the prompt.
+Two-step MTP improves sampled generation in these measurements; prefill remains
+slower because the draft also processes the prompt. Ordinary/MTP table rows
+from different revisions are not a controlled speedup comparison.
 The JSON language-only override skips vision loading; Qwen's CLI `--language-only`
 selects a separate encoder workflow.
 
