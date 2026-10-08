@@ -5,6 +5,28 @@ retains that same result/event until its existing postprocessing turn.
 """
 
 from collections import deque
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class _TensorRef:
+    index: int
+
+
+def _map_tensors(value, visit):
+    """Keep Python container structure while replacing tensor leaves."""
+    import torch
+
+    if isinstance(value, (torch.Tensor, _TensorRef)):
+        return visit(value)
+    if isinstance(value, dict):
+        return {key: _map_tensors(item, visit) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_map_tensors(item, visit) for item in value]
+    if isinstance(value, tuple):
+        items = [_map_tensors(item, visit) for item in value]
+        return type(value)(*items) if hasattr(value, "_fields") else tuple(items)
+    return value
 
 
 def initialize_local_output(original, scheduler):
@@ -22,8 +44,9 @@ def initialize_local_output(original, scheduler):
     spec = get_spec()
     local_spec = (
         spec.speculative_algorithm == "EAGLE"
-        and get_model().quantization == "fp8"
-        and parallel.tp_size == parallel.ep_size == 4
+        and parallel.tp_size == 4
+        and (get_model().quantization, parallel.ep_size)
+        in (("fp8", 4), ("modelopt_fp4", 1))
         and spec.speculative_eagle_topk == 1
         and spec.speculative_num_steps in (1, 2, 3)
         and spec.speculative_num_draft_tokens == spec.speculative_num_steps + 1
@@ -70,6 +93,12 @@ def receive_output(original, scheduler):
     if not scheduler.pp_group.is_last_rank:
         tensors, event = original(scheduler)
         if "__v100_pp_output_layout__" in tensors:
+            if event is not None:
+                import torch
+
+                # CPU leaves are restored with a device-to-host copy below.
+                # Wait before issuing that copy, not only in later processing.
+                torch.cuda.current_stream().wait_event(event)
             tensors = unpack_output(tensors)
         return tensors, event
     event, proxy = local.popleft()
@@ -93,25 +122,23 @@ def send_output_dict(
         and not scheduler.spec_algorithm.is_none()
         and scheduler.pp_group.is_last_rank
         and msg_type == "output"
-        and "spec_next_draft_probs" in tensor_dict
     ):
         # Only the last stage samples/accepts; stage zero needs the tree and
         # commit metadata, not its full-vocabulary proposal probabilities.
         # Keep exact q in the retained result. Copy the dictionary so omitting
         # it from the wire cannot remove it from the last stage's next verify.
         tensor_dict = tensor_dict.copy()
-        del tensor_dict["spec_next_draft_probs"]
+        tensor_dict.pop("spec_next_draft_probs", None)
         import torch
 
-        cuda_payload = any(
-            value.is_cuda
-            for value in tensor_dict.values()
-            if isinstance(value, torch.Tensor)
-        )
+        leaves = []
+        _map_tensors(tensor_dict, lambda value: leaves.append(value))
+        cuda_payload = any(value.is_cuda for value in leaves)
         if cuda_payload and ready_event is not None:
             torch.cuda.current_stream().wait_event(ready_event)
         tensor_dict = pack_output(tensor_dict)
-        if tensor_dict["__v100_pp_output_payload__"].is_cuda:
+        payload = tensor_dict.get("__v100_pp_output_payload__")
+        if payload is not None and payload.is_cuda:
             ready_event = torch.cuda.Event()
             ready_event.record()
     return original(
@@ -124,25 +151,30 @@ def send_output_dict(
 
 
 def pack_output(tensors):
-    """One byte payload; align every typed view without changing its bits."""
+    """One aligned byte payload; never pickle nested CUDA storage as metadata.
+
+    The ordinary tensor-dict transport extracts only top-level tensors. Nested
+    logprob lists would otherwise unpickle on the sender's CUDA ordinal. Store
+    device *types* so GPU leaves land on the receiver's own device instead.
+    """
     import torch
 
-    values = [
-        (key, value)
-        for key, value in tensors.items()
-        if isinstance(value, torch.Tensor)
-    ]
-    device = values[0][1].device
+    values = []
+
+    def remember(value):
+        values.append(value)
+        return _TensorRef(len(values) - 1)
+
+    template = _map_tensors(tensors, remember)
+    if not values:
+        return tensors.copy()
+    cuda_values = [value for value in values if value.is_cuda]
+    device = (cuda_values or values)[0].device
     padding = torch.zeros(8, dtype=torch.uint8, device=device)
     chunks, layout = [], []
     offset = 0
-    result = {
-        key: value
-        for key, value in tensors.items()
-        if not isinstance(value, torch.Tensor)
-    }
-    for key, value in values:
-        if value.device != device or value.element_size() > 8:
+    for value in values:
+        if (value.is_cuda and value.device != device) or value.element_size() > 8:
             raise ValueError(
                 "PP output packing requires colocated tensors with <=8-byte elements"
             )
@@ -150,25 +182,36 @@ def pack_output(tensors):
         if pad:
             chunks.append(padding[:pad])
             offset += pad
-        data = value.contiguous().reshape(-1).view(torch.uint8)
-        layout.append((key, value.shape, value.dtype, offset, data.numel()))
+        data = (
+            value.to(device, non_blocking=True)
+            .contiguous()
+            .reshape(-1)
+            .view(torch.uint8)
+        )
+        layout.append(
+            (value.shape, value.dtype, offset, data.numel(), value.device.type)
+        )
         chunks.append(data)
         offset += data.numel()
     pad = (-offset) % 8
     if pad:
         chunks.append(padding[:pad])
-    result["__v100_pp_output_layout__"] = layout
-    result["__v100_pp_output_payload__"] = torch.cat(chunks)
-    return result
+    return {
+        "__v100_pp_output_template__": template,
+        "__v100_pp_output_layout__": layout,
+        "__v100_pp_output_payload__": torch.cat(chunks),
+    }
 
 
 def unpack_output(tensors):
-    result = tensors.copy()
-    layout = result.pop("__v100_pp_output_layout__")
-    payload = result.pop("__v100_pp_output_payload__")
-    for key, shape, dtype, offset, size in layout:
-        result[key] = payload[offset : offset + size].view(dtype).reshape(shape)
-    return result
+    payload = tensors["__v100_pp_output_payload__"]
+    values = []
+    for shape, dtype, offset, size, device_type in tensors["__v100_pp_output_layout__"]:
+        value = payload[offset : offset + size].view(dtype).reshape(shape)
+        values.append(value.cpu() if device_type == "cpu" else value)
+    return _map_tensors(
+        tensors["__v100_pp_output_template__"], lambda ref: values[ref.index]
+    )
 
 
 def set_local_relay(original, scheduler, batch, relayed):

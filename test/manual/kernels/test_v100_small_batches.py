@@ -24,10 +24,50 @@ with patch.object(
     "Requires a V100",
 )
 class TestV100SmallBatches(CustomTestCase):
+    def test_pp_commit_graph_refreshes_request_acceptance_and_source_state(self):
+        """New request slots/acceptance addresses must not replay the first inputs."""
+        from sglang_v100_plus.commit_graph import CommitGraph
+
+        destination = torch.zeros(4, 8, device="cuda")
+        source = torch.arange(3 * 8, device="cuda", dtype=torch.float32).reshape(3, 8)
+        expected = torch.zeros(4, 8)
+
+        def original(worker, batch, accept_lens, accept_index, draft_tokens):
+            steps = accept_index.gather(1, (accept_lens - 1).reshape(-1, 1)).flatten()
+            destination.index_copy_(
+                0, batch.req_pool_indices, source.index_select(0, steps)
+            )
+
+        state = None
+        with torch.inference_mode():
+            for iteration in range(9):
+                slot, count = iteration % 4, iteration % 3 + 1
+                # Every turn uses new GPU tensors, while the graph must also
+                # read the current contents of the persistent source pool.
+                batch = SimpleNamespace(
+                    req_pool_indices=torch.tensor([slot], device="cuda")
+                )
+                accept = torch.tensor([count], device="cuda")
+                indices = torch.tensor([[2, 0, 1]], device="cuda")
+                source.copy_(
+                    torch.arange(24, device="cuda").reshape(3, 8) + iteration * 100
+                )
+                if state is None:
+                    state = CommitGraph(original, None, batch, accept, indices, 3)
+                state.run(batch, accept, indices)
+                step = [2, 0, 1][count - 1]
+                expected[slot] = torch.arange(8) + step * 8 + iteration * 100
+                torch.testing.assert_close(destination.cpu(), expected, rtol=0, atol=0)
+        self.assertIsNotNone(state.graph)
+
     def test_pp_output_pack_preserves_bits_and_cross_stream_readiness(self):
         from collections import deque
 
-        from sglang_v100_plus.pipeline import send_output_dict, unpack_output
+        from sglang_v100_plus.pipeline import (
+            receive_output,
+            send_output_dict,
+            unpack_output,
+        )
 
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -48,12 +88,21 @@ class TestV100SmallBatches(CustomTestCase):
             "scalar": torch.tensor(7, device="cuda", dtype=torch.int64),
             "spec_next_draft_probs": torch.ones(1, 2, 3, device="cuda"),
             "__msg_type__": "output",
+            "nested_logprobs": {
+                "values": [torch.tensor([-0.0, -0.125], device="cuda")],
+                "indices": (torch.tensor([7, 13], device="cuda"), None),
+                "cpu": torch.empty(2, dtype=torch.int64, pin_memory=True),
+            },
         }
         producer, sender = torch.cuda.Stream(), torch.cuda.Stream()
         producer.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(producer):
             torch.cuda._sleep(200000)
             tensors["hidden_states"].add_(16)
+            tensors["nested_logprobs"]["values"][0].add_(0.5)
+            tensors["nested_logprobs"]["cpu"].copy_(
+                tensors["nested_logprobs"]["indices"][0], non_blocking=True
+            )
             ready = torch.cuda.Event()
             ready.record()
         sent = []
@@ -71,20 +120,65 @@ class TestV100SmallBatches(CustomTestCase):
         self.assertNotIn("spec_next_draft_probs", actual)
         self.assertIn("spec_next_draft_probs", tensors)
         self.assertEqual(payload["__v100_pp_output_payload__"].numel() % 8, 0)
-        for key, expected in tensors.items():
-            if key == "spec_next_draft_probs":
-                continue
+
+        def compare(actual_value, expected):
             if isinstance(expected, torch.Tensor):
-                self.assertEqual(actual[key].shape, expected.shape)
-                self.assertEqual(actual[key].dtype, expected.dtype)
+                self.assertEqual(actual_value.shape, expected.shape)
+                self.assertEqual(actual_value.dtype, expected.dtype)
+                self.assertEqual(actual_value.device.type, expected.device.type)
                 self.assertTrue(
                     torch.equal(
-                        actual[key].contiguous().reshape(-1).view(torch.uint8),
+                        actual_value.contiguous().reshape(-1).view(torch.uint8),
                         expected.contiguous().reshape(-1).view(torch.uint8),
                     )
                 )
+            elif isinstance(expected, dict):
+                for key in expected:
+                    compare(actual_value[key], expected[key])
+            elif isinstance(expected, (list, tuple)):
+                self.assertIsInstance(actual_value, type(expected))
+                for item, reference in zip(actual_value, expected):
+                    compare(item, reference)
             else:
-                self.assertEqual(actual[key], expected)
+                self.assertEqual(actual_value, expected)
+
+        for key, expected in tensors.items():
+            if key != "spec_next_draft_probs":
+                compare(actual[key], expected)
+
+        # Prefill has no proposal q, but nested GPU logprobs still must travel
+        # as tensor payloads. Restoring CPU leaves must wait for receive DMA.
+        prefill = {"nested_logprobs": tensors["nested_logprobs"]}
+        with torch.cuda.stream(sender):
+            send_output_dict(wire, owner, prefill, msg_type="output", ready_event=ready)
+        packed, sent_ready = sent[-1]
+        receiver = SimpleNamespace(
+            _v100_pp_local_outputs=deque(), pp_group=SimpleNamespace(is_last_rank=False)
+        )
+        copied = packed.copy()
+        with torch.cuda.stream(sender):
+            sender.wait_event(sent_ready)
+            torch.cuda._sleep(200000)
+            copied["__v100_pp_output_payload__"] = packed[
+                "__v100_pp_output_payload__"
+            ].clone()
+            received_ready = torch.cuda.Event()
+            received_ready.record()
+        restored, event = receive_output(lambda _: (copied, received_ready), receiver)
+        self.assertIs(event, received_ready)
+        compare(restored, prefill)
+        if torch.cuda.device_count() > 1:
+            copied["__v100_pp_output_payload__"] = copied[
+                "__v100_pp_output_payload__"
+            ].to("cuda:1")
+            restored = unpack_output(copied)
+            self.assertEqual(restored["nested_logprobs"]["values"][0].device.index, 1)
+            torch.testing.assert_close(
+                restored["nested_logprobs"]["values"][0].cpu(),
+                prefill["nested_logprobs"]["values"][0].cpu(),
+                rtol=0,
+                atol=0,
+            )
 
     def test_fp8_verify_topk_preserves_ties_mass_and_graph_inputs(self):
         """The faster renorm must retain cutoff ties and read each graph replay."""

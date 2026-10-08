@@ -24,6 +24,7 @@ def install():
     from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
+    from .commit_graph import commit_relayed_states
     from .dflash import (
         SM70DFlashGroupedConv,
         candidate_topk,
@@ -129,6 +130,11 @@ def install():
         (
             "sglang.srt.managers.scheduler_pp_mixin.SchedulerPPMixin._pp_spec_set_relay",
             set_local_relay,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.speculative.spec_utils.commit_mamba_states_after_verify",
+            commit_relayed_states,
             HookType.AROUND,
         ),
         (

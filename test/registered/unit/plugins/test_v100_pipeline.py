@@ -24,6 +24,7 @@ with patch.object(
 ):
     from sglang_v100_plus.pipeline import (
         initialize_local_output,
+        pack_output,
         receive_output,
         send_output,
         send_output_dict,
@@ -37,6 +38,199 @@ class TestV100Pipeline(CustomTestCase):
         return SimpleNamespace(
             pp_group=SimpleNamespace(is_last_rank=last), spec_algorithm=spec
         )
+
+    def test_decode_snapshot_can_commit_a_speculative_verify_graph(self):
+        """PP snapshots keep DECODE after forward isolation restores the scheduler batch."""
+        from sglang_v100_plus.commit_graph import commit_relayed_states
+
+        from sglang.srt.environ import envs
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        def tensor(shape):
+            return SimpleNamespace(
+                shape=torch.Size(shape),
+                dtype=torch.int64,
+                device=torch.device("cuda:0"),
+                is_cuda=True,
+            )
+
+        worker = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                req_to_token_pool=SimpleNamespace(mamba_pool=SimpleNamespace()),
+                attn_backend=object(),
+                model_config=SimpleNamespace(
+                    hf_config=SimpleNamespace(
+                        architectures=["Qwen4ExpForConditionalGeneration"]
+                    )
+                ),
+            )
+        )
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            req_pool_indices=tensor([1]),
+            mamba_track_indices=None,
+        )
+        accept, indices = tensor([1]), tensor([1, 3])
+        settings = dict(
+            model_path="dummy",
+            quantization="fp8",
+            tp_size=4,
+            ep_size=4,
+            pp_size=2,
+            max_running_requests=1,
+            disable_overlap_schedule=True,
+            speculative_algorithm="EAGLE",
+            speculative_num_steps=2,
+            speculative_eagle_topk=1,
+            speculative_num_draft_tokens=3,
+            speculative_use_rejection_sampling=True,
+        )
+        with (
+            get_context().override_server_args(**settings),
+            get_parallel().override(pp_rank=0),
+            envs.SGLANG_ENABLE_METADATA_GLUE_GRAPH.override(True),
+            envs.SGLANG_ENABLE_PP_SPEC.override(True),
+            patch("sglang_v100_plus.commit_graph.get_buffer", return_value={}),
+            patch("sglang_v100_plus.commit_graph.CommitGraph") as graph,
+        ):
+
+            def eager(*_args):
+                self.fail("A serialized PP verify commit was incorrectly kept eager")
+
+            commit_relayed_states(eager, worker, batch, accept, indices, 3)
+            graph.return_value.run.assert_called_once_with(batch, accept, indices)
+
+    def test_nested_logprobs_do_not_put_storage_in_pickle_metadata(self):
+        """Nested logprobs formerly bypassed extraction and restored on the sender GPU."""
+        import pickle
+
+        from sglang.srt.distributed.parallel_state import _split_tensor_dict
+
+        tensors = {
+            "ids": torch.tensor([7, 13]),
+            "logprobs": [
+                {
+                    "values": torch.tensor([-0.0, -0.125]),
+                    "indices": (torch.tensor([7, 13]), None),
+                }
+            ],
+            "empty": torch.empty(1, 0),
+            "scalar": torch.tensor(True),
+        }
+        packed = pack_output(tensors)
+        metadata, payloads = _split_tensor_dict(packed)
+
+        def contains_tensor(value):
+            if isinstance(value, torch.Tensor):
+                return True
+            if isinstance(value, dict):
+                return any(contains_tensor(item) for item in value.values())
+            if isinstance(value, (tuple, list)):
+                return any(contains_tensor(item) for item in value)
+            return False
+
+        self.assertFalse(contains_tensor(metadata))
+        self.assertEqual(len(payloads), 1)
+        restored_metadata = dict(pickle.loads(pickle.dumps(metadata)))
+        restored_metadata["__v100_pp_output_payload__"] = payloads[0].clone()
+        restored = unpack_output(restored_metadata)
+        self.assertIsInstance(restored["logprobs"], list)
+        self.assertIsInstance(restored["logprobs"][0]["indices"], tuple)
+        self.assertIsNone(restored["logprobs"][0]["indices"][1])
+        for actual, expected in (
+            (restored["ids"], tensors["ids"]),
+            (restored["logprobs"][0]["values"], tensors["logprobs"][0]["values"]),
+            (
+                restored["logprobs"][0]["indices"][0],
+                tensors["logprobs"][0]["indices"][0],
+            ),
+            (restored["empty"], tensors["empty"]),
+            (restored["scalar"], tensors["scalar"]),
+        ):
+            self.assertEqual(actual.shape, expected.shape)
+            self.assertEqual(actual.dtype, expected.dtype)
+            self.assertTrue(
+                torch.equal(
+                    actual.reshape(-1).view(torch.uint8),
+                    expected.reshape(-1).view(torch.uint8),
+                )
+            )
+
+    def test_glm_mtp_retains_exact_proposal_and_index_seed(self):
+        """GLM's FP4/TP4 transport must preserve q and its DSA seed locally."""
+        from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+
+        settings = dict(
+            model_path="dummy",
+            quantization="modelopt_fp4",
+            tp_size=4,
+            ep_size=1,
+            pp_size=2,
+            max_running_requests=1,
+            disable_overlap_schedule=True,
+            speculative_algorithm="EAGLE",
+            speculative_num_steps=3,
+            speculative_eagle_topk=1,
+            speculative_num_draft_tokens=4,
+            speculative_use_rejection_sampling=True,
+        )
+        owner = self.owner(spec=SpeculativeAlgorithm.EAGLE)
+        with get_context().override_server_args(**settings):
+            initialize_local_output(lambda _: None, owner)
+        self.assertIsNotNone(owner._v100_pp_local_outputs)
+        event = object()
+        tensors = {
+            "next_token_ids": torch.tensor([17, 19, 23]),
+            "spec_accept_lens": torch.tensor([3]),
+            "spec_next_draft_probs": torch.tensor(
+                [[[0.25, 0.75], [0.5, 0.5], [0.75, 0.25]]]
+            ),
+            "draft_dsa_topk_indices": torch.tensor(
+                [[31, 32, 63, 64, 129]], dtype=torch.int32
+            ),
+            "draft_hidden_states": torch.arange(16, dtype=torch.float32)[None],
+        }
+        proxy = PPProxyTensors(tensors)
+        pending = deque([(event, proxy)])
+        sent = []
+
+        def wire(_, payload, **kwargs):
+            sent.append(payload)
+            return [object()]
+
+        owner._pp_send_dict_to_next_stage = partial(send_output_dict, wire, owner)
+
+        def original(_, mb, batches, queue, previous):
+            forward_event, value = queue.popleft()
+            return owner._pp_send_dict_to_next_stage(
+                value.tensors, msg_type="output", ready_event=forward_event
+            )
+
+        send_output(original, owner, 0, [True], pending, None)
+        local, ready = receive_output(None, owner)
+        self.assertIs(local, tensors)
+        self.assertIs(ready, event)
+        decoded = unpack_output(sent[0])
+        self.assertNotIn("spec_next_draft_probs", decoded)
+        self.assertIs(local["spec_next_draft_probs"], tensors["spec_next_draft_probs"])
+        for key, expected in tensors.items():
+            if key != "spec_next_draft_probs":
+                torch.testing.assert_close(decoded[key], expected, rtol=0, atol=0)
+
+        # Unvalidated scheduling/topology variants retain their existing wire protocol.
+        for changes in (
+            {"ep_size": 2},
+            {"pp_async_batch_depth": 1},
+            {"max_running_requests": 2},
+            {"speculative_eagle_topk": 2},
+        ):
+            with (
+                self.subTest(changes=changes),
+                get_context().override_server_args(**(settings | changes)),
+            ):
+                other = self.owner(spec=SpeculativeAlgorithm.EAGLE)
+                initialize_local_output(lambda _: None, other)
+                self.assertIsNone(other._v100_pp_local_outputs)
 
     def test_result_fifo_preserves_all_fields_and_original_events(self):
         """Removing the echo must not shift one result into the next token turn."""
