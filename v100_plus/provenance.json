@@ -100,5 +100,13 @@
       "reference common_extension.cc speculative registrations"
     ]
   },
-  "current_kernel_version": "0.4.9+v100"
+  "current_kernel_version": "0.4.9+v100",
+  "marlin_patches": {
+    "v100_plus/patches/marlin-v100-block-fp8-prefill.patch": {
+      "repository": "https://github.com/zhinianqin/marlin_v100",
+      "base": "6d72a49939701d26b15b617a4cd2423174adb2d1",
+      "source": "csrc/moe/marlin_moe_wna16/sm70_marlin_fp8_gemm.cu",
+      "change": "Explicit block-FP8 expert prefill with exact 128x128 scale reuse; generic per-column FP8 metadata remains supported."
+    }
+  }
 }

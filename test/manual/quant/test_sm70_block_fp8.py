@@ -5,6 +5,7 @@ signed E4M3 values and masked EP routes catch scale/layout/type confusion.
 """
 
 import unittest
+from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
@@ -254,6 +255,37 @@ class TestSM70BlockFP8(CustomTestCase):
                             global_num_experts=e,
                         )
                         self.assertTrue(bool(torch.isfinite(actual).all()))
+                        if rows == 128:
+                            from sglang_v100_plus.kernels import moe_marlin
+
+                            # Keep the same routing, weights and FP16 boundaries;
+                            # compare actual bits, including signed zero.
+                            with patch.object(
+                                moe_marlin, "_sm70_marlin_user_tuning", True
+                            ):
+                                native = fused_marlin_moe(
+                                    x,
+                                    layer.w13_weight,
+                                    layer.w2_weight,
+                                    layer.w13_weight_scale_inv,
+                                    layer.w2_weight_scale_inv,
+                                    torch.zeros(rows, e, device="cuda"),
+                                    weights,
+                                    ids,
+                                    num_bits=8,
+                                    inplace=False,
+                                    expert_map=torch.arange(
+                                        e, device="cuda", dtype=torch.int32
+                                    )
+                                    if masked
+                                    else None,
+                                    global_num_experts=e,
+                                )
+                            self.assertTrue(
+                                torch.equal(
+                                    actual.view(torch.int16), native.view(torch.int16)
+                                )
+                            )
                         torch.testing.assert_close(
                             actual, expected.half(), rtol=0.005, atol=0.003
                         )
@@ -346,7 +378,7 @@ class TestSM70BlockFP8(CustomTestCase):
                             )
                         if masked:
                             self.assertEqual(int(torch.count_nonzero(actual[0])), 0)
-                        if rows == 3 and masked:
+                        if rows in (3, 128) and masked:
                             # Verify the same expert masking under the graph
                             # replay used for ordinary/speculative decoding.
                             graph = torch.cuda.CUDAGraph()

@@ -152,11 +152,11 @@ whole experts instead. Native QSA covers three heads for TP8 and six for TP4.
 | --- | --- | ---: | ---: |
 | TP8 + EP8 | Off | 3,249 | 36.1 |
 | TP8 + EP8 | Two steps | 3,112 | 59.6 |
-| TP4 × PP2 + EP4 | Off | 6,817 | 61.7 |
+| TP4 × PP2 + EP4 | Off | 7,040 | 61.4 |
 | TP4 × PP2 + EP4 | Two steps | 5,620 | 46.4 |
 
-Ordinary PP2 now gives about 110% higher prefill and 71% higher generation
-throughput than ordinary TP8. Its 61.7 tokens/s also narrowly exceeds the older
+Ordinary PP2 now gives about 117% higher prefill and 70% higher generation
+throughput than ordinary TP8. Its 61.4 tokens/s also narrowly exceeds the older
 TP8 MTP measurement; PP2 MTP still uses its earlier path. Two-step MTP improved
 TP8 generation by 65%, with 61% accepted draft tokens (excluding bonus tokens).
 PP2's earlier MTP measurement had 58% acceptance. The other three rows predate
@@ -170,6 +170,14 @@ sampled result locally instead of echoing it back from the first stage;
 postprocessing still runs in its original order and waits for the sampling
 event. This applies only to serialized, single-request, non-speculative PP2.
 Both changes stay in the plugin; core scheduling and model files are unchanged.
+
+Block-FP8 expert prefill reuses each 128×128 block's scale across K iterations
+and N columns. FP16 dequantization, activation and output boundaries stay fixed.
+Alternating native runs measured 6,784 → 7,010 prefill tokens/s (+3.3%), with
+generation around 61.5 tokens/s; 1,536 native expert-operation checks matched.
+The packaged operator also passes signed-zero bit comparisons and graph replay.
+Nine packaged-only requests confirmed 7,040 prefill / 61.4 generation tokens/s.
+Its Marlin patch is separate from model and upstream scheduling code.
 
 Prefill partitions HC normalization, projection and residual work by token
 inside each NVLink quad, using `SGLANG_OPT_SM70_HC_PREFILL_SP=1`. Attention

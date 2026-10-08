@@ -309,6 +309,54 @@ def moe_wna16_marlin_gemm(
             )
         op = _load_marlin_v100_op()
         if op is not None:
+            if (
+                not _sm70_marlin_user_tuning
+                and getattr(b_scales, "_sm70_fp8_scale", False)
+                and size_m >= 128
+                and (size_n, size_k) in ((1280, 2560), (2560, 640))
+                and is_k_full
+                and not is_zp_float
+                and all(
+                    x is None
+                    for x in (
+                        b_bias_or_none,
+                        global_scale_or_none,
+                        b_zeros_or_none,
+                        g_idx_or_none,
+                        perm_or_none,
+                    )
+                )
+            ):
+                from sglang.srt.runtime_context import get_buffer
+
+                def block_fp8_op():
+                    try:
+                        return torch.ops._moe_C.sm70_block_fp8_moe_gemm
+                    except AttributeError as exc:
+                        raise RuntimeError(
+                            "Rebuild Volta Marlin with bash v100_plus/setup.sh "
+                            "for block-FP8 expert prefill"
+                        ) from exc
+
+                # Only prepare_fp8_moe sets this tag after validating 128x128
+                # checkpoint blocks. Per-column scales use the generic API.
+                block_op = get_buffer("v100_block_fp8_marlin", block_fp8_op)
+                return block_op(
+                    a,
+                    c,
+                    b_q_weight,
+                    b_scales,
+                    sorted_token_ids,
+                    expert_ids,
+                    num_tokens_post_padded,
+                    topk_weights,
+                    moe_block_size,
+                    top_k,
+                    mul_topk_weights,
+                    size_m,
+                    size_n,
+                    size_k,
+                )
             _configure_sm70_nvfp4_stage(
                 b_scales,
                 moe_block_size,

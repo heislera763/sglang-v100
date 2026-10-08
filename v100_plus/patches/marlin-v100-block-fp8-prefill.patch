@@ -1,0 +1,262 @@
+diff --git a/csrc/moe/marlin_moe_wna16/sm70_marlin_fp8_gemm.cu b/csrc/moe/marlin_moe_wna16/sm70_marlin_fp8_gemm.cu
+index 1329091..a3cd573 100644
+--- a/csrc/moe/marlin_moe_wna16/sm70_marlin_fp8_gemm.cu
++++ b/csrc/moe/marlin_moe_wna16/sm70_marlin_fp8_gemm.cu
+@@ -26,7 +26,8 @@ namespace {
+ constexpr int kFp8ValuesPerAccess = 8;
+ 
+ template <typename Shape_, typename ThreadMap_, int GroupSize_,
+-          int PackedMacroN_, bool UseMetadataVectorWords_ = true>
++          int PackedMacroN_, bool UseMetadataVectorWords_ = true,
++          bool BlockScaleN128 = false>
+ class Sm70MoeFp8IteratorB {
+  public:
+   using Shape = Shape_;
+@@ -78,7 +79,11 @@ class Sm70MoeFp8IteratorB {
+   int k_offset_;
+   int n_offset_;
+   bool mask_enabled_;
+-  mutable half2 cached_scales_[ThreadMap::Iterations::kContiguous * 4];
++  // Block-FP8 shares one scale across 128 N columns and 128 K rows.
++  mutable int cached_group_ = -1;
++  mutable half2 cached_scales_[BlockScaleN128
++                                  ? (ThreadMap::Iterations::kContiguous + 1) / 2
++                                  : ThreadMap::Iterations::kContiguous * 4];
+ 
+  public:
+   CUTLASS_DEVICE
+@@ -179,6 +184,18 @@ class Sm70MoeFp8IteratorB {
+ 
+   CUTLASS_DEVICE
+   void cache_current_group_metadata(int group) const {
++    if constexpr (BlockScaleN128) {
++      if (cached_group_ == group) return;
++      cached_group_ = group;
++      CUTLASS_PRAGMA_UNROLL
++      for (int c = 0; c < ThreadMap::Iterations::kContiguous; c += 2) {
++        int const cache_n = n_offset_ + thread_offset_.contiguous() +
++                            c * ThreadMap::Delta::kContiguous;
++        half const scale =
++            scales_expert_base_[metadata_group_offset(group) + cache_n];
++        cached_scales_[c / 2] = __halves2half2(scale, scale);
++      }
++    } else {
+     CUTLASS_PRAGMA_UNROLL
+     for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c) {
+       int const cache_n =
+@@ -190,6 +207,7 @@ class Sm70MoeFp8IteratorB {
+         cache_metadata_lane_vectors(c, group, cache_n);
+       }
+     }
++    }
+   }
+ 
+   CUTLASS_DEVICE
+@@ -206,18 +224,18 @@ class Sm70MoeFp8IteratorB {
+           int const frag_base = c * kAccess;
+           uint32_t const qword0 = qword_from_vector(qwords0, c);
+           uint32_t const qword1 = qword_from_vector(qwords1, c);
+-          half2 const* scale_vec = cached_scales_ + c * 4;
++          half2 const* scale_vec = cached_scales_ + (BlockScaleN128 ? c / 2 : c * 4);
+ 
+           half2 deq[2];
+           half2* frag_vec = reinterpret_cast<half2*>(frag.data() + frag_base);
+           marlin::dequant<half2, vllm::kFE4M3fn.id(), true>(
+               static_cast<int>(qword0), deq);
+           frag_vec[0] = __hmul2(deq[0], scale_vec[0]);
+-          frag_vec[1] = __hmul2(deq[1], scale_vec[1]);
++          frag_vec[1] = __hmul2(deq[1], scale_vec[BlockScaleN128 ? 0 : 1]);
+           marlin::dequant<half2, vllm::kFE4M3fn.id(), true>(
+               static_cast<int>(qword1), deq);
+-          frag_vec[2] = __hmul2(deq[0], scale_vec[2]);
+-          frag_vec[3] = __hmul2(deq[1], scale_vec[3]);
++          frag_vec[2] = __hmul2(deq[0], scale_vec[BlockScaleN128 ? 0 : 2]);
++          frag_vec[3] = __hmul2(deq[1], scale_vec[BlockScaleN128 ? 0 : 3]);
+         }
+       } else if constexpr (ThreadMap::Iterations::kContiguous == 2) {
+         uint2 const qwords0 =
+@@ -230,18 +248,18 @@ class Sm70MoeFp8IteratorB {
+           int const frag_base = c * kAccess;
+           uint32_t const qword0 = qword_from_vector(qwords0, c);
+           uint32_t const qword1 = qword_from_vector(qwords1, c);
+-          half2 const* scale_vec = cached_scales_ + c * 4;
++          half2 const* scale_vec = cached_scales_ + (BlockScaleN128 ? c / 2 : c * 4);
+ 
+           half2 deq[2];
+           half2* frag_vec = reinterpret_cast<half2*>(frag.data() + frag_base);
+           marlin::dequant<half2, vllm::kFE4M3fn.id(), true>(
+               static_cast<int>(qword0), deq);
+           frag_vec[0] = __hmul2(deq[0], scale_vec[0]);
+-          frag_vec[1] = __hmul2(deq[1], scale_vec[1]);
++          frag_vec[1] = __hmul2(deq[1], scale_vec[BlockScaleN128 ? 0 : 1]);
+           marlin::dequant<half2, vllm::kFE4M3fn.id(), true>(
+               static_cast<int>(qword1), deq);
+-          frag_vec[2] = __hmul2(deq[0], scale_vec[2]);
+-          frag_vec[3] = __hmul2(deq[1], scale_vec[3]);
++          frag_vec[2] = __hmul2(deq[0], scale_vec[BlockScaleN128 ? 0 : 2]);
++          frag_vec[3] = __hmul2(deq[1], scale_vec[BlockScaleN128 ? 0 : 3]);
+         }
+       } else {
+         static_assert(ThreadMap::Iterations::kContiguous == 1,
+@@ -257,11 +275,11 @@ class Sm70MoeFp8IteratorB {
+         marlin::dequant<half2, vllm::kFE4M3fn.id(), true>(
+             static_cast<int>(qword0), deq);
+         frag_vec[0] = __hmul2(deq[0], scale_vec[0]);
+-        frag_vec[1] = __hmul2(deq[1], scale_vec[1]);
++        frag_vec[1] = __hmul2(deq[1], scale_vec[BlockScaleN128 ? 0 : 1]);
+         marlin::dequant<half2, vllm::kFE4M3fn.id(), true>(
+             static_cast<int>(qword1), deq);
+-        frag_vec[2] = __hmul2(deq[0], scale_vec[2]);
+-        frag_vec[3] = __hmul2(deq[1], scale_vec[3]);
++        frag_vec[2] = __hmul2(deq[0], scale_vec[BlockScaleN128 ? 0 : 2]);
++        frag_vec[3] = __hmul2(deq[1], scale_vec[BlockScaleN128 ? 0 : 3]);
+       }
+     } else {
+       int const logical_n_base = n_offset_ + thread_offset_.contiguous();
+@@ -288,7 +306,7 @@ class Sm70MoeFp8IteratorB {
+                 (c + s * ThreadMap::Iterations::kContiguous) * kAccess;
+             uint32_t const qword0 = qword_from_vector(qwords0, c);
+             uint32_t const qword1 = qword_from_vector(qwords1, c);
+-            half2 const* scale_vec = cached_scales_ + c * 4;
++            half2 const* scale_vec = cached_scales_ + (BlockScaleN128 ? c / 2 : c * 4);
+ 
+             half2 deq[2];
+             half2* frag_vec = reinterpret_cast<half2*>(frag.data() + frag_base);
+@@ -297,13 +315,13 @@ class Sm70MoeFp8IteratorB {
+             frag_vec[0] =
+                 __hmul2(deq[0], scale_vec[0]);
+             frag_vec[1] =
+-                __hmul2(deq[1], scale_vec[1]);
++                __hmul2(deq[1], scale_vec[BlockScaleN128 ? 0 : 1]);
+             marlin::dequant<half2, vllm::kFE4M3fn.id(), true>(
+                 static_cast<int>(qword1), deq);
+             frag_vec[2] =
+-                __hmul2(deq[0], scale_vec[2]);
++                __hmul2(deq[0], scale_vec[BlockScaleN128 ? 0 : 2]);
+             frag_vec[3] =
+-                __hmul2(deq[1], scale_vec[3]);
++                __hmul2(deq[1], scale_vec[BlockScaleN128 ? 0 : 3]);
+           }
+         } else if constexpr (ThreadMap::Iterations::kContiguous == 2) {
+           uint2 const qwords0 =
+@@ -317,7 +335,7 @@ class Sm70MoeFp8IteratorB {
+                 (c + s * ThreadMap::Iterations::kContiguous) * kAccess;
+             uint32_t const qword0 = qword_from_vector(qwords0, c);
+             uint32_t const qword1 = qword_from_vector(qwords1, c);
+-            half2 const* scale_vec = cached_scales_ + c * 4;
++            half2 const* scale_vec = cached_scales_ + (BlockScaleN128 ? c / 2 : c * 4);
+ 
+             half2 deq[2];
+             half2* frag_vec = reinterpret_cast<half2*>(frag.data() + frag_base);
+@@ -326,13 +344,13 @@ class Sm70MoeFp8IteratorB {
+             frag_vec[0] =
+                 __hmul2(deq[0], scale_vec[0]);
+             frag_vec[1] =
+-                __hmul2(deq[1], scale_vec[1]);
++                __hmul2(deq[1], scale_vec[BlockScaleN128 ? 0 : 1]);
+             marlin::dequant<half2, vllm::kFE4M3fn.id(), true>(
+                 static_cast<int>(qword1), deq);
+             frag_vec[2] =
+-                __hmul2(deq[0], scale_vec[2]);
++                __hmul2(deq[0], scale_vec[BlockScaleN128 ? 0 : 2]);
+             frag_vec[3] =
+-                __hmul2(deq[1], scale_vec[3]);
++                __hmul2(deq[1], scale_vec[BlockScaleN128 ? 0 : 3]);
+           }
+         } else {
+           static_assert(ThreadMap::Iterations::kContiguous == 1,
+@@ -350,11 +368,11 @@ class Sm70MoeFp8IteratorB {
+           marlin::dequant<half2, vllm::kFE4M3fn.id(), true>(
+               static_cast<int>(qword0), deq);
+           frag_vec[0] = __hmul2(deq[0], scale_vec[0]);
+-          frag_vec[1] = __hmul2(deq[1], scale_vec[1]);
++          frag_vec[1] = __hmul2(deq[1], scale_vec[BlockScaleN128 ? 0 : 1]);
+           marlin::dequant<half2, vllm::kFE4M3fn.id(), true>(
+               static_cast<int>(qword1), deq);
+-          frag_vec[2] = __hmul2(deq[0], scale_vec[2]);
+-          frag_vec[3] = __hmul2(deq[1], scale_vec[3]);
++          frag_vec[2] = __hmul2(deq[0], scale_vec[BlockScaleN128 ? 0 : 2]);
++          frag_vec[3] = __hmul2(deq[1], scale_vec[BlockScaleN128 ? 0 : 3]);
+         }
+       }
+     }
+@@ -376,7 +394,7 @@ class Sm70MoeFp8IteratorB {
+   }
+ };
+ 
+-template <bool UseMetadataVectorWords = true>
++template <bool UseMetadataVectorWords = true, bool BlockScaleN128 = false>
+ struct Sm70MoeFp8GemmSpec {
+   using ScaleElement = half;
+   using ZeroElement = half;
+@@ -388,15 +406,15 @@ struct Sm70MoeFp8GemmSpec {
+   template <typename Shape, typename ThreadMap, int GroupSize, int PackedMacroN>
+   using IteratorB =
+       Sm70MoeFp8IteratorB<Shape, ThreadMap, GroupSize, PackedMacroN,
+-                          UseMetadataVectorWords>;
++                          UseMetadataVectorWords, BlockScaleN128>;
+ };
+ 
+ template <int CtaM, int CtaN, int CtaK, int Warps, int WarpM,
+           int WarpN, int WarpK, int GroupSize, int PackedMacroN,
+-          bool UseMetadataVectorWords = true>
++          bool UseMetadataVectorWords = true, bool BlockScaleN128 = false>
+ using Sm70MoeFp8GemmTraits =
+     Sm70MarlinMoeGemmTraits<
+-        Sm70MoeFp8GemmSpec<UseMetadataVectorWords>, CtaM, CtaN, CtaK,
++        Sm70MoeFp8GemmSpec<UseMetadataVectorWords, BlockScaleN128>, CtaM, CtaN, CtaK,
+         Warps, WarpM, WarpN, WarpK, GroupSize, PackedMacroN>;
+ 
+ template <bool UseMetadataVectorWords = true>
+@@ -470,4 +488,51 @@ torch::Tensor sm70_marlin_fp8_gemm(
+   return dispatch_sm70_marlin_moe_fp8_geometry(launcher, geometry, params.packed_macro_n, group_size);
+ }
+ 
++
++// Explicit block-scale contract; the generic FP8 operator permits scales that
++// vary per N column and must retain its original metadata interpretation.
++torch::Tensor sm70_block_fp8_moe_gemm(
++    torch::Tensor a, torch::Tensor c, torch::Tensor w, torch::Tensor scales,
++    torch::Tensor sorted, torch::Tensor experts, torch::Tensor count,
++    torch::Tensor weights, int64_t block_size, int64_t top_k, bool mul_weights,
++    int64_t m, int64_t n, int64_t k) {
++  c10::cuda::CUDAGuard guard(a.device());
++  TORCH_CHECK(m > 0 && top_k > 0 && n % 256 == 0 && k % 128 == 0,
++              "SM70 block-FP8 requires positive M/top_k, N % 256 == 0 and K % 128 == 0");
++  TORCH_CHECK(block_size == 8 || block_size == 16 || block_size == 32 ||
++                  block_size == 48 || block_size == 64,
++              "Unsupported SM70 block-FP8 route alignment");
++  TORCH_CHECK(a.scalar_type() == at::kHalf && c.scalar_type() == at::kHalf &&
++                  scales.scalar_type() == at::kHalf && w.scalar_type() == at::kInt,
++              "SM70 block-FP8 expects FP16 activations/output/scales and int32 packed weights");
++  TORCH_CHECK(a.dim() == 2 && a.size(0) == m && a.size(1) == k &&
++                  c.dim() == 2 && c.size(0) == m * top_k && c.size(1) == n &&
++                  w.dim() == 3 && w.size(1) == k / 16 && w.size(2) == n * 4 &&
++                  scales.dim() == 3 && scales.size(0) == w.size(0) &&
++                  scales.size(1) == k / 128 && scales.size(2) == n,
++              "Invalid SM70 block-FP8 tensor shape");
++  for (auto const& tensor : {a, c, w, scales, sorted, experts, count, weights}) {
++    TORCH_CHECK(tensor.is_cuda() && tensor.device() == a.device() && tensor.is_contiguous(),
++                "SM70 block-FP8 requires contiguous tensors on one CUDA device");
++  }
++  TORCH_CHECK(sorted.scalar_type() == at::kInt && experts.scalar_type() == at::kInt &&
++                  count.scalar_type() == at::kInt && count.numel() == 1 &&
++                  weights.scalar_type() == at::kFloat && weights.numel() == m * top_k,
++              "Invalid SM70 block-FP8 routing metadata");
++  using Traits = Sm70MarlinMoeGemmTraits<Sm70MoeFp8GemmSpec<true, true>,
++      32, 256, 32, 4, 32, 64, 32, 128, 256>;
++  auto zeros = torch::empty({0}, scales.options());
++  auto global_scale = torch::empty({0}, scales.options().dtype(at::kFloat));
++  return launch_sm70_marlin_moe_gemm<Traits>(a, c, w, scales, zeros, global_scale,
++      sorted, experts, count, weights, block_size, top_k, mul_weights, m, n, k, 1);
++}
++
+ }  // namespace marlin_moe_wna16
++
++TORCH_LIBRARY_FRAGMENT(_moe_C, m) {
++  m.def("sm70_block_fp8_moe_gemm(Tensor a, Tensor(a!) c, Tensor w, Tensor scales, "
++        "Tensor sorted, Tensor experts, Tensor count, Tensor weights, int block_size, "
++        "int top_k, bool mul_weights, int size_m, int size_n, int size_k) -> Tensor(a!)");
++  m.impl("sm70_block_fp8_moe_gemm", torch::kCUDA,
++         &marlin_moe_wna16::sm70_block_fp8_moe_gemm);
++}
