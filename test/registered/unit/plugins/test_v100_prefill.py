@@ -21,9 +21,105 @@ with patch.object(
 ):
     from sglang_v100_plus import prefill
     from sglang_v100_plus.dispatch import prefill_scope
+    from sglang_v100_plus.hc_state import SM70GatedResidualState
 
 
 class TestV100Prefill(CustomTestCase):
+    def test_boundary_keeps_each_stages_cached_gate_and_clears_it(self):
+        residual = torch.arange(4 * 12, dtype=torch.float32).reshape(4, 12)
+        gate_a, gate_b = torch.full((4, 3), 2.0), torch.full((4, 3), 3.0)
+        seen = []
+
+        def mix_with_gate(gate):
+            return lambda value: (value[:, :4], (value, value * 0.5, gate))
+
+        def combine(output, values):
+            seen.append(values)
+            return values[0] + output.repeat(1, 3)
+
+        state = SM70GatedResidualState(
+            expand=lambda value: value,
+            attn_mix=mix_with_gate(gate_a),
+            ffn_mix=mix_with_gate(gate_b),
+            attn_combine=combine,
+            ffn_combine=combine,
+        )
+        ops = state.residual_ops()
+        hidden, residual = ops.attn_readout.read(residual, None)
+        _, residual = ops.ffn_readout.update_and_read(
+            ops.attn_update, hidden, residual, None
+        )
+        self.assertIs(seen[0][2], gate_a)
+        self.assertIs(state.gate, gate_b)
+        ops.ffn_update.update(hidden, residual)
+        self.assertIs(seen[1][2], gate_b)
+        self.assertIsNone(state.gate)
+        self.assertIsNone(state.normed)
+        # A subsequent prefill/empty read returns the ordinary pair and must
+        # never reuse a gate from an earlier captured or speculative read.
+        state.gate = gate_a
+        state.attn_mix = lambda value: (value[:, :4], (value, value * 0.25))
+        hidden, residual = ops.attn_readout.read(residual, None)
+        ops.attn_update.update(hidden, residual)
+        self.assertIsNone(state.gate)
+        self.assertEqual(len(seen[-1]), 2)
+
+    def test_boundary_slices_gate_rows_with_normalized_residuals(self):
+        residual = torch.arange(4 * 12, dtype=torch.float32).reshape(4, 12)
+        normed = residual * 0.5
+        gate = torch.arange(4 * 8 * 3).reshape(4, 8, 3)
+        state = SM70GatedResidualState(None, None, None, None, None, normed, gate)
+        parallel = SimpleNamespace(attn_tp_size=2, attn_tp_rank=1)
+        with (
+            patch("sglang_v100_plus.hc_state.get_parallel", return_value=parallel),
+            patch(
+                "sglang.srt.layers.layer_boundary.residual.gated.get_parallel",
+                return_value=parallel,
+            ),
+        ):
+            selected = state.residual_ops().attn_update.slice_residual_attn_tp(residual)
+        torch.testing.assert_close(selected, residual[2:])
+        torch.testing.assert_close(state.normed, normed[2:])
+        torch.testing.assert_close(state.gate, gate[2:])
+
+    def test_ple_preparation_gathers_before_the_causal_convolution(self):
+        from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+
+        full = torch.arange(256 * 5).reshape(256, 5)
+        batch = SimpleNamespace(residual_stream=None)
+        ple_batch = object()
+        owner = SimpleNamespace(ple=object())
+
+        class Group:
+            def all_gather(_, value, dim):
+                torch.testing.assert_close(value, full[64:128])
+                self.assertEqual(dim, 0)
+                return full
+
+        def original(layer, hidden, actual_batch, actual_ple_batch):
+            self.assertIs(layer, owner)
+            self.assertIs(actual_batch, batch)
+            self.assertIs(actual_ple_batch, ple_batch)
+            residual_batch.stream_of(batch).check(hidden)
+            return hidden
+
+        with (
+            get_context().override_server_args(model_path="dummy"),
+            get_parallel().override(attn_tp_group=Group()),
+            prefill.partition_scope(prefill.Partition(256, 1)),
+        ):
+            local = full[64:128]
+            residual_batch.set_written(local, batch)
+            actual = prefill.prepare_attention(original, owner, local, batch, ple_batch)
+            self.assertIs(actual, full)
+            owner.ple = None
+            local = full[64:128]
+            residual_batch.set_written(local, batch)
+            self.assertIs(
+                prefill.prepare_attention(original, owner, local, batch, ple_batch),
+                local,
+            )
+
     def test_only_eager_serialized_fp8_prefill_is_partitioned(self):
         """Decode, verification, ragged rows and other layouts retain full inputs."""
         owner = SimpleNamespace(hc_count=4, hidden_size=2560)

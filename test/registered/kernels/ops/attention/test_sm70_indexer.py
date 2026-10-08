@@ -9,7 +9,7 @@ from sglang.kernels.ops.attention.dsa.sm70_indexer import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, stage="jit-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.version.hip is not None,
     reason="CUDA software FP8 kernels",
@@ -118,24 +118,33 @@ def test_quantization_and_pool_graph_replay_use_new_inputs():
 
 
 @pytest.mark.parametrize("use_graph", [False, True])
-def test_device_pool4_replays_lengths_requests_and_page_boundaries(use_graph):
+@pytest.mark.parametrize(
+    "token_page_size,index_page_size", [(64, 64), (64, 16), (256, 64)]
+)
+def test_device_pool4_replays_lengths_requests_and_page_boundaries(
+    use_graph, token_page_size, index_page_size
+):
     from sglang.kernels.ops.attention.dsa.sm70_pool4_decode import pool4_decode_sm70
 
     torch.manual_seed(737)
-    cache = torch.zeros(40, 8448, device="cuda", dtype=torch.uint8)
+    scale_offset = index_page_size * 128
+    cache = torch.zeros(40, index_page_size * 132, device="cuda", dtype=torch.uint8)
     finite_codes = (
         torch.cat((torch.arange(127), torch.arange(128, 255))).to(torch.uint8).cuda()
     )
-    cache[:, :8192] = finite_codes.repeat((40 * 8192 + 253) // 254)[
-        : 40 * 8192
-    ].reshape(40, 8192)
-    cache[:, 8192:].view(torch.float32).fill_(0.01)
+    cache[:, :scale_offset] = finite_codes.repeat((40 * scale_offset + 253) // 254)[
+        : 40 * scale_offset
+    ].reshape(40, scale_offset)
+    cache[:, scale_offset:].view(torch.float32).fill_(0.01)
     tail_k = torch.randn(3, 4, 128, device="cuda").bfloat16()
     tail_g = torch.randn_like(tail_k)
     table = torch.zeros(3, 512, device="cuda", dtype=torch.int32)
     for req, start in ((1, 1), (2, 17)):
-        pages = torch.randperm(8, device="cuda") + start
-        table[req] = (pages[:, None] * 64 + torch.arange(64, device="cuda")).flatten()
+        pages = torch.randperm(512 // token_page_size, device="cuda") + start
+        table[req] = (
+            pages[:, None] * token_page_size
+            + torch.arange(token_page_size, device="cuda")
+        ).flatten()
     reference_cache, reference_k, reference_g = (
         cache.clone(),
         tail_k.clone(),
@@ -149,7 +158,16 @@ def test_device_pool4_replays_lengths_requests_and_page_boundaries(use_graph):
 
     def run():
         return pool4_decode_sm70(
-            keys, gates, ape, tail_k, tail_g, cache, table, reqs, lengths
+            keys,
+            gates,
+            ape,
+            tail_k,
+            tail_g,
+            cache,
+            table,
+            reqs,
+            lengths,
+            token_page_size=token_page_size,
         )
 
     for _ in range(3):
@@ -192,22 +210,29 @@ def test_device_pool4_replays_lengths_requests_and_page_boundaries(use_graph):
                     assembled_k[None], assembled_g[None], ape
                 )
                 pool_id = prefix // 4
-                page = int(table[req, pool_id // 64 * 256].item()) // 64
-                offset = pool_id % 64
+                page = (
+                    int(table[req, pool_id // index_page_size * (index_page_size * 4)])
+                    // token_page_size
+                )
+                offset = pool_id % index_page_size
                 reference_cache[page, offset * 128 : (offset + 1) * 128] = q.view(
                     torch.uint8
                 )[0]
-                reference_cache[page, 8192 + offset * 4 : 8192 + (offset + 1) * 4] = (
-                    scale.view(torch.uint8).flatten()
-                )
+                reference_cache[
+                    page, scale_offset + offset * 4 : scale_offset + (offset + 1) * 4
+                ] = scale.view(torch.uint8).flatten()
             else:
                 reference_k[req, prefix % 4] = keys[row].bfloat16()
                 reference_g[req, prefix % 4] = gates[row].bfloat16()
             count = length // 4
             ids = torch.arange(count, device="cuda")
-            pages = table[req, ids // 64 * 256].long() // 64
+            pages = (
+                table[req, ids // index_page_size * (index_page_size * 4)].long()
+                // token_page_size
+            )
             columns = (
-                ids[:, None] % 64 * 128 + torch.arange(128, device="cuda")[None, :]
+                ids[:, None] % index_page_size * 128
+                + torch.arange(128, device="cuda")[None, :]
             )
             expected_keys = (
                 reference_cache[pages[:, None], columns]
@@ -215,8 +240,8 @@ def test_device_pool4_replays_lengths_requests_and_page_boundaries(use_graph):
                 .view(torch.float8_e4m3fn)
                 .half()
             )
-            expected_scales = reference_cache[:, 8192:].view(torch.float32)[
-                pages, ids % 64
+            expected_scales = reference_cache[:, scale_offset:].view(torch.float32)[
+                pages, ids % index_page_size
             ]
             assert actual_pools[row] == count
             torch.testing.assert_close(
@@ -236,8 +261,16 @@ def test_device_pool4_replays_lengths_requests_and_page_boundaries(use_graph):
 @pytest.mark.parametrize("round_scale", [False, True])
 @pytest.mark.parametrize("use_graph", [False, True])
 @pytest.mark.parametrize("use_effective", [False, True])
+@pytest.mark.parametrize(
+    "token_page_size,index_page_size", [(64, 64), (64, 16), (256, 64)]
+)
 def test_pool4_spec_chain_rejection_and_page_boundary(
-    num_draft_tokens, round_scale, use_graph, use_effective
+    num_draft_tokens,
+    round_scale,
+    use_graph,
+    use_effective,
+    token_page_size,
+    index_page_size,
 ):
     """Verify -> partial commit -> verify must replace rejected future pools.
 
@@ -249,13 +282,17 @@ def test_pool4_spec_chain_rejection_and_page_boundary(
 
     torch.manual_seed(741)
     n, batch = num_draft_tokens, 3
-    cache = torch.zeros(40, 8448, device="cuda", dtype=torch.uint8)
+    scale_offset = index_page_size * 128
+    cache = torch.zeros(40, index_page_size * 132, device="cuda", dtype=torch.uint8)
     tail_k = torch.randn(3, 4 + n, 128, device="cuda").bfloat16()
     tail_g = torch.randn_like(tail_k)
     table = torch.zeros(3, 512, device="cuda", dtype=torch.int32)
     for req, first in ((1, 1), (2, 17)):
-        pages = torch.randperm(8, device="cuda") + first
-        table[req] = (pages[:, None] * 64 + torch.arange(64, device="cuda")).flatten()
+        pages = torch.randperm(512 // token_page_size, device="cuda") + first
+        table[req] = (
+            pages[:, None] * token_page_size
+            + torch.arange(token_page_size, device="cuda")
+        ).flatten()
     reference_cache, reference_k, reference_g = (
         cache.clone(),
         tail_k.clone(),
@@ -291,6 +328,7 @@ def test_pool4_spec_chain_rejection_and_page_boundary(
             lengths,
             effective if use_effective else None,
             round_scale,
+            token_page_size=token_page_size,
         )
 
     actual_keys, actual_scales, actual_pools = run()
@@ -324,7 +362,12 @@ def test_pool4_spec_chain_rejection_and_page_boundary(
             for p in range((n + 3) // 4):
                 pool_id = prefix // 4 + p
                 locations[row, p] = (
-                    table[req, pool_id // 64 * 256].long() // 64 * 64 + pool_id % 64
+                    table[
+                        req, pool_id // index_page_size * (index_page_size * 4)
+                    ].long()
+                    // token_page_size
+                    * index_page_size
+                    + pool_id % index_page_size
                 )
             for i in range(n):
                 pos = (prefix + i) % (4 + n)
@@ -338,14 +381,17 @@ def test_pool4_spec_chain_rejection_and_page_boundary(
                     ape,
                     round_scale,
                 )
-                page = int(table[req, pool_id // 64 * 256]) // 64
-                offset = pool_id % 64
+                page = (
+                    int(table[req, pool_id // index_page_size * (index_page_size * 4)])
+                    // token_page_size
+                )
+                offset = pool_id % index_page_size
                 reference_cache[page, offset * 128 : (offset + 1) * 128] = q.view(
                     torch.uint8
                 )[0]
-                reference_cache[page, 8192 + offset * 4 : 8192 + (offset + 1) * 4] = (
-                    scale.view(torch.uint8).flatten()
-                )
+                reference_cache[
+                    page, scale_offset + offset * 4 : scale_offset + (offset + 1) * 4
+                ] = scale.view(torch.uint8).flatten()
         if use_graph:
             graph.replay()
         else:
@@ -359,9 +405,15 @@ def test_pool4_spec_chain_rejection_and_page_boundary(
                 count = (prefixes[row] + i + 1) // 4 if req >= 0 else 0
                 assert actual_pools[qrow] == count
                 ids = torch.arange(count, device="cuda")
-                pages = table[req, ids // 64 * 256].long() // 64 if req >= 0 else ids
+                pages = (
+                    table[req, ids // index_page_size * (index_page_size * 4)].long()
+                    // token_page_size
+                    if req >= 0
+                    else ids
+                )
                 columns = (
-                    ids[:, None] % 64 * 128 + torch.arange(128, device="cuda")[None, :]
+                    ids[:, None] % index_page_size * 128
+                    + torch.arange(128, device="cuda")[None, :]
                 )
                 expected_k = (
                     reference_cache[pages[:, None], columns]
@@ -369,8 +421,8 @@ def test_pool4_spec_chain_rejection_and_page_boundary(
                     .view(torch.float8_e4m3fn)
                     .half()
                 )
-                expected_s = reference_cache[:, 8192:].view(torch.float32)[
-                    pages, ids % 64
+                expected_s = reference_cache[:, scale_offset:].view(torch.float32)[
+                    pages, ids % index_page_size
                 ]
                 assert torch.equal(actual_keys[qrow, :count], expected_k)
                 assert torch.equal(actual_scales[qrow, :count], expected_s)
@@ -380,6 +432,50 @@ def test_pool4_spec_chain_rejection_and_page_boundary(
                 # Target verification staged the full window; rejecting all
                 # proposed drafts keeps only the bonus-token prefix.
                 committed[req] += 1 if step % 2 == 0 else counts[row]
+
+
+@pytest.mark.parametrize("token_page_size,index_page_size", [(64, 16), (256, 64)])
+def test_prefill_cache_uses_compact_pooled_token_locations(
+    token_page_size, index_page_size
+):
+    from sglang_v100_plus.glm_dsa import (
+        pooled_locations,
+        read_pooled_cache,
+        write_pooled_cache,
+    )
+
+    torch.manual_seed(742)
+    pages = torch.randperm(8, device="cuda") + 1
+    table = (
+        pages[:, None] * token_page_size + torch.arange(token_page_size, device="cuda")
+    ).flatten()
+    ids = torch.arange(table.numel() // 4, device="cuda")
+    # In the compact upstream layout a pool's physical slot is the first of
+    # its four token slots divided by four. This reference does not group IDs
+    # using the adapter's page-start formula.
+    expected_locations = table[ids * 4].long() // 4
+    locations = pooled_locations(
+        table, ids, token_page_size=token_page_size, index_page_size=index_page_size
+    )
+    assert torch.equal(locations, expected_locations)
+    codes = torch.randint(0, 127, (ids.numel(), 128), device="cuda", dtype=torch.uint8)
+    keys = codes.view(torch.float8_e4m3fn)
+    scales = torch.rand(ids.numel(), device="cuda", dtype=torch.float32)
+    cache = torch.zeros(10, index_page_size * 132, device="cuda", dtype=torch.uint8)
+    expected = cache.clone()
+    for i, loc in enumerate(expected_locations.tolist()):
+        page, offset = divmod(loc, index_page_size)
+        expected[page, offset * 128 : (offset + 1) * 128] = codes[i]
+        expected[
+            page,
+            index_page_size * 128 + offset * 4 : index_page_size * 128
+            + (offset + 1) * 4,
+        ] = scales[i : i + 1].view(torch.uint8)
+    write_pooled_cache(cache, locations, keys, scales)
+    assert torch.equal(cache, expected)
+    actual_keys, actual_scales = read_pooled_cache(cache, locations.flip(0))
+    assert torch.equal(actual_keys.view(torch.uint8), codes.flip(0))
+    assert torch.equal(actual_scales, scales.flip(0))
 
 
 if __name__ == "__main__":

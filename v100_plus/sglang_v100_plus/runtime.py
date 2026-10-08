@@ -54,6 +54,7 @@ def install():
     )
     from .glm_kda import SM70KDAKernel
     from .glm_mhc import mhc_post, mhc_pre
+    from .hc_state import SM70GatedResidualState
     from .mqa import qsa_mqa_prefill
     from .ple import (
         Qwen4ExpPinnedHostEmbedding,
@@ -66,6 +67,11 @@ def install():
             raise ValueError("The enabled SM70 profile requires float16 model weights")
 
     hooks = [
+        (
+            "sglang.srt.models.qwen4_exp.GatedResidualState",
+            SM70GatedResidualState,
+            HookType.REPLACE,
+        ),
         (
             "sglang.srt.managers.scheduler_pp_mixin.SchedulerPPMixin.init_pp_loop_state",
             initialize_local_output,
@@ -266,7 +272,7 @@ def install():
                 HookType.AROUND,
             ),
             (
-                "sglang.srt.models.qwen4_exp.Qwen4ExpLayerExtensionMixin._prepare_qwen4_exp_attn",
+                "sglang.srt.models.qwen4_exp.Qwen4ExpLayerExtensionMixin._prepare_attn_stage",
                 prepare_attention,
                 HookType.AROUND,
             ),

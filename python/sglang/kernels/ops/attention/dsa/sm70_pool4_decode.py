@@ -10,6 +10,17 @@ from sglang.kernels.ops.attention.dsa.sm70_indexer import (
 )
 
 
+def pool4_cache_page_size(cache):
+    """Number of pooled keys per row-major FP8/FP32 cache page."""
+    if (
+        cache.dtype != torch.uint8
+        or cache.ndim != 2
+        or cache.shape[1] not in (16 * 132, 64 * 132)
+    ):
+        raise ValueError("SM70 pool4 requires 16- or 64-slot FP8/FP32 cache pages")
+    return cache.shape[1] // 132
+
+
 @triton.jit
 def _pool4_decode_write(
     K,
@@ -30,6 +41,8 @@ def _pool4_decode_write(
     TAIL_SIZE: tl.constexpr,
     CACHE_STRIDE: tl.constexpr,
     TABLE_STRIDE: tl.constexpr,
+    TOKEN_PAGE_SIZE: tl.constexpr,
+    INDEX_PAGE_SIZE: tl.constexpr,
     ROUND_SCALE: tl.constexpr,
     RETAIN_CLOSED_TAIL: tl.constexpr,
 ):
@@ -82,15 +95,17 @@ def _pool4_decode_write(
                 (x * 128**-0.5).to(tl.bfloat16).to(tl.float32), ROUND_SCALE
             )
             pool_id = prefix // 4
-            physical = tl.load(TABLE + req * TABLE_STRIDE + pool_id // 64 * 256).to(
-                tl.int64
-            )
-            page = physical // 64
-            offset = pool_id % 64
+            physical = tl.load(
+                TABLE
+                + req * TABLE_STRIDE
+                + pool_id // INDEX_PAGE_SIZE * (INDEX_PAGE_SIZE * 4)
+            ).to(tl.int64)
+            page = physical // TOKEN_PAGE_SIZE
+            offset = pool_id % INDEX_PAGE_SIZE
             tl.store(CACHE + page * CACHE_STRIDE + offset * 128 + cols, encoded)
-            scale_ptr = (CACHE + page * CACHE_STRIDE + 8192 + offset * 4).to(
-                tl.pointer_type(tl.float32)
-            )
+            scale_ptr = (
+                CACHE + page * CACHE_STRIDE + INDEX_PAGE_SIZE * 128 + offset * 4
+            ).to(tl.pointer_type(tl.float32))
             tl.store(scale_ptr, scale)
         if (length % 4 != 0) | RETAIN_CLOSED_TAIL:
             tail_pos = prefix % TAIL_SIZE
@@ -125,6 +140,8 @@ def _pool4_decode_gather(
     POOLS,
     CACHE_STRIDE: tl.constexpr,
     TABLE_STRIDE: tl.constexpr,
+    TOKEN_PAGE_SIZE: tl.constexpr,
+    INDEX_PAGE_SIZE: tl.constexpr,
     MAX_POOLS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -138,17 +155,19 @@ def _pool4_decode_gather(
     valid = (ids < pools) & (ids < MAX_POOLS)
     cols = tl.arange(0, 128)
     physical = tl.load(
-        TABLE + req * TABLE_STRIDE + ids // 64 * 256, mask=valid, other=0
+        TABLE + req * TABLE_STRIDE + ids // INDEX_PAGE_SIZE * (INDEX_PAGE_SIZE * 4),
+        mask=valid,
+        other=0,
     ).to(tl.int64)
-    pages = physical // 64
-    offsets = ids % 64
+    pages = physical // TOKEN_PAGE_SIZE
+    offsets = ids % INDEX_PAGE_SIZE
     encoded = tl.load(
         CACHE + pages[:, None] * CACHE_STRIDE + offsets[:, None] * 128 + cols[None, :],
         mask=valid[:, None],
         other=0,
     )
     keys = _decode_e4m3fn(encoded)
-    scale_ptr = (CACHE + pages * CACHE_STRIDE + 8192 + offsets * 4).to(
+    scale_ptr = (CACHE + pages * CACHE_STRIDE + INDEX_PAGE_SIZE * 128 + offsets * 4).to(
         tl.pointer_type(tl.float32)
     )
     scales = tl.load(scale_ptr, mask=valid, other=0)
@@ -172,6 +191,8 @@ def pool4_decode_sm70(
     seq_lens,
     round_scale=False,
     retain_closed_tail=False,
+    *,
+    token_page_size=64,
 ):
     """Append one key per request, close pools on-device, and gather FP16 keys.
 
@@ -198,10 +219,9 @@ def pool4_decode_sm70(
         and cache.is_contiguous()
     ):
         raise ValueError("SM70 decode cache and tail rings must be contiguous")
-    if cache.dtype != torch.uint8 or cache.shape[1] != 8448:
-        raise ValueError(
-            "SM70 pool4 decode requires 64-slot row-major FP8/FP32 cache pages"
-        )
+    index_page_size = pool4_cache_page_size(cache)
+    if token_page_size not in (64, 256):
+        raise ValueError("SM70 pool4 supports 64- or 256-token allocation pages")
     capacity = token_table.shape[1] // 4
     gathered = torch.empty(
         (batch, capacity, 128), dtype=torch.float16, device=keys.device
@@ -224,6 +244,8 @@ def pool4_decode_sm70(
         tail_keys.shape[1],
         cache.stride(0),
         token_table.stride(0),
+        token_page_size,
+        index_page_size,
         round_scale,
         retain_closed_tail,
         num_warps=4,
@@ -239,6 +261,8 @@ def pool4_decode_sm70(
         pools,
         cache.stride(0),
         token_table.stride(0),
+        token_page_size,
+        index_page_size,
         capacity,
         16,
         num_warps=4,
@@ -266,6 +290,7 @@ def _pool4_spec_write(
     A_COL: tl.constexpr,
     TAIL_SIZE: tl.constexpr,
     CACHE_STRIDE: tl.constexpr,
+    INDEX_PAGE_SIZE: tl.constexpr,
     WRITE_STRIDE: tl.constexpr,
     N: tl.constexpr,
     MAX_CLOSED: tl.constexpr,
@@ -313,11 +338,11 @@ def _pool4_spec_write(
                     (x * 128**-0.5).to(tl.bfloat16).to(tl.float32), ROUND_SCALE
                 )
                 loc = tl.load(WRITE_LOCS + b * WRITE_STRIDE + p).to(tl.int64)
-                page, offset = loc // 64, loc % 64
+                page, offset = loc // INDEX_PAGE_SIZE, loc % INDEX_PAGE_SIZE
                 tl.store(CACHE + page * CACHE_STRIDE + offset * 128 + cols, encoded)
-                scale_ptr = (CACHE + page * CACHE_STRIDE + 8192 + offset * 4).to(
-                    tl.pointer_type(tl.float32)
-                )
+                scale_ptr = (
+                    CACHE + page * CACHE_STRIDE + INDEX_PAGE_SIZE * 128 + offset * 4
+                ).to(tl.pointer_type(tl.float32))
                 tl.store(scale_ptr, scale)
 
 
@@ -338,6 +363,8 @@ def pool4_spec_sm70(
     query_lengths,
     effective_num_tokens=None,
     round_scale=False,
+    *,
+    token_page_size=64,
 ):
     """Apply upstream chain verify/draft-extend plans using software FP8.
 
@@ -353,6 +380,9 @@ def pool4_spec_sm70(
     max_closed = (n + 3) // 4
     if not 1 <= n <= 6 or keys.shape != gates.shape or keys.shape[1:] != (128,):
         raise ValueError("SM70 pool4 supports chain widths 1..6 and 128-wide keys")
+    index_page_size = pool4_cache_page_size(cache)
+    if token_page_size not in (64, 256):
+        raise ValueError("SM70 pool4 supports 64- or 256-token allocation pages")
     if (
         ape.shape != (4, 128)
         or tail_keys.shape != tail_gates.shape
@@ -360,9 +390,6 @@ def pool4_spec_sm70(
         or tail_keys.shape[-1] != 128
         or tail_keys.dtype != torch.bfloat16
         or tail_gates.dtype != torch.bfloat16
-        or cache.dtype != torch.uint8
-        or cache.ndim != 2
-        or cache.shape[1] != 8448
         or write_locations.shape != (batch, max_closed)
         or out_locations.numel() != keys.shape[0]
         or query_lengths.numel() != keys.shape[0]
@@ -419,6 +446,7 @@ def pool4_spec_sm70(
         *ape.stride(),
         tail_keys.shape[1],
         cache.stride(0),
+        index_page_size,
         write_locations.stride(0),
         n,
         max_closed,
@@ -437,6 +465,8 @@ def pool4_spec_sm70(
         pools,
         cache.stride(0),
         token_table.stride(0),
+        token_page_size,
+        index_page_size,
         capacity,
         16,
         num_warps=4,

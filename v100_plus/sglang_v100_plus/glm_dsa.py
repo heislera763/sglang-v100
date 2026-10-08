@@ -9,6 +9,7 @@ from sglang.kernels.ops.attention.dsa.sm70_indexer import (
     mqa_logits_sm70,
 )
 from sglang.kernels.ops.attention.dsa.sm70_pool4_decode import (
+    pool4_cache_page_size,
     pool4_decode_sm70,
     pool4_spec_sm70,
 )
@@ -52,29 +53,38 @@ def sm70_dsa_constraints(
     return original(kv_cache_dtype, prefill_backend, decode_backend, hip=hip)
 
 
-def pooled_locations(token_table, pool_ids):
-    # A closed pool's storage page is the first physical token page of its
-    # four-page logical group; its slot within that page is the pool ID mod 64.
-    token_page_starts = torch.div(pool_ids, 64, rounding_mode="floor") * 256
+def pooled_locations(token_table, pool_ids, *, token_page_size, index_page_size):
+    # Each index page represents four tokens per pooled slot. The allocator's
+    # token page size and the index cache's slot count are separate quantities.
+    token_page_starts = (
+        torch.div(pool_ids, index_page_size, rounding_mode="floor")
+        * index_page_size
+        * 4
+    )
     token_slots = token_table[token_page_starts.long()].long()
-    return torch.div(token_slots, 64, rounding_mode="floor") * 64 + pool_ids % 64
+    return (
+        torch.div(token_slots, token_page_size, rounding_mode="floor") * index_page_size
+        + pool_ids % index_page_size
+    )
 
 
 def write_pooled_cache(buf, locations, keys, scales):
-    pages = torch.div(locations, 64, rounding_mode="floor").long()
-    offsets = locations.remainder(64).long()
+    index_page_size = pool4_cache_page_size(buf)
+    pages = torch.div(locations, index_page_size, rounding_mode="floor").long()
+    offsets = locations.remainder(index_page_size).long()
     columns = offsets[:, None] * 128 + torch.arange(128, device=buf.device)[None, :]
     buf[pages[:, None], columns] = keys.contiguous().view(torch.uint8)
-    scale_buffer = buf[:, 8192:].view(torch.float32)
+    scale_buffer = buf[:, index_page_size * 128 :].view(torch.float32)
     scale_buffer[pages, offsets] = scales.reshape(-1)
 
 
 def read_pooled_cache(buf, locations):
-    pages = torch.div(locations, 64, rounding_mode="floor").long()
-    offsets = locations.remainder(64).long()
+    index_page_size = pool4_cache_page_size(buf)
+    pages = torch.div(locations, index_page_size, rounding_mode="floor").long()
+    offsets = locations.remainder(index_page_size).long()
     columns = offsets[:, None] * 128 + torch.arange(128, device=buf.device)[None, :]
     keys = buf[pages[:, None], columns].contiguous().view(torch.float8_e4m3fn)
-    scales = buf[:, 8192:].view(torch.float32)[pages, offsets]
+    scales = buf[:, index_page_size * 128 :].view(torch.float32)[pages, offsets]
     return keys, scales
 
 
@@ -120,6 +130,7 @@ class SM70IndexerKPool(IndexerKPool):
         weights = head_weights * query_scale.squeeze(-1)
         pool = get_token_to_kv_pool()
         buffer = pool.get_index_k_with_scale_buffer(layer_id)
+        index_page_size = pool4_cache_page_size(buffer)
         tail_k, tail_s = pool.get_compress_tail_buffers(layer_id)
         table = get_req_to_token_pool().req_to_token
         if mode.is_decode():
@@ -135,6 +146,7 @@ class SM70IndexerKPool(IndexerKPool):
                 forward_batch.seq_lens,
                 self.scale_fmt is not None,
                 retain_closed_tail=tail_k.shape[1] > 4,
+                token_page_size=pool.page_size,
             )
             if not return_indices:
                 return None
@@ -193,7 +205,15 @@ class SM70IndexerKPool(IndexerKPool):
                 )
                 ids = prefix // 4 + torch.arange(closed, device=x.device)
                 write_pooled_cache(
-                    buffer, pooled_locations(token_table, ids), compressed, scales
+                    buffer,
+                    pooled_locations(
+                        token_table,
+                        ids,
+                        token_page_size=pool.page_size,
+                        index_page_size=index_page_size,
+                    ),
+                    compressed,
+                    scales,
                 )
             remainder = seq_len % 4
             if remainder:
@@ -209,7 +229,13 @@ class SM70IndexerKPool(IndexerKPool):
                 max_pools = seq_len // 4
                 ids = torch.arange(max_pools, device=x.device)
                 cached_keys, cached_scales = read_pooled_cache(
-                    buffer, pooled_locations(token_table, ids)
+                    buffer,
+                    pooled_locations(
+                        token_table,
+                        ids,
+                        token_page_size=pool.page_size,
+                        index_page_size=index_page_size,
+                    ),
                 )
                 for start in range(0, count, 32):
                     stop = min(start + 32, count)
@@ -293,6 +319,7 @@ class SM70IndexerKPool(IndexerKPool):
             lengths,
             effective_num_tokens=plan.effective_n_per_batch,
             round_scale=self.scale_fmt is not None,
+            token_page_size=pool.page_size,
         )
         if not return_indices:
             return None

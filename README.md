@@ -6,7 +6,7 @@ SXM2 GPUs arranged as two NVLink quads. We rebuilt the compatibility work from
 selectively porting its kernels into plugin hooks and shared operators. This
 is effectively a rebase of the useful hardware adaptations into an independent
 fork, with a smaller surface for future upstream updates. The integrated
-upstream revision is `affa261e3d28`; exact origins and revisions are recorded in
+upstream revision is `c892301ff76f`; exact origins and revisions are recorded in
 [v100_plus/provenance.json](v100_plus/provenance.json).
 
 ## Architecture and scope

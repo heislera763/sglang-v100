@@ -109,12 +109,20 @@ def model_forward(original, self, input_ids, positions, forward_batch, *args, **
         return result
 
 
-def prepare_attention(original, self, hidden_states, residual, forward_batch, **kwargs):
+def prepare_attention(original, self, hidden_states, forward_batch, ple_batch):
     partition = _slot().get()
     if (
         partition is not None
         and self.ple is not None
         and hidden_states.shape[0] == partition.local_rows
     ):
-        hidden_states = gather_input(hidden_states)
-    return original(self, hidden_states, residual, forward_batch, **kwargs)
+        from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+
+        # PLE consumes a completed FFN write. Transfer it through the boundary
+        # accessor so gathering does not leave a stale written-residual identity
+        # or discard an outstanding producer contribution.
+        hidden_states = residual_batch.take_output(hidden_states, forward_batch)
+        hidden_states = residual_batch.set_written(
+            gather_input(hidden_states), forward_batch
+        )
+    return original(self, hidden_states, forward_batch, ple_batch)

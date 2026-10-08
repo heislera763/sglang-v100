@@ -55,7 +55,9 @@ class TestEaglePrefillProposal(CustomTestCase):
         worker.topk = 1
         with (
             get_context().override_server_args(speculative_use_rejection_sampling=True),
-            envs.SGLANG_OPT_USE_GUMBEL_SAMPLE.override(True),
+            # Mainline's Gumbel argmax is a GPU kernel. Exercise the real
+            # Torch sampler here so this CPU regression stays device-independent.
+            envs.SGLANG_OPT_USE_GUMBEL_SAMPLE.override(False),
             patch(
                 "sglang.srt.speculative.eagle_worker_v2.ForwardBatch.init_new",
                 return_value=SimpleNamespace(forward_mode=ForwardMode.EXTEND),
