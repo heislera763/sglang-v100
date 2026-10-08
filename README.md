@@ -23,8 +23,9 @@ The integrated upstream revision is `c892301ff76f`; see
   embeddings; GLM sparse MLA/K-pool indexing, KDA and mHC. Qwen FP8 PP2 adds
   vector experts for ordinary and MTP decode, block-scale reuse, partitioned HC
   prefill, masked Tensor Core sparse attention and GPU metadata graphs. Sampled
-  MTP keeps exact draft probabilities locally, packs small PP result tensors
-  and retains Tensor Core attention for target and draft prompt prefill.
+  MTP keeps exact draft probabilities locally, packs nested PP result tensors
+  for both models and retains Tensor Core Qwen target/draft prompt attention.
+  Qwen's two-step PP2 profile also captures accepted recurrent/PLE state copies.
 - **Upstream maintenance:** adapters live in `v100_plus/sglang_v100_plus/`;
   shared operators live in `python/sglang/kernels/ops/`; native builds and Marlin
   patches live in `v100_plus/aot/` and `v100_plus/patches/`. Keep host services,
@@ -128,6 +129,9 @@ uv run --no-project .venv/bin/python -m sglang_v100_plus "${sglang_args[@]}" \
 For FP8 TP8, use TP8/EP8, omit PP and unset the partition/HC/metadata flags.
 For FP8 PP2 MTP, keep HC/metadata flags and 4096-token chunks, set
 `SGLANG_ENABLE_PP_SPEC=1` and add Qwen's two-step speculative arguments above.
+The metadata flag also enables the tested first-stage commit graph, with live
+request/acceptance buffers refreshed each round; tracking and broader batching
+keep eager commits. Both TP4 groups use their quad's NVLink peers and CPU socket.
 The current sampled profile improves generation roughly11% over ordinary
 decode; prefill remains slower because the draft also processes the prompt.
 The JSON language-only override skips vision loading; Qwen's CLI `--language-only`
@@ -177,8 +181,8 @@ An FP8 GLM target cannot fit fully resident: routed experts alone need 283.5 GiB
 Eight V100 SXM2 32 GB GPUs, fan control corrected, concurrency one, coherent
 near-8K prompts and 512 sampled output tokens. Rates divide total native tokens
 by total execution time: prefill uses the prefill interval; generation excludes
-the first token. Excluded warmups, no cached input or retractions. **A**, **D**
-and **E** are nine-request confirmations; **C** is a three-request smoke check.
+the first token. Excluded warmups, no cached input or retractions. **A**, **D**,
+**E** and **F** are nine-request confirmations; **C** is a three-request smoke check.
 Rows from different revisions are not a controlled attribution of an upstream gain.
 
 | Checkpoint / layout | MTP steps | Prefill tokens/s | Generation tokens/s | Evidence |
@@ -186,9 +190,9 @@ Rows from different revisions are not a controlled attribution of an upstream ga
 | Qwen NVFP4 / TP4 | Off | 3,712 | 70.1 | A |
 | Qwen NVFP4 / TP4 | 2 | 3,387 | 99.1 | A |
 | GLM NVFP4 / TP4×PP2 | Off | 1,719 | 24.8 | A |
-| GLM NVFP4 / TP4×PP2 | 3 | 1,579 | 30.3 | A |
+| GLM NVFP4 / TP4×PP2 | 3 | 1,593 | 36.1 | F |
 | Qwen FP8 / TP4×PP2 + EP4 | Off | 6,989 | 60.8 | D |
-| Qwen FP8 / TP4×PP2 + EP4 | 2 | 6,585 | 66.1 | E |
+| Qwen FP8 / TP4×PP2 + EP4 | 2 | 6,657 | 69.3 | F |
 | GLM NVFP4 / TP8 | Off | 1,163 | 39.6 | C |
 | GLM NVFP4 / TP8 | 3 | 1,084 | 37.5 | C |
 
@@ -196,9 +200,10 @@ Runtime revisions: **A** [`cf7f7e9f`](https://github.com/heislera763/sglang-v100
 **C** [`c7442393`](https://github.com/heislera763/sglang-v100-plus/commit/c7442393),
 **D** [`5c019a9a`](https://github.com/heislera763/sglang-v100-plus/commit/5c019a9a),
 **E** [`6f211dc6`](https://github.com/heislera763/sglang-v100-plus/commit/6f211dc61251952a88d0476a13565c5c05dcf95a),
+**F** [`9212de6d`](https://github.com/heislera763/sglang-v100-plus/commit/9212de6ddcac40b7a4617782d9e98a395d618076),
 2026-10-07/08, Torch `2.13.0+cu126`. Table rows use eager prefill/full batch-one
 decode, strict dispatch, no overlap/radix cache, context/cache 12288 and
-2048-token chunks; D/E use 4096-token chunks, HC partitioning and metadata graphs.
+2048-token chunks; Qwen FP8 D/E/F use 4096-token chunks, HC partitioning and metadata graphs.
 FP8 expert checks include independent FP16 references and exact batched-versus-row
 comparisons. MTP's retained proposal probabilities passed native bit comparisons;
 packed results preserve typed field bits and CUDA event ordering. Native protocol
@@ -209,6 +214,15 @@ matched before/after runs improve 6,165→6,585 prefill tokens/s (+6.8%), with
 generation unchanged at 66.1. All 468 native target/draft attention comparisons
 pass the established FP16 tolerances (rtol=.005, atol=.003); selected keys stay
 unchanged. These checks establish bounded numerical agreement, not bit equality.
+
+F improves sampled PP2 generation: Qwen **66.0→69.3 (+5.1%)**, GLM
+**31.7→36.1 (+13.9%)**, with unchanged prefill. Qwen alternates nine eager/nine
+commit-graph requests on one warmed model; GLM uses nine requests per transport.
+All 80 native Qwen state comparisons and 712 GLM proposal comparisons pass
+bitwise, alongside packed-field/event and EOS/logprob/cancel/reuse checks.
+GLM's nested CUDA logprobs now travel as tensors instead of restoring pickled
+storage on the sender's GPU. PP2 prefill stages already overlap; its scheduler
+overlap restriction remains, and prefill graphs gave no advantage in our screen.
 
 Inputs: [NVIDIA SPEED-Bench `throughput_8k`](https://huggingface.co/datasets/nvidia/SPEED-Bench/tree/454f88454792dfa3ccfd7ef15fff248efde44cd1),
 revision `454f88454792dfa3ccfd7ef15fff248efde44cd1`. First turns of
