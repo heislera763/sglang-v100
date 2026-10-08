@@ -30,12 +30,20 @@ class Partition:
 
     @property
     def local_rows(self):
-        return self.rows // self.size
+        return (self.rows + self.size - 1) // self.size
 
     def local(self, x):
         if x.shape[0] == self.rows:
             start = self.rank * self.local_rows
-            return x[start : start + self.local_rows].contiguous()
+            local = x[start : start + self.local_rows].contiguous()
+            if local.shape[0] != self.local_rows:
+                import torch.nn.functional as F
+
+                # Only replicated HC work is padded. Gather trims these rows
+                # before attention, causal PLE, PP output or final logits.
+                pad = (0, 0) * (x.ndim - 1) + (0, self.local_rows - local.shape[0])
+                local = F.pad(local, pad)
+            return local
         if x.shape[0] != self.local_rows:
             raise ValueError("HC rows do not match the prefill token partition")
         return x
@@ -69,7 +77,10 @@ def gather_input(x):
         return x
     if x.shape[0] != partition.local_rows:
         raise ValueError("HC gather requires one rank's token partition")
-    return get_parallel().attn_tp_group.all_gather(x.contiguous(), dim=0)
+    gathered = get_parallel().attn_tp_group.all_gather(x.contiguous(), dim=0)
+    return (
+        gathered if gathered.shape[0] == partition.rows else gathered[: partition.rows]
+    )
 
 
 def _partition(self, input_ids, forward_batch):
@@ -79,7 +90,6 @@ def _partition(self, input_ids, forward_batch):
         and in_prefill()
         and forward_batch.forward_mode.is_extend()
         and input_ids.shape[0] >= 256
-        and input_ids.shape[0] % 4 == 0
         and forward_batch.batch_size == 1
         and self.hc_count == 4
         and self.hidden_size == 2560

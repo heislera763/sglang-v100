@@ -176,6 +176,33 @@ def fp8_marlin_scalar_type(original, num_bits, has_zp, scales=None, global_scale
     return original(num_bits, has_zp, scales, global_scale)
 
 
+def fp8_route_block_size(original, hidden, ids, w1, w2, scales):
+    """Align Qwen prefill routes to the native kernel's 32-row CTA."""
+    from sglang.srt.runtime_context import get_parallel, get_schedule
+
+    from .kernels.moe_marlin import _sm70_marlin_user_tuning
+
+    if (
+        not _sm70_marlin_user_tuning
+        and get_schedule().disable_overlap_schedule
+        and get_schedule().max_running_requests == 1
+        and get_parallel().tp_size == get_parallel().ep_size == 4
+        and get_parallel().pp_size == 2
+        and hidden.dtype == scales.dtype == torch.float16
+        and hidden.is_cuda
+        and hidden.ndim == 2
+        and hidden.shape[0] >= 128
+        and hidden.shape[1] == 2560
+        and ids.shape == (hidden.shape[0], 10)
+        and ids.dtype == torch.int32
+        and tuple(w1.shape) == (128, 160, 5120)
+        and tuple(w2.shape) == (128, 40, 10240)
+        and getattr(scales, "_sm70_fp8_scale", False)
+    ):
+        return 32
+    return original(hidden, ids, w1, w2, scales)
+
+
 def apply_fp8_moe(original, method, layer, dispatch_output):
     from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput

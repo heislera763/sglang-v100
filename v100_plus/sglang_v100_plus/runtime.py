@@ -37,6 +37,7 @@ def install():
         create_fp8_moe_runner,
         fp8_marlin_scalar_type,
         fp8_minimum_capability,
+        fp8_route_block_size,
         prepare_fp8_dense,
         prepare_fp8_moe,
     )
@@ -135,6 +136,11 @@ def install():
         (
             "sglang.srt.speculative.spec_utils.commit_mamba_states_after_verify",
             commit_relayed_states,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe.select_marlin_moe_block_size",
+            fp8_route_block_size,
             HookType.AROUND,
         ),
         (

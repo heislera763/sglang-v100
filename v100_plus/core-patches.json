@@ -15,6 +15,7 @@
     "python/sglang/srt/environ.py": "Typed SM70 optimization switches, HC prefill partitioning and strict V100 dispatch diagnostics.",
     "python/sglang/srt/layers/attention/dsa/dsa_indexer_kpool.py": "Dispatch supported SM70 K-pool/indexer decode operations.",
     "python/sglang/srt/layers/attention/dsa_backend.py": "Allocate and dispatch Volta-compatible FP16 sparse attention/indexer paths.",
+    "python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py": "Expose route-alignment selection so the plugin can match the native GEMM row tile; the default policy is unchanged.",
     "python/sglang/srt/managers/scheduler_pp_mixin.py": "Relay exact draft probabilities into sampled PP verification; cold rows fall back to target sampling.",
     "python/sglang/srt/managers/utils.py": "Carry proposal probabilities with the next PP verification tree.",
     "python/sglang/srt/mem_cache/qsa_kv_pool.py": "FP16 QSA index-cache allocation and safe dtype validation.",

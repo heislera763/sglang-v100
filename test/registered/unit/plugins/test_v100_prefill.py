@@ -26,6 +26,52 @@ with patch.object(
 
 
 class TestV100Prefill(CustomTestCase):
+    def test_fp8_route_alignment_matches_native_tile_and_preserves_other_profiles(self):
+        """Only the whole-expert FP8/EP4 profile may replace generic route alignment."""
+        from sglang_v100_plus.fp8 import fp8_route_block_size
+
+        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+            select_marlin_moe_block_size,
+        )
+
+        hidden = SimpleNamespace(
+            shape=(4352, 2560), ndim=2, dtype=torch.float16, is_cuda=True
+        )
+        ids = SimpleNamespace(shape=(4352, 10), dtype=torch.int32)
+        w1 = SimpleNamespace(shape=(128, 160, 5120))
+        w2 = SimpleNamespace(shape=(128, 40, 10240))
+        scales = SimpleNamespace(dtype=torch.float16, _sm70_fp8_scale=True)
+        fields = dict(
+            model_path="dummy",
+            tp_size=4,
+            ep_size=4,
+            pp_size=2,
+            max_running_requests=1,
+            disable_overlap_schedule=True,
+        )
+        for changes, tuning, tagged, expected in (
+            ({}, False, True, 32),
+            ({"ep_size": 1}, False, True, 64),
+            ({"tp_size": 8}, False, True, 64),
+            ({"pp_size": 1}, False, True, 64),
+            ({"max_running_requests": 2}, False, True, 64),
+            ({}, True, True, 64),
+            ({}, False, False, 64),
+        ):
+            with (
+                self.subTest(changes=changes, tuning=tuning, tagged=tagged),
+                get_context().override_server_args(**(fields | changes)),
+                patch(
+                    "sglang_v100_plus.kernels.moe_marlin._sm70_marlin_user_tuning",
+                    tuning,
+                ),
+            ):
+                scales._sm70_fp8_scale = tagged
+                actual = fp8_route_block_size(
+                    select_marlin_moe_block_size, hidden, ids, w1, w2, scales
+                )
+                self.assertEqual(actual, expected)
+
     def test_dflash_residual_addition_does_not_overflow_before_norm(self):
         norm = SM70DFlashResidualNorm(
             SimpleNamespace(
@@ -192,11 +238,11 @@ class TestV100Prefill(CustomTestCase):
                 ):
                     for rows in (128, 256, 257):
                         actual = prefill._partition(owner, torch.empty(rows), batch)
-                        if rows == 256 and changes in (
+                        if rows >= 256 and changes in (
                             {},
                             {"speculative_algorithm": "EAGLE"},
                         ):
-                            self.assertEqual(actual, prefill.Partition(256, 2))
+                            self.assertEqual(actual, prefill.Partition(rows, 2))
                         else:
                             self.assertIsNone(actual)
 
@@ -232,6 +278,40 @@ class TestV100Prefill(CustomTestCase):
             ):
                 raise RuntimeError("failed forward")
             self.assertIs(prefill.gather_input(full), full)
+
+    def test_ragged_partitions_pad_only_hc_and_trim_before_consumers(self):
+        """Equal collective counts must retain every real row, including short tails."""
+        with get_context().override_server_args(model_path="dummy"):
+            for rows in (257, 325, 3994, 4165):
+                with self.subTest(rows=rows):
+                    full = torch.arange(rows * 12).reshape(rows, 4, 3)
+                    count = (rows + 3) // 4
+                    parts = [
+                        prefill.Partition(rows, rank).local(full) for rank in range(4)
+                    ]
+                    padded = torch.cat(parts)
+                    self.assertEqual(padded.shape[0], 4 * count)
+                    torch.testing.assert_close(padded[:rows], full, rtol=0, atol=0)
+                    self.assertTrue(
+                        torch.equal(padded[rows:], torch.zeros_like(padded[rows:]))
+                    )
+
+                    class Group:
+                        def all_gather(_, value, dim):
+                            self.assertEqual(dim, 0)
+                            self.assertEqual(value.shape[0], count)
+                            return padded
+
+                    for rank, part in enumerate(parts):
+                        with (
+                            get_parallel().override(attn_tp_group=Group()),
+                            prefill.partition_scope(prefill.Partition(rows, rank)),
+                        ):
+                            self.assertIs(prefill.local_input(part), part)
+                            torch.testing.assert_close(
+                                prefill.gather_input(part), full, rtol=0, atol=0
+                            )
+        self.assertIs(prefill.gather_input(full), full)
 
     def test_inactive_forwards_hide_parent_partition_and_restore_it(self):
         """A decode/nested inactive call cannot inherit the previous prefill's rows."""

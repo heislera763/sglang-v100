@@ -146,6 +146,15 @@ def swiglu_gpt_oss_sigmoid_alpha_contiguous(
     output.copy_(gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1))
 
 
+def select_marlin_moe_block_size(hidden_states, topk_ids, w1, w2, w1_scale):
+    """Select route alignment separately from the GEMM kernel's row tile."""
+    M, E, topk = hidden_states.shape[0], w1.shape[0], topk_ids.shape[1]
+    for block_size_m in [8, 16, 32, 48, 64]:
+        if M * topk / E / block_size_m < 0.9:
+            break
+    return block_size_m
+
+
 @register_custom_op(out_shape="hidden_states")
 def fused_marlin_moe(
     hidden_states: torch.Tensor,
@@ -250,11 +259,9 @@ def fused_marlin_moe(
     topk = topk_ids.shape[1]
     gemm1_n = 2 * N if is_gated else N
 
-    # M block size selection logic
-    # TODO: tune this further for specific models
-    for block_size_m in [8, 16, 32, 48, 64]:
-        if M * topk / E / block_size_m < 0.9:
-            break
+    block_size_m = select_marlin_moe_block_size(
+        hidden_states, topk_ids, w1, w2, w1_scale
+    )
 
     if global_num_experts == -1:
         global_num_experts = E
