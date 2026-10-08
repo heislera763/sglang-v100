@@ -25,14 +25,10 @@ and pinned-host n-gram embeddings. GLM adds sparse MLA/K-pool indexing, KDA and
 mHC, with FP16 activations/residuals and FP32 indexer head weights/mHC parameters.
 Current measured profiles use eager prefill and batch-one decode graphs.
 
-| Branch | Purpose |
-| --- | --- |
-| `main` | Established Qwen and SM70 compatibility |
-| `glm-5.3-flash` | GLM compatibility and conservative operator paths |
-| `glm-5.3-flash-fast` | GLM speed work; floating-point reduction differences are accepted |
-| `qwen-3.8-flash-next-fp8` | Official Qwen FP8 checkpoint through SM70 W8A16 experts |
+`main` integrates Qwen NVFP4/FP8, GLM compatibility, MTP and the retained
+optimizations. Use it for all launch profiles below.
 
-On the fast branch, batch-one NVFP4 GEMV and fused mHC projection/RMS are on
+For supported shapes, batch-one NVFP4 GEMV and fused mHC projection/RMS are on
 by default for supported shapes. The checkpoint and model architecture stay
 fixed, but reduction order can change routing, logits and generated tokens.
 Operator references, finite-output checks and native model runs are development
@@ -301,7 +297,7 @@ Marlin extension and applies its checked-in patches.
 ```bash
 git clone https://github.com/heislera763/sglang-v100-plus.git
 cd sglang-v100-plus
-git switch glm-5.3-flash-fast
+git switch main
 bash v100_plus/setup.sh
 ```
 
@@ -424,8 +420,7 @@ artifacts stay outside this source repository.
 [v100_plus/core-patches.json](v100_plus/core-patches.json) enumerates the core
 exceptions. Verify maintained `main` with
 `uv run --no-project .venv/bin/python v100_plus/check-core-diff.py`.
-Update and validate `main` against upstream first, then integrate it into the
-GLM branches; integrate conservative GLM changes into the fast branch as well.
+Update and validate `main` against upstream before adding hardware optimizations.
 Prefer upstream implementations when equivalent fixes land. Keep hardware
 adaptations in the plugin/public operators, with focused tests and provenance,
 so an upstream update can review a small set of deliberate exceptions.
