@@ -20,9 +20,11 @@ The integrated upstream revision is `c892301ff76f`; see
   activations. Volta has no native FP8/FP4 Tensor Core arithmetic. KV FP8 formats
   use software conversion.
 - **Architecture coverage:** Qwen QSA/GDN, gated residuals and pinned-host PLE
-  embeddings; GLM sparse MLA/K-pool indexing, KDA and mHC. Qwen FP8 PP2 adds
-  vector experts for ordinary and MTP decode, block-scale reuse, ragged HC
-  prefill with padding trimmed before consumers, 32-row expert route alignment, masked Tensor Core sparse attention and GPU metadata graphs. Sampled
+  embeddings; GLM sparse MLA/K-pool indexing, KDA and mHC. Qwen FP8 uses vector
+  experts for compatible ordinary/MTP rows across TP/PP layouts; top-k for wide
+  vocabularies is shared with NVFP4. PP2 adds block-scale reuse, ragged HC
+  prefill with padding trimmed before consumers, 32-row expert route alignment,
+  masked Tensor Core sparse attention and GPU metadata graphs. Sampled
   MTP keeps exact draft probabilities locally, packs nested PP result tensors
   for both models and retains Tensor Core Qwen target/draft prompt attention.
   Qwen's two-step PP2 profile also captures accepted recurrent/PLE state copies.
@@ -92,10 +94,13 @@ does not instrument every upstream operation or guarantee the fastest kernel.
 
 ```bash
 export CUDA_VISIBLE_DEVICES=4,5,6,7
+unset SGLANG_PP_LAYER_PARTITION SGLANG_ENABLE_PP_SPEC
+unset SGLANG_OPT_SM70_HC_PREFILL_SP SGLANG_ENABLE_METADATA_GLUE_GRAPH
 uv run --no-project .venv/bin/python -m sglang_v100_plus "${sglang_args[@]}" \
   --model-path "$HOME/models/sglang/RadixArk-Qwen3.8-Flash-Next-NVFP4" \
   --served-model-name qwen3.8-flash-next --quantization modelopt_fp4 --fp4-gemm-backend marlin \
-  --tensor-parallel-size 4 --mem-fraction-static 0.88 --attention-backend triton \
+  --tensor-parallel-size 4 --mem-fraction-static 0.88 --chunked-prefill-size 4352 \
+  --json-model-override-args '{"language_model_only":true}' --attention-backend triton \
   --linear-attn-prefill-backend tilelang_v100 --linear-attn-decode-backend triton \
   --page-size 64 --kv-cache-dtype fp8_e5m2 --qsa-indexer-dtype float16 \
   --ple-offload-embedding --mamba-radix-cache-strategy extra_buffer \
@@ -184,16 +189,19 @@ coherent near-8K prompts and 512 output tokens, lab-recommended sampled thinking
 settings. Prefill is input tokens divided by native prefill duration; generation
 excludes the first token. Warmups, cached input and retractions are excluded.
 **A/F** and **G MTP** use nine-request confirmations; **C** and **G ordinary**
-are three-request checks. Rows from different revisions are not controlled A/Bs.
+are three-request checks. **H** compares six requests per TP8 variant and
+three per NVFP4 variant. Rows from different revisions are not controlled A/Bs.
 
 | Checkpoint / layout | MTP steps | Prefill tokens/s | Generation tokens/s | Evidence |
 | --- | ---: | ---: | ---: | :---: |
 | Qwen NVFP4 / TP4 | Off | 3,712 | 70.1 | A |
-| Qwen NVFP4 / TP4 | 2 | 3,387 | 99.1 | A |
+| Qwen NVFP4 / TP4 | 2 | 4,324 | 100.7 | H |
 | GLM NVFP4 / TP4×PP2 | Off | 1,719 | 24.8 | A |
 | GLM NVFP4 / TP4×PP2 | 3 | 1,593 | 36.1 | F |
 | Qwen FP8 / TP4×PP2 + EP4 | Off | 8,092 | 61.6 | G |
 | Qwen FP8 / TP4×PP2 + EP4 | 2 | 7,609 | 70.6 | G |
+| Qwen FP8 / TP8 + EP8 | Off | 4,183 | 51.0 | H |
+| Qwen FP8 / TP8 + EP8 | 2 | 4,012 | 75.0 | H |
 | GLM NVFP4 / TP8 | Off | 1,163 | 39.6 | C |
 | GLM NVFP4 / TP8 | 3 | 1,084 | 37.5 | C |
 
@@ -201,9 +209,18 @@ Runtime revisions: **A** [`cf7f7e9f`](https://github.com/heislera763/sglang-v100
 **C** [`c7442393`](https://github.com/heislera763/sglang-v100-plus/commit/c7442393),
 **F** [`9212de6d`](https://github.com/heislera763/sglang-v100-plus/commit/9212de6ddcac40b7a4617782d9e98a395d618076),
 **G** [`d1d93041`](https://github.com/heislera763/sglang-v100-plus/commit/d1d93041f4bf78e13c49bb752fb6c1384c306527),
+**H** [`e054ff4d`](https://github.com/heislera763/sglang-v100-plus/commit/e054ff4d072616ec5678683adcf14c65e377e17d),
 2026-10-07/08, Torch `2.13.0+cu126`. Eager prefill/full batch-one decode,
 strict dispatch, no overlap/radix, context/cache 12288. A/C/F GLM use 2048-token
-chunks; G Qwen FP8 uses 4352, HC partitioning and metadata graphs.
+chunks; G Qwen FP8 uses 4352, HC partitioning and metadata graphs. H uses
+4352 on TP8 and NVFP4 TP4, without HC partitioning or metadata graphs. On TP8,
+dispatch by tensor geometry improves ordinary generation **36.2→51.0 (+41.0%)**
+and two-step MTP
+**61.2→75.0 (+22.5%)**; prefill stays flat. Numerical masks, cutoff ties,
+FP64 normalization, high expert indices and refreshed CUDA graph inputs pass;
+FP8 scale/activation boundaries are unchanged. The three-prompt NVFP4 top-k
+check gives **97.8→100.7** generation tokens/s at matching settings; treat this
+smaller gain as preliminary.
 
 G retains two matched prefill gains: ragged HC plus chunk selection
 **6,612→7,359 (+11.3%)**, then expert route alignment **7,370→7,609 (+3.2%)**.
@@ -216,8 +233,8 @@ G MTP category means (three requests each):
 | Category | Prefill tokens/s | Generation tokens/s |
 | --- | ---: | ---: |
 | Coding | 7,647 | 74.4 |
-| QA / book continuation | 7,648 | 67.6 |
-| Writing / briefing | 7,532 | 69.9 |
+| Book continuation | 7,648 | 67.6 |
+| Document briefing | 7,532 | 69.9 |
 
 Benchmark tooling and raw responses stay outside Git.
 
