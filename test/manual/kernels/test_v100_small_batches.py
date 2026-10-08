@@ -1,4 +1,4 @@
-"""Three-row kernels must preserve the validated four-row arithmetic."""
+"""Small-batch projections, HC gates and draft caches on SM70."""
 
 import sys
 import unittest
@@ -16,7 +16,7 @@ with patch.object(
 ):
     from sglang_v100_plus.dispatch import V100FallbackError
     from sglang_v100_plus.kernels import gemm, sm70_hc_mix
-    from sglang_v100_plus.runtime import apply_unquant
+    from sglang_v100_plus.runtime import apply_unquant, store
 
 
 @unittest.skipUnless(
@@ -24,6 +24,125 @@ with patch.object(
     "Requires a V100",
 )
 class TestV100SmallBatches(CustomTestCase):
+    def test_dflash_output_convolution_keeps_range_until_residual_norm(self):
+        from sglang_v100_plus.dflash import SM70DFlashGroupedConv
+
+        conv = SM70DFlashGroupedConv(16, 8, 2, 16).cuda().half()
+        conv.base_kernel.data.fill_(2.0)
+        hidden = torch.full((16, 16), 2048.0, device="cuda", dtype=torch.float16)
+        coefficients = torch.full((16, 2, 1), 63.0, device="cuda", dtype=torch.float16)
+        conv.finish(hidden, coefficients)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = conv.finish(hidden, coefficients)
+        for value in (2048.0, 1024.0):
+            hidden.fill_(value)
+            graph.replay()
+            expected = torch.full(
+                (16, 16), 2 * 65 * value, device="cuda", dtype=torch.float32
+            )
+            expected[::8] = 65 * value
+            self.assertEqual(output.dtype, torch.float32)
+            torch.testing.assert_close(output, expected, rtol=0, atol=0)
+            self.assertTrue(torch.isfinite(output).all())
+
+    def test_dflash_topk_graph_reads_fresh_logits(self):
+        from sglang_v100_plus.dflash import candidate_topk
+
+        def forbidden_backend(*args):
+            self.fail("Volta candidate selection must not delegate to FlashInfer")
+
+        for dtype in (torch.float16, torch.float32):
+            with self.subTest(dtype=dtype), torch.inference_mode():
+                scores = torch.full((8, 19360), -4096.0, device="cuda", dtype=dtype)
+                rows = torch.arange(8, device="cuda")[:, None]
+                positions = torch.arange(16, device="cuda")[None, :] * 1024
+                values = torch.arange(16, device="cuda", dtype=dtype)[None, :].expand(
+                    8, -1
+                )
+                scores[rows, positions.expand(8, -1)] = values
+                candidate_topk(forbidden_backend, scores, 16)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    actual_values, actual_ids = candidate_topk(
+                        forbidden_backend, scores, 16
+                    )
+                for shift in (5, 91):
+                    scores.fill_(-4096)
+                    expected_ids = (positions + rows * 37 + shift).expand(8, -1)
+                    scores[rows, expected_ids] = values
+                    graph.replay()
+                    torch.testing.assert_close(
+                        actual_values, values.flip(-1), rtol=0, atol=0
+                    )
+                    self.assertTrue(torch.equal(actual_ids, expected_ids.flip(-1)))
+
+    def test_fp16_draft_cache_preserves_strided_rows_and_graph_replay(self):
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+        with torch.inference_mode():
+            pool = MHATokenToKVPool(
+                size=64,
+                page_size=64,
+                dtype=torch.float16,
+                head_num=1,
+                head_dim=128,
+                layer_num=1,
+                device="cuda",
+                enable_memory_saver=False,
+                enable_alt_stream=False,
+            )
+            pool.k_buffer[0].zero_()
+            pool.v_buffer[0].zero_()
+            qkv = torch.randn(8, 768, device="cuda", dtype=torch.float16)
+            key = qkv[:, 512:640].view(8, 1, 128)
+            value = qkv[:, 640:].view(8, 1, 128)
+            self.assertFalse(key.is_contiguous())
+            locations = torch.arange(8, device="cuda", dtype=torch.int64)
+            layer = SimpleNamespace(layer_id=0)
+            k_scale = torch.tensor(2.0, device="cuda")
+            v_scale = torch.tensor(3.0, device="cuda")
+
+            def write():
+                return store(
+                    MHATokenToKVPool.set_kv_buffer,
+                    pool,
+                    layer,
+                    locations,
+                    key,
+                    value,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                )
+
+            write()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                write()
+            expected_k, expected_v = pool.k_buffer[0].clone(), pool.v_buffer[0].clone()
+            for start in (0, 17, 41):
+                qkv.normal_()
+                key[..., 0] = 0.0
+                key[..., 1] = -0.0
+                value[..., 0] = 2**-24
+                locations.copy_(torch.arange(start, start + 8, device="cuda"))
+                graph.replay()
+                # Slot 0 is reserved graph padding and the primary CUDA writer
+                # skips it, including during capture/warmup.
+                live = locations != 0
+                expected_k[locations[live]] = key[live]
+                expected_v[locations[live]] = value[live]
+                self.assertTrue(
+                    torch.equal(
+                        pool.k_buffer[0].view(torch.int16), expected_k.view(torch.int16)
+                    )
+                )
+                self.assertTrue(
+                    torch.equal(
+                        pool.v_buffer[0].view(torch.int16), expected_v.view(torch.int16)
+                    )
+                )
+
     def test_glm_primary_projection_routes_preserve_fp32(self):
         def forbidden_fallback(*args):
             self.fail("Declared GLM projections must not delegate dispatch")
@@ -32,8 +151,13 @@ class TestV100SmallBatches(CustomTestCase):
             envs.SGLANG_DEBUG_V100_STRICT_DISPATCH.override(True),
             torch.inference_mode(),
         ):
-            for rows in (1, 6):
-                for n, dtype in ((3336, torch.float16), (32, torch.float32)):
+            for rows in (1, 6, 8):
+                for n, dtype in (
+                    (3336, torch.float16),
+                    (32, torch.float32),
+                    (768, torch.float16),
+                    (3072, torch.float16),
+                ):
                     x = torch.randn(rows, 4096, device="cuda", dtype=dtype)
                     weight = torch.randn(n, 4096, device="cuda", dtype=dtype) * 0.02
                     actual = apply_unquant(

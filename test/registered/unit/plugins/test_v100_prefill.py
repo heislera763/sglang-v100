@@ -20,11 +20,47 @@ with patch.object(
     sys, "path", [str(Path(__file__).resolve().parents[4] / "v100_plus"), *sys.path]
 ):
     from sglang_v100_plus import prefill
+    from sglang_v100_plus.dflash import SM70DFlashResidualNorm, forward_draft
     from sglang_v100_plus.dispatch import prefill_scope
     from sglang_v100_plus.hc_state import SM70GatedResidualState
 
 
 class TestV100Prefill(CustomTestCase):
+    def test_dflash_residual_addition_does_not_overflow_before_norm(self):
+        norm = SM70DFlashResidualNorm(
+            SimpleNamespace(
+                weight=torch.nn.Parameter(torch.ones(4, dtype=torch.float16)),
+                variance_epsilon=1e-5,
+            )
+        )
+        x = torch.full((2, 4), 65504.0, dtype=torch.float16)
+        self.assertFalse(torch.isfinite(x + x).all())
+        output, residual = norm(x, x)
+        self.assertEqual(residual.dtype, torch.float32)
+        torch.testing.assert_close(
+            residual, torch.full((2, 4), 131008.0), rtol=0, atol=0
+        )
+        torch.testing.assert_close(output, torch.ones_like(x), rtol=0, atol=0)
+
+    def test_dflash_eager_entry_keeps_fp16_embedding_bits(self):
+        embeddings = torch.tensor(
+            [[1.0009765625, 1.0029296875, -1.0009765625]], dtype=torch.float16
+        )
+        rounded = embeddings.bfloat16()
+        self.assertFalse(torch.equal(rounded.half(), embeddings))
+        batch = SimpleNamespace(input_embeds=embeddings)
+        actual = forward_draft(
+            lambda owner, ids, positions, fb, input_embeds: input_embeds,
+            None,
+            None,
+            None,
+            batch,
+            input_embeds=rounded,
+        )
+        self.assertTrue(
+            torch.equal(actual.view(torch.int16), embeddings.view(torch.int16))
+        )
+
     def test_boundary_keeps_each_stages_cached_gate_and_clears_it(self):
         residual = torch.arange(4 * 12, dtype=torch.float32).reshape(4, 12)
         gate_a, gate_b = torch.full((4, 3), 2.0), torch.full((4, 3), 3.0)

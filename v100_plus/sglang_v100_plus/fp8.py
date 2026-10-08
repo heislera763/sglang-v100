@@ -13,6 +13,89 @@ def fp8_minimum_capability(original, config):
     return 70
 
 
+def prepare_fp8_dense(original, method, layer):
+    from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+        fp8_fused_exponent_bias_into_scales,
+    )
+    from sglang.srt.layers.utils import copy_or_rebind_param
+
+    from .quantization import _dense_repack
+
+    if (
+        method.use_mxfp8
+        or method.weight_block_size != [128, 128]
+        or not method.quant_config.is_checkpoint_fp8_serialized
+        or layer.orig_dtype != torch.float16
+        or getattr(layer, "bias", None) is not None
+    ):
+        raise ValueError(
+            "SM70 dense FP8 requires serialized 128x128 blocks, FP16 and no bias"
+        )
+    weight, block_scales = layer.weight, layer.weight_scale_inv
+    n, k = layer.output_size_per_partition, layer.input_size_per_partition
+    if (
+        weight.dtype != torch.float8_e4m3fn
+        or tuple(weight.shape) != (n, k)
+        or n % 128
+        or k % 128
+        or tuple(block_scales.shape) != (n // 128, k // 128)
+    ):
+        raise ValueError(
+            "SM70 dense FP8 dimensions must preserve complete 128x128 blocks"
+        )
+    # The SM70 iterator consumes logical [K/group,N] scales, unlike the
+    # SM80 dense Marlin wrapper's permuted scale layout.
+    scales = fp8_fused_exponent_bias_into_scales(
+        block_scales.T.repeat_interleave(128, dim=1).to(torch.float16)
+    )
+    if not bool(torch.isfinite(scales).all()):
+        raise ValueError("SM70 dense FP8 scales overflow FP16")
+    copy_or_rebind_param(layer, "weight", _dense_repack(weight[None], num_bits=8)[0])
+    copy_or_rebind_param(layer, "weight_scale_inv", scales)
+    layer.workspace = torch.zeros(
+        torch.cuda.get_device_properties(weight.device).multi_processor_count * 4,
+        device=weight.device,
+        dtype=torch.int32,
+    )
+    layer._sm70_fp8_dense_ready = True
+
+
+def apply_fp8_dense(original, method, layer, x, bias=None):
+    from sglang.srt.layers.quantization.utils import get_scalar_types
+
+    from .quantization import dense_marlin_gemm
+
+    if not getattr(layer, "_sm70_fp8_dense_ready", False) or (
+        x.dtype != torch.float16 or not x.is_cuda or bias is not None
+    ):
+        raise ValueError(
+            "SM70 dense FP8 requires prepared weights and FP16 activations"
+        )
+    a = x.reshape(-1, x.shape[-1]).contiguous()
+    n, k = layer.output_size_per_partition, layer.input_size_per_partition
+    if a.shape[1] != k:
+        raise ValueError(
+            "SM70 dense FP8 activation width does not match the checkpoint"
+        )
+    output = dense_marlin_gemm(
+        None,
+        a,
+        None,
+        layer.weight,
+        layer.weight_scale_inv,
+        None,
+        None,
+        None,
+        None,
+        layer.workspace,
+        get_scalar_types()[1].float8_e4m3fn,
+        a.shape[0],
+        n,
+        k,
+    )
+    return output.reshape(*x.shape[:-1], n)
+
+
 def _validate(method):
     from sglang.srt.layers.moe import get_moe_runner_backend
 

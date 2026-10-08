@@ -257,7 +257,7 @@ def test_device_pool4_replays_lengths_requests_and_page_boundaries(
         assert torch.equal(tail_g, reference_g)
 
 
-@pytest.mark.parametrize("num_draft_tokens", [2, 6])
+@pytest.mark.parametrize("num_draft_tokens", [2, 6, 8])
 @pytest.mark.parametrize("round_scale", [False, True])
 @pytest.mark.parametrize("use_graph", [False, True])
 @pytest.mark.parametrize("use_effective", [False, True])

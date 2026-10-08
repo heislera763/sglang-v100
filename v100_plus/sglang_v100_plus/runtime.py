@@ -24,11 +24,19 @@ def install():
     from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
+    from .dflash import (
+        SM70DFlashGroupedConv,
+        candidate_topk,
+        forward_draft,
+        initialize_draft,
+    )
     from .fp8 import (
+        apply_fp8_dense,
         apply_fp8_moe,
         create_fp8_moe_runner,
         fp8_marlin_scalar_type,
         fp8_minimum_capability,
+        prepare_fp8_dense,
         prepare_fp8_moe,
     )
     from .pipeline import initialize_local_output, receive_output, send_output
@@ -68,6 +76,26 @@ def install():
 
     hooks = [
         (
+            "sglang.srt.models.dflash.DFlashGroupedConv",
+            SM70DFlashGroupedConv,
+            HookType.REPLACE,
+        ),
+        (
+            "sglang.srt.models.dflash._radix_topk",
+            candidate_topk,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.models.dflash.DFlash2DraftModel.__init__",
+            initialize_draft,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.models.dflash.DFlashDraftModel.forward",
+            forward_draft,
+            HookType.AROUND,
+        ),
+        (
             "sglang.srt.models.qwen4_exp.GatedResidualState",
             SM70GatedResidualState,
             HookType.REPLACE,
@@ -90,6 +118,16 @@ def install():
         (
             "sglang.srt.layers.quantization.fp8.Fp8Config.get_min_capability",
             fp8_minimum_capability,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.layers.quantization.fp8.Fp8LinearMethod.process_weights_after_loading",
+            prepare_fp8_dense,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.layers.quantization.fp8.Fp8LinearMethod.apply",
+            apply_fp8_dense,
             HookType.AROUND,
         ),
         (
@@ -498,6 +536,23 @@ def store(
 ):
     import torch
 
+    if self.dtype == torch.float16:
+        from .kv_cache import fp16_store_supported
+
+        if fp16_store_supported(self, key, value, k_scale, v_scale, dcp_kv_mask):
+            # Preserve upstream slot validation, layer selection and padding;
+            # its declared CUDA byte-copy kernel supports SM70 FP16 storage.
+            return original(
+                self,
+                layer,
+                loc_info,
+                key,
+                value,
+                k_scale,
+                v_scale,
+                layer_id_override,
+                dcp_kv_mask,
+            )
     if self.dtype == torch.float8_e5m2 and not self.use_hnd and dcp_kv_mask is None:
         from sglang.srt.mem_cache.memory_pool import unwrap_write_loc
 

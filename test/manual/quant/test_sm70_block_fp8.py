@@ -21,6 +21,60 @@ class TestSM70BlockFP8(CustomTestCase):
 
         load_plugins()
 
+    def test_dense_draft_projections_and_graph_replay(self):
+        from sglang_v100_plus.fp8 import apply_fp8_dense, prepare_fp8_dense
+
+        from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
+        from sglang.srt.runtime_context import get_context
+
+        self.enterContext(
+            get_context().override_server_args(
+                model_path="dummy", disable_overlap_schedule=True
+            )
+        )
+        torch.manual_seed(85)
+        method = Fp8LinearMethod(
+            Fp8Config(is_checkpoint_fp8_serialized=True, weight_block_size=[128, 128])
+        )
+        for n, k in (
+            (4096, 20480),
+            (768, 4096),
+            (4096, 512),
+            (3072, 4096),
+            (4096, 1536),
+        ):
+            codes = torch.randint(254, (n, k), device="cuda", dtype=torch.int32)
+            codes = (codes + (codes >= 127)).to(torch.uint8)
+            weight = codes.view(torch.float8_e4m3fn)
+            scales = torch.rand(n // 128, k // 128, device="cuda") * 0.001 + 0.0005
+            expanded = scales.half().repeat_interleave(128, 0).repeat_interleave(128, 1)
+            reference = (weight.float() * expanded.float()).half()
+            layer = torch.nn.Module()
+            layer.orig_dtype = torch.float16
+            layer.output_size_per_partition, layer.input_size_per_partition = n, k
+            layer.register_parameter(
+                "weight", torch.nn.Parameter(weight, requires_grad=False)
+            )
+            layer.register_parameter(
+                "weight_scale_inv", torch.nn.Parameter(scales, requires_grad=False)
+            )
+            prepare_fp8_dense(None, method, layer)
+            for rows in (1, 8, 129):
+                with self.subTest(n=n, k=k, rows=rows), torch.inference_mode():
+                    x = torch.randn(rows, k, device="cuda", dtype=torch.float16) * 0.1
+                    actual = apply_fp8_dense(None, method, layer, x)
+                    torch.testing.assert_close(
+                        actual, F.linear(x, reference), rtol=0.005, atol=0.003
+                    )
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        output = apply_fp8_dense(None, method, layer, x)
+                    x.normal_(std=0.1)
+                    graph.replay()
+                    torch.testing.assert_close(
+                        output, F.linear(x, reference), rtol=0.005, atol=0.003
+                    )
+
     def test_tp8_unquantized_projection_shapes(self):
         from sglang_v100_plus.kernels.gemm import linear_dense, supported
 

@@ -144,6 +144,8 @@ _GLM_BLAS_SHAPES = {
     (128, 4096),  # replicated indexer key
     (1024, 4096),
     (4096, 256),  # unquantized NextN shared expert (TP4/TP8)
+    (768, 4096),
+    (3072, 4096),  # DFlash2 TP8 fused QKV and gate/up projections
 }
 
 

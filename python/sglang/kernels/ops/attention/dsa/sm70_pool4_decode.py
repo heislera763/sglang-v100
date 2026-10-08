@@ -378,8 +378,8 @@ def pool4_spec_sm70(
         raise ValueError("Speculative pool4 requires a fixed chain width per request")
     n = keys.shape[0] // batch
     max_closed = (n + 3) // 4
-    if not 1 <= n <= 6 or keys.shape != gates.shape or keys.shape[1:] != (128,):
-        raise ValueError("SM70 pool4 supports chain widths 1..6 and 128-wide keys")
+    if not 1 <= n <= 8 or keys.shape != gates.shape or keys.shape[1:] != (128,):
+        raise ValueError("SM70 pool4 supports chain widths 1..8 and 128-wide keys")
     index_page_size = pool4_cache_page_size(cache)
     if token_page_size not in (64, 256):
         raise ValueError("SM70 pool4 supports 64- or 256-token allocation pages")

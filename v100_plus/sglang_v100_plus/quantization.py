@@ -73,12 +73,18 @@ def dense_marlin_gemm(
     use_fp32_reduce=False,
     is_zp_float=False,
 ):
+    from sglang.srt.layers.quantization.utils import get_scalar_types
     from sglang.srt.runtime_context import get_buffer
 
     from .kernels.moe_marlin import moe_wna16_marlin_gemm
 
-    if a.dtype != torch.float16 or global_scale is None:
-        raise ValueError("V100 dense Marlin hook requires FP16 NVFP4")
+    block_fp8 = (
+        global_scale is None
+        and b_scales.dtype == torch.float16
+        and b_q_type.id == get_scalar_types()[1].float8_e4m3fn.id
+    )
+    if a.dtype != torch.float16 or (global_scale is None and not block_fp8):
+        raise ValueError("V100 dense Marlin requires FP16 NVFP4 or block-FP8")
     # The installed NVFP4 extension includes the expert GEMM. A single expert
     # with one route per token computes the same dense multiplication, using
     # its existing logical scale layout and repacked weight format.
@@ -103,7 +109,7 @@ def dense_marlin_gemm(
         b_q_weight[None],
         None,
         b_scales[None],
-        global_scale.reshape(1),
+        None if global_scale is None else global_scale.reshape(1),
         b_zeros,
         g_idx,
         perm,
