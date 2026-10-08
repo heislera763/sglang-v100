@@ -23,7 +23,8 @@ The integrated upstream revision is `c892301ff76f`; see
   embeddings; GLM sparse MLA/K-pool indexing, KDA and mHC. Qwen FP8 PP2 adds
   vector experts for ordinary and MTP decode, block-scale reuse, partitioned HC
   prefill, masked Tensor Core sparse attention and GPU metadata graphs. Sampled
-  MTP keeps exact draft probabilities locally and packs small PP result tensors.
+  MTP keeps exact draft probabilities locally, packs small PP result tensors
+  and retains Tensor Core attention for target and draft prompt prefill.
 - **Upstream maintenance:** adapters live in `v100_plus/sglang_v100_plus/`;
   shared operators live in `python/sglang/kernels/ops/`; native builds and Marlin
   patches live in `v100_plus/aot/` and `v100_plus/patches/`. Keep host services,
@@ -176,8 +177,8 @@ An FP8 GLM target cannot fit fully resident: routed experts alone need 283.5 GiB
 Eight V100 SXM2 32 GB GPUs, fan control corrected, concurrency one, coherent
 near-8K prompts and 512 sampled output tokens. Rates divide total native tokens
 by total execution time: prefill uses the prefill interval; generation excludes
-the first token. Excluded warmups, no cached input or retractions. **A** and
-**D** are nine-request confirmations; **C** is a three-request smoke check.
+the first token. Excluded warmups, no cached input or retractions. **A**, **D**
+and **E** are nine-request confirmations; **C** is a three-request smoke check.
 Rows from different revisions are not a controlled attribution of an upstream gain.
 
 | Checkpoint / layout | MTP steps | Prefill tokens/s | Generation tokens/s | Evidence |
@@ -187,21 +188,27 @@ Rows from different revisions are not a controlled attribution of an upstream ga
 | GLM NVFP4 / TP4×PP2 | Off | 1,719 | 24.8 | A |
 | GLM NVFP4 / TP4×PP2 | 3 | 1,579 | 30.3 | A |
 | Qwen FP8 / TP4×PP2 + EP4 | Off | 6,989 | 60.8 | D |
-| Qwen FP8 / TP4×PP2 + EP4 | 2 | 6,154 | 67.5 | D |
+| Qwen FP8 / TP4×PP2 + EP4 | 2 | 6,585 | 66.1 | E |
 | GLM NVFP4 / TP8 | Off | 1,163 | 39.6 | C |
 | GLM NVFP4 / TP8 | 3 | 1,084 | 37.5 | C |
 
 Runtime revisions: **A** [`cf7f7e9f`](https://github.com/heislera763/sglang-v100-plus/commit/cf7f7e9fa42baf4fe683ab0444183b7ca8e2e409),
 **C** [`c7442393`](https://github.com/heislera763/sglang-v100-plus/commit/c7442393),
 **D** [`5c019a9a`](https://github.com/heislera763/sglang-v100-plus/commit/5c019a9a),
+**E** [`6f211dc6`](https://github.com/heislera763/sglang-v100-plus/commit/6f211dc61251952a88d0476a13565c5c05dcf95a),
 2026-10-07/08, Torch `2.13.0+cu126`. Table rows use eager prefill/full batch-one
 decode, strict dispatch, no overlap/radix cache, context/cache 12288 and
-2048-token chunks; D uses 4096-token chunks, HC partitioning and metadata graphs.
+2048-token chunks; D/E use 4096-token chunks, HC partitioning and metadata graphs.
 FP8 expert checks include independent FP16 references and exact batched-versus-row
 comparisons. MTP's retained proposal probabilities passed native bit comparisons;
 packed results preserve typed field bits and CUDA event ordering. Native protocol
 coverage includes EOS, logprobs, cancellation and reuse. One/three-step FP8 screens
 gave 51.6/59.9 generation tokens/s; two steps remain the better measured choice.
+E enables the existing masked Tensor Core attention kernel for MTP prefill:
+matched before/after runs improve 6,165→6,585 prefill tokens/s (+6.8%), with
+generation unchanged at 66.1. All 468 native target/draft attention comparisons
+pass the established FP16 tolerances (rtol=.005, atol=.003); selected keys stay
+unchanged. These checks establish bounded numerical agreement, not bit equality.
 
 Inputs: [NVIDIA SPEED-Bench `throughput_8k`](https://huggingface.co/datasets/nvidia/SPEED-Bench/tree/454f88454792dfa3ccfd7ef15fff248efde44cd1),
 revision `454f88454792dfa3ccfd7ef15fff248efde44cd1`. First turns of
