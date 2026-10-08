@@ -9,6 +9,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
@@ -257,6 +258,86 @@ class TestV100StrictDispatch(CustomTestCase):
                     ),
                     x.sum(-1),
                 )
+
+    def test_mtp_prefill_keeps_tensor_core_attention_on_target_and_local_draft(self):
+        """MTP must not disable the exact-membership prefill kernel on either stage."""
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        backend = object.__new__(qsa.QwenSparseAttnBackend)
+        cache = torch.zeros(1, 1, 256, dtype=torch.float8_e5m2)
+        backend.token_to_kv_pool = SimpleNamespace(
+            get_key_buffer=lambda _: cache, get_value_buffer=lambda _: cache
+        )
+        backend.req_to_token_pool = SimpleNamespace(req_to_token=object())
+        backend.qsa_profile = SimpleNamespace(budget=2048)
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            seq_lens_cpu=[8192],
+            extend_seq_lens_cpu=[128],
+            req_pool_indices=torch.tensor([0], dtype=torch.int32),
+            seq_lens=torch.tensor([8192], dtype=torch.int32),
+        )
+        layer = SimpleNamespace(
+            tp_q_head_num=6, head_dim=256, layer_id=0, scaling=0.0625
+        )
+        x = torch.ones(128, 6, 256, dtype=torch.float16)
+        indices = torch.arange(128, dtype=torch.int32)[:, None]
+
+        def tensor_core(query, keys, values, table, requests, selected, length, scale):
+            self.assertIs(keys, cache)
+            self.assertIs(values, cache)
+            self.assertEqual(length, 8192)
+            self.assertEqual(scale, layer.scaling)
+            self.assertTrue(torch.equal(selected, indices))
+            return query * 2
+
+        modules = {
+            "sglang_v100_plus.kernels.qsa_prefill": SimpleNamespace(
+                qsa_masked_prefill=tensor_core
+            ),
+            "sglang_v100_plus.kernels.qsa_cuda": SimpleNamespace(
+                sm70_cuda_qsa_prefill=lambda query, *args: query * 3
+            ),
+        }
+        fields = dict(
+            model_path="dummy",
+            quantization="fp8",
+            tp_size=4,
+            pp_size=2,
+            disable_overlap_schedule=True,
+            max_running_requests=1,
+        )
+        cases = [
+            ({}, True),
+            ({"speculative_algorithm": "EAGLE"}, True),
+            ({"speculative_algorithm": "EAGLE", "pp_size": 1}, True),
+            ({"pp_size": 1}, False),
+            ({"tp_size": 8, "speculative_algorithm": "EAGLE"}, False),
+            ({"speculative_algorithm": "STANDALONE"}, False),
+            ({"speculative_algorithm": "EAGLE", "max_running_requests": 2}, False),
+        ]
+        with (
+            patch.dict(sys.modules, modules),
+            patch.object(backend, "_can_use_sm70_sparse_prefill", return_value=True),
+            envs.SGLANG_DEBUG_V100_STRICT_DISPATCH.override(True),
+        ):
+            for changes, optimized in cases:
+                with (
+                    self.subTest(changes=changes),
+                    get_context().override_server_args(**(fields | changes)),
+                ):
+                    actual = backend.forward_extend(
+                        x,
+                        None,
+                        None,
+                        layer,
+                        batch,
+                        save_kv_cache=False,
+                        topk_indices=indices,
+                    )
+                    torch.testing.assert_close(
+                        actual, (x * (2 if optimized else 3)).flatten(1), rtol=0, atol=0
+                    )
 
 
 if __name__ == "__main__":
