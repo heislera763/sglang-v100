@@ -157,7 +157,7 @@ class TestV100Prefill(CustomTestCase):
             )
 
     def test_only_eager_serialized_fp8_prefill_is_partitioned(self):
-        """Decode, verification, ragged rows and other layouts retain full inputs."""
+        """Only ordinary/MTP eager prefill may partition; verification stays full."""
         owner = SimpleNamespace(hc_count=4, hidden_size=2560)
         batch = SimpleNamespace(
             batch_size=1, forward_mode=SimpleNamespace(is_extend=lambda: True)
@@ -180,6 +180,8 @@ class TestV100Prefill(CustomTestCase):
                 {"max_running_requests": 2},
                 {"disable_prefill_cuda_graph": False},
                 {"enable_return_hidden_states": True},
+                {"speculative_algorithm": "EAGLE"},
+                {"speculative_algorithm": "DFLASH"},
             ):
                 with (
                     self.subTest(changes=changes),
@@ -190,7 +192,10 @@ class TestV100Prefill(CustomTestCase):
                 ):
                     for rows in (128, 256, 257):
                         actual = prefill._partition(owner, torch.empty(rows), batch)
-                        if rows == 256 and not changes:
+                        if rows == 256 and changes in (
+                            {},
+                            {"speculative_algorithm": "EAGLE"},
+                        ):
                             self.assertEqual(actual, prefill.Partition(256, 2))
                         else:
                             self.assertIsNone(actual)

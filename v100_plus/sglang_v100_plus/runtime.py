@@ -39,7 +39,13 @@ def install():
         prepare_fp8_dense,
         prepare_fp8_moe,
     )
-    from .pipeline import initialize_local_output, receive_output, send_output
+    from .pipeline import (
+        initialize_local_output,
+        receive_output,
+        send_output,
+        send_output_dict,
+        set_local_relay,
+    )
     from .quantization import (
         dense_marlin_gemm,
         marlin_gemm,
@@ -113,6 +119,16 @@ def install():
         (
             "sglang.srt.managers.scheduler_pp_mixin.SchedulerPPMixin._pp_recv_dict_from_prev_stage",
             receive_output,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.managers.scheduler_pp_mixin.SchedulerPPMixin._pp_send_dict_to_next_stage",
+            send_output_dict,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.managers.scheduler_pp_mixin.SchedulerPPMixin._pp_spec_set_relay",
+            set_local_relay,
             HookType.AROUND,
         ),
         (
@@ -720,6 +736,31 @@ def route_top10(original, scores, bias, topk, *args, **kwargs):
 
 
 def top_k_renorm_probs(probs, top_k):
+    from sglang.srt.runtime_context import (
+        get_model,
+        get_parallel,
+        get_schedule,
+        get_spec,
+    )
+
+    if (
+        probs.ndim == 2
+        and 2 <= probs.shape[0] <= 4
+        and probs.shape[1] == 248320
+        and probs.dtype == torch.float32
+        and get_model().quantization == "fp8"
+        and get_spec().speculative_algorithm == "EAGLE"
+        and get_parallel().tp_size == 4
+        and get_parallel().pp_size == 2
+        and get_schedule().max_running_requests == 1
+    ):
+        from sglang.kernels.ops.sampling.renorm_triton import (
+            top_k_renorm_probs_triton,
+        )
+
+        # Vocabulary-wide row reductions leave most Volta SMs idle. Device
+        # sorting plus parallel mask/reduction retains the same cutoff ties.
+        return top_k_renorm_probs_triton(probs, top_k)
     return _top_k_renorm_probs_internal(probs, *_to_tensor_scalar_tuple(top_k))
 
 

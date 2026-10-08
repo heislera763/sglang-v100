@@ -1,7 +1,7 @@
-"""Single-token E4M3 experts over the SM70 Marlin packed layout.
+"""Small-batch E4M3 experts over the SM70 Marlin packed layout.
 
 Split GEMV work across output and reduction tiles instead of padding one
-activation to a tensor-core GEMM. Keep Marlin's FP16 dequantization, projection,
+activation batch to a tensor-core GEMM. Keep Marlin's FP16 dequantization, projection,
 activation and weighted-expert boundaries; partial sums use FP32.
 """
 
@@ -20,6 +20,8 @@ def _partial(
     N: tl.constexpr,
     K: tl.constexpr,
     INPUT_PER_ROUTE: tl.constexpr,
+    TOPK: tl.constexpr,
+    ROWS: tl.constexpr,
     BN: tl.constexpr,
     BK: tl.constexpr,
     MACRO: tl.constexpr,
@@ -52,7 +54,10 @@ def _partial(
             S + expert * (K // 128) * N + (k[:, None] // 128) * N + n[None, :]
         )
         weight = (biased.to(tl.float32) * scale.to(tl.float32)).to(tl.float16)
-        row = route if INPUT_PER_ROUTE else 0
+        if INPUT_PER_ROUTE:
+            row = route
+        else:
+            row = route // TOPK if ROWS > 1 else 0
         x = tl.load(X + row * K + k).to(tl.float32)
         accum = tl.sum(x[:, None] * weight.to(tl.float32), axis=0)
         tl.store(P + (route * (K // BK) + tl.program_id(1)) * N + n, accum)
@@ -91,22 +96,24 @@ def _combine(
     BN: tl.constexpr,
 ):
     n = tl.program_id(0) * BN + tl.arange(0, BN)
+    row = tl.program_id(1)
     routes = tl.arange(0, BT)
+    flat_routes = row * TOPK + routes
     splits = tl.arange(0, BS)
-    experts = tl.load(Ids + routes, routes < TOPK, -1)
+    experts = tl.load(Ids + flat_routes, routes < TOPK, -1)
     valid = (routes < TOPK) & (experts >= 0)
     p = tl.load(
         P
-        + (routes[:, None, None] * SPLITS + splits[None, :, None]) * H
+        + (flat_routes[:, None, None] * SPLITS + splits[None, :, None]) * H
         + n[None, None, :],
         valid[:, None, None] & (splits[None, :, None] < SPLITS),
         0,
     )
     down = tl.sum(p, axis=1)
-    weights = tl.load(Router + routes, valid, 0)
+    weights = tl.load(Router + flat_routes, valid, 0)
     weighted = (down * weights[:, None]).to(tl.float16).to(tl.float32)
     result = tl.sum(weighted, axis=0).to(tl.float16)
-    tl.store(Out + n, result)
+    tl.store(Out + row * H + n, result)
 
 
 def fp8_moe_decode(x, w13, w2, s13, s2, ids, weights):
@@ -114,9 +121,11 @@ def fp8_moe_decode(x, w13, w2, s13, s2, ids, weights):
     from sglang.srt.runtime_context import get_buffer
 
     if (
-        x.shape != (1, 2560)
+        x.ndim != 2
+        or not 1 <= x.shape[0] <= 4
+        or x.shape[1] != 2560
         or ids.ndim != 2
-        or ids.shape[0] != 1
+        or ids.shape[0] != x.shape[0]
         or not 1 <= ids.shape[1] <= 32
         or ids.dtype != torch.int32
         or weights.shape != ids.shape
@@ -139,26 +148,41 @@ def fp8_moe_decode(x, w13, w2, s13, s2, ids, weights):
     if any(t.device != x.device or not t.is_contiguous() for t in tensors):
         raise ValueError("FP8 decode requires contiguous colocated tensors")
     topk = ids.shape[1]
+    rows = x.shape[0]
+    num_routes = rows * topk
     # One forward stream owns this scratch; graph replay consumes each layer
     # before the next overwrites it. No per-layer persistent expansion of weights.
     scratch = get_buffer(
-        f"v100_fp8_moe_decode:{x.device}:{topk}",
+        f"v100_fp8_moe_decode:{x.device}:{rows}:{topk}",
         lambda: (
-            torch.empty((topk, 20, 1280), dtype=torch.float32, device=x.device),
-            torch.empty((topk, 640), dtype=torch.float16, device=x.device),
-            torch.empty((topk, 5, 2560), dtype=torch.float32, device=x.device),
+            torch.empty((num_routes, 20, 1280), dtype=torch.float32, device=x.device),
+            torch.empty((num_routes, 640), dtype=torch.float16, device=x.device),
+            torch.empty((num_routes, 5, 2560), dtype=torch.float32, device=x.device),
         ),
     )
     gate, activation, down = scratch
     out = torch.empty_like(x)
-    _partial[(20, 20, topk)](
-        x, w13, s13, ids, gate, 1280, 2560, False, 64, 128, 256, num_warps=4
+    _partial[(20, 20, num_routes)](
+        x, w13, s13, ids, gate, 1280, 2560, False, topk, rows, 64, 128, 256, num_warps=4
     )
-    _activate[(5, topk)](gate, ids, activation, 640, 20, 32, 128, num_warps=4)
-    _partial[(40, 5, topk)](
-        activation, w2, s2, ids, down, 2560, 640, True, 64, 128, 256, num_warps=4
+    _activate[(5, num_routes)](gate, ids, activation, 640, 20, 32, 128, num_warps=4)
+    _partial[(40, 5, num_routes)](
+        activation,
+        w2,
+        s2,
+        ids,
+        down,
+        2560,
+        640,
+        True,
+        topk,
+        rows,
+        64,
+        128,
+        256,
+        num_warps=4,
     )
-    _combine[(40,)](
+    _combine[(40, rows)](
         down,
         ids,
         weights,

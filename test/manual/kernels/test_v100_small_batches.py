@@ -24,6 +24,117 @@ with patch.object(
     "Requires a V100",
 )
 class TestV100SmallBatches(CustomTestCase):
+    def test_pp_output_pack_preserves_bits_and_cross_stream_readiness(self):
+        from collections import deque
+
+        from sglang_v100_plus.pipeline import send_output_dict, unpack_output
+
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        owner = SimpleNamespace(
+            _v100_pp_local_outputs=deque(),
+            spec_algorithm=SpeculativeAlgorithm.EAGLE,
+            pp_group=SimpleNamespace(is_last_rank=True),
+        )
+        tensors = {
+            "next_token_ids": torch.arange(3, device="cuda", dtype=torch.int32),
+            "seq_lens": torch.tensor([8193], device="cuda", dtype=torch.int64),
+            "probabilities": torch.tensor([-0.0, 0.125, 0.875], device="cuda"),
+            "hidden_states": torch.arange(12, device="cuda", dtype=torch.float16)
+            .reshape(3, 4)
+            .T,
+            "empty_parents": torch.empty(1, 0, device="cuda", dtype=torch.int64),
+            "mask": torch.tensor([True, False, True], device="cuda"),
+            "scalar": torch.tensor(7, device="cuda", dtype=torch.int64),
+            "spec_next_draft_probs": torch.ones(1, 2, 3, device="cuda"),
+            "__msg_type__": "output",
+        }
+        producer, sender = torch.cuda.Stream(), torch.cuda.Stream()
+        producer.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(producer):
+            torch.cuda._sleep(200000)
+            tensors["hidden_states"].add_(16)
+            ready = torch.cuda.Event()
+            ready.record()
+        sent = []
+
+        def wire(_, payload, **kwargs):
+            sent.append((payload, kwargs["ready_event"]))
+            return []
+
+        with torch.cuda.stream(sender):
+            send_output_dict(wire, owner, tensors, msg_type="output", ready_event=ready)
+        payload, packed_ready = sent[0]
+        self.assertIsNot(packed_ready, ready)
+        torch.cuda.current_stream().wait_event(packed_ready)
+        actual = unpack_output(payload)
+        self.assertNotIn("spec_next_draft_probs", actual)
+        self.assertIn("spec_next_draft_probs", tensors)
+        self.assertEqual(payload["__v100_pp_output_payload__"].numel() % 8, 0)
+        for key, expected in tensors.items():
+            if key == "spec_next_draft_probs":
+                continue
+            if isinstance(expected, torch.Tensor):
+                self.assertEqual(actual[key].shape, expected.shape)
+                self.assertEqual(actual[key].dtype, expected.dtype)
+                self.assertTrue(
+                    torch.equal(
+                        actual[key].contiguous().reshape(-1).view(torch.uint8),
+                        expected.contiguous().reshape(-1).view(torch.uint8),
+                    )
+                )
+            else:
+                self.assertEqual(actual[key], expected)
+
+    def test_fp8_verify_topk_preserves_ties_mass_and_graph_inputs(self):
+        """The faster renorm must retain cutoff ties and read each graph replay."""
+        from sgl_kernel.sampling import _top_k_renorm_probs_internal
+        from sglang_v100_plus.runtime import top_k_renorm_probs
+
+        from sglang.srt.runtime_context import get_context
+
+        torch.manual_seed(531)
+        with get_context().override_server_args(
+            model_path="dummy",
+            quantization="fp8",
+            tp_size=4,
+            ep_size=4,
+            pp_size=2,
+            max_running_requests=1,
+            speculative_algorithm="EAGLE",
+        ):
+            for rows in (2, 3, 4):
+                probs = torch.softmax(
+                    torch.randn(rows, 248320, device="cuda") * 4, dim=-1
+                )
+                top_ks = torch.full((rows,), 20, device="cuda", dtype=torch.int32)
+                top_k_renorm_probs(probs, top_ks)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    actual = top_k_renorm_probs(probs, top_ks)
+                for tied, k in ((False, 20), (True, 20), (False, 5)):
+                    with self.subTest(rows=rows, tied=tied, k=k):
+                        if tied:
+                            probs.fill_(1 / probs.shape[-1])
+                        else:
+                            probs.copy_(
+                                torch.softmax(torch.randn_like(probs) * 4, dim=-1)
+                            )
+                        top_ks.fill_(k)
+                        graph.replay()
+                        # An independent FP64 mass calculation and the old
+                        # AOT implementation both constrain the new output.
+                        pivot = probs.double().topk(k, dim=-1).values[:, -1:]
+                        kept = torch.where(probs >= pivot, probs.double(), 0.0)
+                        reference = (kept / kept.sum(-1, keepdim=True)).float()
+                        legacy = _top_k_renorm_probs_internal(probs, top_ks, 0)
+                        self.assertTrue(torch.equal(actual > 0, reference > 0))
+                        self.assertTrue(torch.equal(actual > 0, legacy > 0))
+                        torch.testing.assert_close(
+                            actual, reference, rtol=3e-6, atol=1e-8
+                        )
+                        torch.testing.assert_close(actual, legacy, rtol=3e-6, atol=1e-8)
+
     def test_dflash_output_convolution_keeps_range_until_residual_norm(self):
         from sglang_v100_plus.dflash import SM70DFlashGroupedConv
 

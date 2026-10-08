@@ -188,12 +188,25 @@ def apply_fp8_moe(original, method, layer, dispatch_output):
     if (
         get_schedule().disable_overlap_schedule
         and get_parallel().tp_size == 4
-        and get_parallel().pp_size == 2
-        and get_spec().speculative_algorithm is None
-        and hidden.shape == (1, 2560)
+        and (
+            (
+                get_spec().speculative_algorithm is None
+                and get_parallel().pp_size == 2
+                and hidden.shape == (1, 2560)
+            )
+            or (
+                get_spec().speculative_algorithm == "EAGLE"
+                # The one-layer draft temporarily uses a local PP group.
+                and get_parallel().pp_size in (1, 2)
+                and get_schedule().max_running_requests == 1
+                and hidden.ndim == 2
+                and 1 <= hidden.shape[0] <= 4
+                and hidden.shape[1] == 2560
+            )
+        )
         and hidden.dtype == torch.float16
         and TopKOutputChecker.format_is_standard(topk)
-        and topk.topk_ids.shape == (1, 10)
+        and topk.topk_ids.shape == (hidden.shape[0], 10)
         and layer.w13_weight.shape[1:] == (160, 5120)
         and layer.w2_weight.shape[1:] == (40, 10240)
         and config.is_gated

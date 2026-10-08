@@ -256,7 +256,7 @@ class TestSM70BlockFP8(CustomTestCase):
                 )
             )
             prepare_fp8_moe(None, method, layer)
-            for rows in (1, 3, 128):
+            for rows in (1, 2, 3, 4, 128):
                 for masked in (False, True):
                     with self.subTest(rows=rows, masked=masked):
                         x = (
@@ -343,7 +343,7 @@ class TestSM70BlockFP8(CustomTestCase):
                         torch.testing.assert_close(
                             actual, expected.half(), rtol=0.005, atol=0.003
                         )
-                        if rows == 1:
+                        if rows <= 4:
                             from sglang_v100_plus.kernels.sm70_fp8_moe_decode import (
                                 fp8_moe_decode,
                             )
@@ -359,6 +359,25 @@ class TestSM70BlockFP8(CustomTestCase):
                             )
                             torch.testing.assert_close(
                                 vector, expected.half(), rtol=0.005, atol=0.003
+                            )
+                            per_row = torch.cat(
+                                [
+                                    fp8_moe_decode(
+                                        x[row : row + 1],
+                                        layer.w13_weight,
+                                        layer.w2_weight,
+                                        layer.w13_weight_scale_inv,
+                                        layer.w2_weight_scale_inv,
+                                        ids[row : row + 1],
+                                        weights[row : row + 1],
+                                    )
+                                    for row in range(rows)
+                                ]
+                            )
+                            self.assertTrue(
+                                torch.equal(
+                                    vector.view(torch.int16), per_row.view(torch.int16)
+                                )
                             )
                             vector_graph = torch.cuda.CUDAGraph()
                             with torch.cuda.graph(vector_graph):
@@ -379,25 +398,35 @@ class TestSM70BlockFP8(CustomTestCase):
                             # Masked slots may contain stale scratch from the
                             # preceding layer or graph replay and must vanish.
                             ten_ids = torch.full(
-                                (1, 10), -1, device="cuda", dtype=torch.int32
+                                (rows, 10), -1, device="cuda", dtype=torch.int32
                             )
-                            ten_ids[0, [0, 3, 6, 9]] = torch.arange(
-                                e, device="cuda", dtype=torch.int32
-                            )
+                            for row in range(rows):
+                                slots = torch.tensor(
+                                    [(i * 3 + row) % 10 for i in range(e)],
+                                    device="cuda",
+                                )
+                                ten_ids[row, slots] = (
+                                    torch.arange(e, device="cuda", dtype=torch.int32)
+                                    + row
+                                ) % e
                             ten_weights = torch.rand(
-                                (1, 10), device="cuda", dtype=torch.float32
+                                (rows, 10), device="cuda", dtype=torch.float32
                             )
                             ten_expected = torch.zeros_like(x, dtype=torch.float32)
-                            for route, expert in zip((0, 3, 6, 9), range(e)):
-                                gu = F.linear(x, reference["w13"][expert])
-                                gate, up = gu.float().chunk(2, dim=-1)
-                                act = (F.silu(gate) * up).half()
-                                down = F.linear(act, reference["w2"][expert])
-                                ten_expected += (
-                                    (down.float() * ten_weights[0, route])
-                                    .half()
-                                    .float()
-                                )
+                            for row in range(rows):
+                                for i in range(e):
+                                    route, expert = (i * 3 + row) % 10, (i + row) % e
+                                    gu = F.linear(
+                                        x[row : row + 1], reference["w13"][expert]
+                                    )
+                                    gate, up = gu.float().chunk(2, dim=-1)
+                                    act = (F.silu(gate) * up).half()
+                                    down = F.linear(act, reference["w2"][expert])
+                                    ten_expected[row : row + 1] += (
+                                        (down.float() * ten_weights[row, route])
+                                        .half()
+                                        .float()
+                                    )
                             ten_actual = fp8_moe_decode(
                                 x,
                                 layer.w13_weight,

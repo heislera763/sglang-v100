@@ -88,7 +88,7 @@ def _partition(self, input_ids, forward_batch):
         and get_model().quantization == "fp8"
         and get_schedule().disable_overlap_schedule
         and get_schedule().max_running_requests == 1
-        and get_spec().speculative_algorithm is None
+        and get_spec().speculative_algorithm in (None, "EAGLE")
         and get_exec().graph.disable_prefill_cuda_graph
         and not get_exec().features.enable_return_hidden_states
         and get_exec().features.return_hidden_states_mode is None
