@@ -18,6 +18,7 @@ def install():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
         raise RuntimeError("SGLANG_V100_LITE=1 requires an SM70 CUDA device")
     import sgl_kernel.elementwise as norm_ops
+
     import sglang.srt.layers.layernorm as norms
     from sglang.srt.arg_groups.choices import add_linear_attn_kernel_backend_choices
     from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
@@ -255,6 +256,22 @@ def install():
             HookType.AROUND,
         ),
     ]
+    from .prefill import model_forward, prepare_attention
+
+    hooks.extend(
+        (
+            (
+                "sglang.srt.models.qwen4_exp.Qwen4ExpModel.forward",
+                model_forward,
+                HookType.AROUND,
+            ),
+            (
+                "sglang.srt.models.qwen4_exp.Qwen4ExpLayerExtensionMixin._prepare_qwen4_exp_attn",
+                prepare_attention,
+                HookType.AROUND,
+            ),
+        )
+    )
     for target, replacement, kind in hooks:
         HookRegistry.register(target, replacement, kind)
     global REQUIRED_HOOKS
@@ -300,24 +317,27 @@ def mix(original, self, hyper_input):
         and hyper_input.dtype == torch.float16
         and hyper_input.is_cuda
         and torch.cuda.get_device_capability(hyper_input.device) == (7, 0)
+        and in_prefill()
     ):
-        if in_prefill():
-            # Prefill deliberately uses FP16 cuBLAS, not the small persistent
-            # decode kernel. Keep the upstream prefill equations and rounding.
-            if self.config.hc_per_branch_norm:
-                normed = self.hc_norm(hyper_input)
-            else:
-                normed = self.hc_norm(
-                    hyper_input.unflatten(-1, (self.hc_count, self.hidden_size))
-                ).flatten(-2)
-            result = self._mix_compute(
-                normed,
-                self.input_mix_weight_down.weight,
-                self.input_mix_weight_up.weight,
-                self.hc_count,
-                self.hidden_size,
-            ).to(self.params_dtype)
-            return result, (hyper_input, normed)
+        from .prefill import gather_input, local_input
+
+        hyper_input = local_input(hyper_input)
+        # Prefill deliberately uses FP16 cuBLAS, not the small persistent
+        # decode kernel. Keep the upstream prefill equations and rounding.
+        if self.config.hc_per_branch_norm:
+            normed = self.hc_norm(hyper_input)
+        else:
+            normed = self.hc_norm(
+                hyper_input.unflatten(-1, (self.hc_count, self.hidden_size))
+            ).flatten(-2)
+        result = self._mix_compute(
+            normed,
+            self.input_mix_weight_down.weight,
+            self.input_mix_weight_up.weight,
+            self.hc_count,
+            self.hidden_size,
+        ).to(self.params_dtype)
+        return gather_input(result), (hyper_input, normed)
     if (
         hyper_input.ndim != 2
         or hyper_input.shape[0] not in (1, 2, 3, 4)
@@ -366,6 +386,10 @@ def mix(original, self, hyper_input):
 
 
 def combine(original, self, block_output, residuals):
+    if in_prefill():
+        from .prefill import local_input
+
+        block_output = local_input(block_output)
     if len(residuals) == 3:
         from .kernels.sm70_hc_mix import hc_apply_gate
 

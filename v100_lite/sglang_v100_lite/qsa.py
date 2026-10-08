@@ -3,9 +3,11 @@
 import os
 
 import torch
+
 from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
     QwenSparseAttnBackend as BaseQSA,
 )
+from sglang.srt.runtime_context import get_model, get_parallel, get_schedule, get_spec
 
 from .dispatch import reject_fallback
 
@@ -160,6 +162,37 @@ class QwenSparseAttnBackend(BaseQSA):
             ):
                 if save_kv_cache:
                     pool.set_kv_buffer(layer, forward_batch.out_cache_loc, k, v)
+                if (
+                    self.qsa_profile is not None
+                    and lengths is not None
+                    and len(lengths) == 1
+                    and rows >= 128
+                    and get_model().quantization == "fp8"
+                    and get_parallel().tp_size == 4
+                    and get_parallel().pp_size == 2
+                    and get_spec().speculative_algorithm is None
+                    and get_schedule().disable_overlap_schedule
+                    and get_schedule().max_running_requests == 1
+                    and self.qsa_profile.budget
+                    <= int(lengths[0])
+                    <= 6 * self.qsa_profile.budget
+                ):
+                    # Sparse per-query scalar work underuses Volta. Share K/V
+                    # tiles across queries/heads and mask their exact selections
+                    # while using FP16 Tensor Cores with FP32 accumulation.
+                    from .kernels.qsa_prefill import qsa_masked_prefill
+
+                    out = qsa_masked_prefill(
+                        q3[:rows],
+                        kb,
+                        vb,
+                        self.req_to_token_pool.req_to_token,
+                        forward_batch.req_pool_indices,
+                        topk_indices.to(torch.int32).contiguous(),
+                        int(lengths[0]),
+                        layer.scaling,
+                    )
+                    return self._pad_extend_output(out, q3.shape[0])
                 from .kernels.qsa_cuda import sm70_cuda_qsa_prefill
 
                 out = sm70_cuda_qsa_prefill(

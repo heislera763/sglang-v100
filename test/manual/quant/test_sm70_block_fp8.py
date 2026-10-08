@@ -8,6 +8,7 @@ import unittest
 
 import torch
 import torch.nn.functional as F
+
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -110,14 +111,60 @@ class TestSM70BlockFP8(CustomTestCase):
             actual, reference(selections, counts), rtol=0.005, atol=0.003
         )
 
+    def test_tensor_core_prefill_keeps_each_querys_sparse_causal_set(self):
+        """A shared KV tile must not turn the selected union into every row's keys."""
+        from sglang_v100_lite.kernels.qsa_prefill import qsa_masked_prefill
+
+        torch.manual_seed(83)
+        rows, length, topk, pool = 129, 257, 64, 321
+        keys = torch.randn(pool, 1, 256, device="cuda", dtype=torch.float16).to(
+            torch.float8_e5m2
+        )
+        values = torch.randn_like(keys, dtype=torch.float16).to(torch.float8_e5m2)
+        table = torch.stack(
+            [torch.randperm(pool, device="cuda")[:length] for _ in range(2)]
+        ).int()
+        requests = torch.tensor([1], dtype=torch.int32, device="cuda")
+        # Distinct per-row candidates, including bit 31, future keys, a completely
+        # masked row and a ragged last query/head tile.
+        indices = (
+            torch.rand(rows, length, device="cuda")
+            .argsort(1)[:, :topk]
+            .int()
+            .contiguous()
+        )
+        indices[0].fill_(-1)
+        indices[1, :4] = torch.tensor([-1, length + 5, 31, 32], device="cuda")
+        remaining = torch.arange(length, device="cuda")
+        indices[1, 4:] = remaining[(remaining != 31) & (remaining != 32)][: topk - 4]
+        visible = length - rows + torch.arange(rows, device="cuda") + 1
+        valid = (indices >= 0) & (indices < visible[:, None])
+        valid &= torch.arange(topk, device="cuda")[None] < visible[:, None]
+        slots = table[1, indices.clamp(0, length - 1).long()].long()
+        k, v = keys[slots, 0].float(), values[slots, 0].float()
+        for heads in (3, 6):
+            with self.subTest(heads=heads):
+                q = torch.randn(rows, heads, 256, device="cuda", dtype=torch.float16)
+                logits = torch.bmm(q.float(), k.transpose(1, 2)) * (256**-0.5)
+                probabilities = logits.masked_fill(~valid[:, None], -torch.inf).softmax(
+                    -1
+                )
+                expected = torch.bmm(probabilities.nan_to_num(), v).half()
+                actual = qsa_masked_prefill(
+                    q, keys, values, table, requests, indices, length, 256**-0.5
+                )
+                torch.testing.assert_close(actual, expected, rtol=0.005, atol=0.003)
+                self.assertFalse(bool(actual[0].any()))
+
     def test_routed_experts_and_masked_rows(self):
+        from sglang_v100_lite.fp8 import prepare_fp8_moe
+
         from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
             fused_marlin_moe,
         )
         from sglang.srt.layers.moe.utils import initialize_moe_config
         from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
         from sglang.srt.runtime_context import get_context
-        from sglang_v100_lite.fp8 import prepare_fp8_moe
 
         with get_context().override_server_args(
             model_path="dummy", moe_runner_backend="marlin"

@@ -916,6 +916,8 @@ class Envs:
     SGLANG_OPT_SM70_MHC_PROJECTION = EnvBool(True)
     # Keep cuBLAS projection and torch mean; fuse only surrounding pointwise work.
     SGLANG_OPT_SM70_MHC_POINTWISE = EnvBool(False)
+    # Partition Qwen FP8 eager-prefill HC tokens within a TP4 NVLink quad.
+    SGLANG_OPT_SM70_HC_PREFILL_SP = EnvBool(False)
     # Fuse the `residual_add + RMSNorm + zero-pad` triplet that appears
     # before the MoE block for models whose MoE input hidden_size must be
     # padded up to a stride (e.g. GPT-OSS MXFP4 needs pad to multiple of

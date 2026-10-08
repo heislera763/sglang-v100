@@ -156,11 +156,11 @@ whole experts instead. Native QSA covers three heads for TP8 and six for TP4.
 | --- | --- | ---: | ---: |
 | TP8 + EP8 | Off | 3,249 | 36.1 |
 | TP8 + EP8 | Two steps | 3,112 | 59.6 |
-| TP4 × PP2 + EP4 | Off | 5,981 | 61.8 |
+| TP4 × PP2 + EP4 | Off | 6,817 | 61.7 |
 | TP4 × PP2 + EP4 | Two steps | 5,620 | 46.4 |
 
-Ordinary PP2 now gives about 84% higher prefill and 71% higher generation
-throughput than ordinary TP8. Its 61.8 tokens/s also narrowly exceeds the older
+Ordinary PP2 now gives about 110% higher prefill and 71% higher generation
+throughput than ordinary TP8. Its 61.7 tokens/s also narrowly exceeds the older
 TP8 MTP measurement; PP2 MTP still uses its earlier path. Two-step MTP improved
 TP8 generation by 65%, with 61% accepted draft tokens (excluding bonus tokens).
 PP2's earlier MTP measurement had 58% acceptance. The other three rows predate
@@ -175,16 +175,37 @@ postprocessing still runs in its original order and waits for the sampling
 event. This applies only to serialized, single-request, non-speculative PP2.
 Both changes stay in the plugin; core scheduling and model files are unchanged.
 
-Nine matched near-8K/512-token requests confirmed **33.2% faster generation**
-than the preceding 46.4 tokens/s build, and 59% over the earlier 38.8 tokens/s
-Marlin-only profile. Prefill changed from 5,847 to 5,981 tokens/s. The measured
-configuration also enables `SGLANG_ENABLE_METADATA_GLUE_GRAPH=1`: GPU-only
+Prefill partitions HC normalization, projection and residual work by token
+inside each NVLink quad, using `SGLANG_OPT_SM70_HC_PREFILL_SP=1`. Attention
+and experts receive the complete mixed inputs through all-gather; widened
+residuals remain local between HC calls. PLE's causal convolution and PP/final
+outputs keep their full layouts. The guarded profile requires eager, serialized,
+single-request, non-speculative FP8 TP4×PP2; other profiles keep the existing
+HC path. Smaller GEMMs can change FP16 rounding: independent FP32 projection
+checks measured relative L2 errors below 0.0003 for both native and partitioned
+HC, and normalization matched exactly.
+
+At moderate contexts, QSA prefill scans shared logical K/V tiles with an exact
+per-query selection bitmap and Volta Tensor Cores. It retains FP16 inputs and
+AV probabilities with FP32 accumulation and normalization. This performs extra
+masked arithmetic to improve reuse and utilization; it does not add attended
+tokens. Longer contexts retain direct sparse execution.
+
+Nine matched near-8K/512-token requests confirmed **11.4% faster prefill**
+at the same 2K chunk size (5,981 → 6,663 tokens/s). A separate nine-request
+4K-chunk confirmation reached **6,817 tokens/s**, 14.0% above the preceding
+2K profile; generation remained about 61.7 tokens/s. Alternating
+native comparisons isolated about 9.5% prefill gain from HC partitioning and
+3.7% from masked Tensor Core attention. GPU profiles show reduced HC compute
+despite the added gathers. The measured configuration also enables
+`SGLANG_ENABLE_METADATA_GLUE_GRAPH=1`: GPU-only
 QSA/GDN metadata refresh runs through a small graph. Warmup checks compared
 all 21 metadata tensors exactly with fresh eager metadata on every rank;
 checks were removed before timing. Numerical references cover finite E4M3
 codes, block scales, live ten-route masking and graph replay. Serving checks
-cover EOS, logprobs, cancellation and reuse after cancellation. Larger 4K
-prefill chunks were slower; the measured profile retains 2K chunks.
+cover EOS, logprobs, cancellation and reuse after cancellation. With these
+optimizations, 4K chunks beat 2K by 2.3%; the ordinary row uses 4K chunks,
+while the other rows retain their earlier 2K profiles.
 
 An earlier two-request screen, before the current optimizations, gave
 **76.2 aggregate generation tokens/s**, with **38–42 tokens/s per request**.
@@ -224,10 +245,11 @@ speculative flags. `setup.sh` builds both NVFP4 and FP8 expert kernels.
 For TP4 × PP2, replace the TP8/EP8 arguments with
 `--tensor-parallel-size 4 --pipeline-parallel-size 2 --expert-parallel-size 4`
 and set `SGLANG_PP_LAYER_PARTITION=24,24`. For the measured ordinary profile,
-retain `--max-running-requests 1 --disable-overlap-schedule`, 2048-token prefill
+retain `--max-running-requests 1 --disable-overlap-schedule`, 4096-token prefill
 chunks and batch-one full decode graphs, and set
-`SGLANG_ENABLE_METADATA_GLUE_GRAPH=1`. This metadata option was checked for
-this ordinary profile; leave it unset for other configurations until validated.
+`SGLANG_ENABLE_METADATA_GLUE_GRAPH=1` and
+`SGLANG_OPT_SM70_HC_PREFILL_SP=1`. These options were checked for
+this ordinary profile; leave them unset for other configurations until validated.
 For PP2 with MTP, also set
 `SGLANG_ENABLE_PP_SPEC=1`; retain two draft steps, three verification positions,
 top-k one, rejection sampling and `--disable-overlap-schedule`. Ordinary PP2
