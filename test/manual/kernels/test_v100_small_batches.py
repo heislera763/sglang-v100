@@ -12,11 +12,11 @@ from sglang.srt.environ import envs
 from sglang.test.test_utils import CustomTestCase
 
 with patch.object(
-    sys, "path", [str(Path(__file__).resolve().parents[3] / "v100_lite"), *sys.path]
+    sys, "path", [str(Path(__file__).resolve().parents[3] / "v100_plus"), *sys.path]
 ):
-    from sglang_v100_lite.kernels import gemm, sm70_hc_mix
-    from sglang_v100_lite.dispatch import V100FallbackError
-    from sglang_v100_lite.runtime import apply_unquant
+    from sglang_v100_plus.dispatch import V100FallbackError
+    from sglang_v100_plus.kernels import gemm, sm70_hc_mix
+    from sglang_v100_plus.runtime import apply_unquant
 
 
 @unittest.skipUnless(

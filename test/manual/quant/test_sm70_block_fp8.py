@@ -21,7 +21,7 @@ class TestSM70BlockFP8(CustomTestCase):
         load_plugins()
 
     def test_tp8_unquantized_projection_shapes(self):
-        from sglang_v100_lite.kernels.gemm import linear_dense, supported
+        from sglang_v100_plus.kernels.gemm import linear_dense, supported
 
         torch.manual_seed(45)
         for n, k in (
@@ -43,11 +43,11 @@ class TestSM70BlockFP8(CustomTestCase):
                     )
 
     def test_tp8_three_head_sparse_attention(self):
-        from sglang_v100_lite.kernels.qsa_cuda import (
+        from sglang_v100_plus.kernels.qsa_cuda import (
             sm70_cuda_qsa_decode,
             sm70_cuda_qsa_prefill,
         )
-        from sglang_v100_lite.qsa import QwenSparseAttnBackend
+        from sglang_v100_plus.qsa import QwenSparseAttnBackend
 
         torch.manual_seed(31)
         pool, length, rows, heads = 96, 64, 3, 3
@@ -113,7 +113,7 @@ class TestSM70BlockFP8(CustomTestCase):
 
     def test_tensor_core_prefill_keeps_each_querys_sparse_causal_set(self):
         """A shared KV tile must not turn the selected union into every row's keys."""
-        from sglang_v100_lite.kernels.qsa_prefill import qsa_masked_prefill
+        from sglang_v100_plus.kernels.qsa_prefill import qsa_masked_prefill
 
         torch.manual_seed(83)
         rows, length, topk, pool = 129, 257, 64, 321
@@ -157,7 +157,7 @@ class TestSM70BlockFP8(CustomTestCase):
                 self.assertFalse(bool(actual[0].any()))
 
     def test_routed_experts_and_masked_rows(self):
-        from sglang_v100_lite.fp8 import prepare_fp8_moe
+        from sglang_v100_plus.fp8 import prepare_fp8_moe
 
         from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
             fused_marlin_moe,
@@ -258,7 +258,7 @@ class TestSM70BlockFP8(CustomTestCase):
                             actual, expected.half(), rtol=0.005, atol=0.003
                         )
                         if rows == 1:
-                            from sglang_v100_lite.kernels.sm70_fp8_moe_decode import (
+                            from sglang_v100_plus.kernels.sm70_fp8_moe_decode import (
                                 fp8_moe_decode,
                             )
 

@@ -23,7 +23,7 @@ class QwenSparseAttnBackend(BaseQSA):
         image self-contained: it intentionally does not ship the legacy
         external ``flash_attn_v100`` wheel.
         """
-        from sglang_v100_lite.kernels.attention import (
+        from sglang_v100_plus.kernels.attention import (
             get_dense_prefix_d256_kernel,
         )
 

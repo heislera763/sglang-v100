@@ -1,10 +1,11 @@
 """GPU references for the SM70 operators and FP16 MTP recurrence."""
 
 import torch
+from sglang_v100_plus.kernels.sm70_fp8_kv import write_fp8_e5m2_cache_sm70
+from sglang_v100_plus.kernels.sm70_nvfp4_moe_decode import sm70_nvfp4_moe_decode
+from sglang_v100_plus.quantization import prepare_nvfp4_moe
+
 from sglang.srt.runtime_context import get_context
-from sglang_v100_lite.quantization import prepare_nvfp4_moe
-from sglang_v100_lite.kernels.sm70_nvfp4_moe_decode import sm70_nvfp4_moe_decode
-from sglang_v100_lite.kernels.sm70_fp8_kv import write_fp8_e5m2_cache_sm70
 
 assert torch.cuda.get_device_capability() == (7, 0)
 torch.manual_seed(12)
@@ -42,13 +43,14 @@ for experts, tokens in ((33, 8), (129, 640)):
         )
         torch.cuda.synchronize()
         assert torch.equal(backing[length:], torch.full_like(backing[length:], -1))
-        tail = backing[count.item():length]
+        tail = backing[count.item() : length]
         assert torch.equal(tail, torch.full_like(tail, ids.numel()))
 print("MoE padding: scalar tails filled, backing guard words unchanged", flush=True)
 
+from sglang_v100_plus.runtime import route_top10
+
 # The native router must preserve sorted ids, tie ordering and renormalization.
 from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
-from sglang_v100_lite.runtime import route_top10
 
 for dtype in (torch.float16, torch.float32):
     for rows in (1, 2, 4):
@@ -56,31 +58,55 @@ for dtype in (torch.float16, torch.float32):
             scores = torch.randn(rows, 512, device=device, dtype=dtype) * 8
             if tied:
                 scores.zero_()
-            weights, ids = route_top10(moe_fused_gate, scores, None, 10, scoring_func="softmax")
-            expected_ids = scores.float().argsort(dim=-1, descending=True, stable=True)[:, :10]
+            weights, ids = route_top10(
+                moe_fused_gate, scores, None, 10, scoring_func="softmax"
+            )
+            expected_ids = scores.float().argsort(dim=-1, descending=True, stable=True)[
+                :, :10
+            ]
             expected_weights = scores.float().gather(1, expected_ids).softmax(-1)
             assert torch.equal(ids.long(), expected_ids)
             torch.testing.assert_close(weights, expected_weights, rtol=1e-6, atol=1e-7)
-            mainline_weights, mainline_ids = moe_fused_gate(scores, None, 10, scoring_func="softmax")
+            mainline_weights, mainline_ids = moe_fused_gate(
+                scores, None, 10, scoring_func="softmax"
+            )
             assert torch.equal(ids, mainline_ids)
             torch.testing.assert_close(weights, mainline_weights, rtol=1e-6, atol=1e-7)
-print("Native top-10 router: ids, ties and weights agree with Torch and mainline", flush=True)
+print(
+    "Native top-10 router: ids, ties and weights agree with Torch and mainline",
+    flush=True,
+)
+
 
 def original_router(*args, **kwargs):
     return "fallback"
-for options in ({"renormalize": False}, {"packed_out": torch.empty(1, device=device)}, {"routed_scaling_factor": 2.0}):
+
+
+for options in (
+    {"renormalize": False},
+    {"packed_out": torch.empty(1, device=device)},
+    {"routed_scaling_factor": 2.0},
+):
+    from sglang_v100_plus.dispatch import V100FallbackError
+
     from sglang.srt.environ import envs
-    from sglang_v100_lite.dispatch import V100FallbackError
 
     if envs.SGLANG_DEBUG_V100_STRICT_DISPATCH.get():
         try:
-            route_top10(original_router, scores, None, 10, scoring_func="softmax", **options)
+            route_top10(
+                original_router, scores, None, 10, scoring_func="softmax", **options
+            )
         except V100FallbackError:
             pass
         else:
             raise AssertionError("Unsupported router options must fail in strict mode")
     else:
-        assert route_top10(original_router, scores, None, 10, scoring_func="softmax", **options) == "fallback"
+        assert (
+            route_top10(
+                original_router, scores, None, 10, scoring_func="softmax", **options
+            )
+            == "fallback"
+        )
 
 # Qwen TP4 MoE shape. A synthetic checkpoint and a dequantized Torch reference
 # test packing, the unusual S0E5M3 scale layout, gating, and weighted summation.
@@ -129,8 +155,9 @@ def dequant(prefix, expert):
     )
 
 
+from sglang_v100_plus.quantization import marlin_gemm
+
 from sglang.srt.plugins.hook_registry import HookRegistry, HookType
-from sglang_v100_lite.quantization import marlin_gemm
 
 HookRegistry.register(
     "sglang.kernels.ops.moe.moe_wna16_marlin.moe_wna16_marlin_gemm",
@@ -185,14 +212,14 @@ for m in (1, 4, 17):
         flush=True,
     )
 
-from sglang_v100_lite.kernels.attention import (
+from sglang_v100_plus.kernels.attention import (
     get_dense_prefix_d256_kernel,
 )
+from sglang_v100_plus.runtime import round_verify_state
+
 from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update as recurrent,
 )
-
-from sglang_v100_lite.runtime import round_verify_state
 
 HookRegistry.register(
     "sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent.fused_sigmoid_gating_delta_rule_update_kernel.run",
@@ -221,7 +248,7 @@ print("D256 causal dense attention: SDPA reference agrees", flush=True)
 
 # Current mainline uses compressed page 16; retain the fork's page 4 too.
 # Random physical page order catches addressing errors hidden by identity maps.
-from sglang_v100_lite.kernels.qsa_cuda import (
+from sglang_v100_plus.kernels.qsa_cuda import (
     sm70_cuda_qsa_indexer_decode,
 )
 
@@ -244,9 +271,9 @@ for page in (4, 16):
         flush=True,
     )
 
-from sglang_v100_lite.kernels.qsa_cuda import (
-    sm70_cuda_qsa_prefill,
+from sglang_v100_plus.kernels.qsa_cuda import (
     sm70_cuda_qsa_decode,
+    sm70_cuda_qsa_prefill,
 )
 
 # Sparse attention must respect selected logical rows, causal masks and physical
@@ -354,14 +381,17 @@ print("Four-step FP16 MTP recurrence: sequential decode agrees", flush=True)
 # Independent sequential FP32 reference for the retained chunked GDN algorithm.
 # Non-aligned sequence boundaries, nonzero indexed state and checkpoint content
 # exercise correctness beyond producing plausible model text.
-from sglang_v100_lite.kernels.gdn import TileLangGDNKernel
+from sglang_v100_plus.kernels.gdn import TileLangGDNKernel
+
 n, heads, value_heads, dim = 128, 4, 12, 128
 q = torch.randn(1, n, heads, dim, device=device, dtype=torch.float16)
 k = torch.randn_like(q)
 v = torch.randn(1, n, value_heads, dim, device=device, dtype=torch.float16)
 g = -torch.rand(1, n, value_heads, device=device) * 0.15
 beta = torch.rand_like(g)
-initial = torch.randn(3, value_heads, dim, dim, device=device, dtype=torch.float16) * 0.02
+initial = (
+    torch.randn(3, value_heads, dim, dim, device=device, dtype=torch.float16) * 0.02
+)
 indices = torch.tensor([2, 0], device=device, dtype=torch.int32)
 cu = torch.tensor([0, 51, n], device=device, dtype=torch.int32)
 qn = torch.nn.functional.normalize(q.float(), dim=-1, eps=1e-6).repeat_interleave(3, 2)
@@ -375,18 +405,37 @@ for start, end, slot in ((0, 51, 2), (51, n, 0)):
         if (t - start) % 64 == 0:
             checkpoint_reference.append(current.half())
         current = current * g[0, t].exp()[:, None, None]
-        delta = (v[0, t].float() - (current * kn[0, t, :, None, :]).sum(-1)) * beta[0, t, :, None]
+        delta = (v[0, t].float() - (current * kn[0, t, :, None, :]).sum(-1)) * beta[
+            0, t, :, None
+        ]
         current += delta[:, :, None] * kn[0, t, :, None, :]
-        reference[0, t] = (current * qn[0, t, :, None, :]).sum(-1) * dim ** -0.5
+        reference[0, t] = (current * qn[0, t, :, None, :]).sum(-1) * dim**-0.5
     final[slot] = current.half()
 for checkpoints_enabled in (False, True):
     actual_state = initial.clone()
-    output, _, checkpoints = TileLangGDNKernel().extend(q, k, v, g, beta, ssm_states=actual_state, cache_indices=indices, query_start_loc=cu, store_checkpoints=checkpoints_enabled)
+    output, _, checkpoints = TileLangGDNKernel().extend(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        ssm_states=actual_state,
+        cache_indices=indices,
+        query_start_loc=cu,
+        store_checkpoints=checkpoints_enabled,
+    )
     torch.testing.assert_close(output.float(), reference, rtol=0.02, atol=0.0001)
-    torch.testing.assert_close(actual_state.float(), final.float(), rtol=0.02, atol=0.0005)
+    torch.testing.assert_close(
+        actual_state.float(), final.float(), rtol=0.02, atol=0.0005
+    )
     assert torch.equal(actual_state[1], initial[1])
     if checkpoints_enabled:
-        torch.testing.assert_close(checkpoints[0], torch.stack(checkpoint_reference), rtol=0.02, atol=0.0005)
+        torch.testing.assert_close(
+            checkpoints[0], torch.stack(checkpoint_reference), rtol=0.02, atol=0.0005
+        )
     else:
         assert checkpoints is None
-print("Chunked GDN: outputs, indexed state and chunk checkpoints agree with FP32 recurrence", flush=True)
+print(
+    "Chunked GDN: outputs, indexed state and chunk checkpoints agree with FP32 recurrence",
+    flush=True,
+)

@@ -3,8 +3,7 @@
 import os
 
 import torch
-
-from sglang_v100_lite.kernels.utils import cache_once, load_jit
+from sglang_v100_plus.kernels.utils import cache_once, load_jit
 
 # (output features, input features) -> (threads, lanes per row, vector width).
 _DENSE_CONFIGS = {
@@ -196,7 +195,7 @@ def blas_supported(x, weight, bias=None):
             return True
     elif x.shape[1:] == (4, 2560) and weight.shape == (2560, 2560):
         return True
-    from sglang_v100_lite.dispatch import in_prefill
+    from sglang_v100_plus.dispatch import in_prefill
 
     return in_prefill()
 

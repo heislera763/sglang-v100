@@ -17,17 +17,17 @@ maybe_stub_sgl_kernel()
 
 # The fork plugin is separately packaged; CPU CI need not install that wheel.
 with patch.object(
-    sys, "path", [str(Path(__file__).resolve().parents[4] / "v100_lite"), *sys.path]
+    sys, "path", [str(Path(__file__).resolve().parents[4] / "v100_plus"), *sys.path]
 ):
-    import sglang_v100_lite
-    from sglang_v100_lite import glm_mhc, mqa, qsa, quantization, runtime
-    from sglang_v100_lite.dispatch import (
+    import sglang_v100_plus
+    from sglang_v100_plus import glm_mhc, mqa, qsa, quantization, runtime
+    from sglang_v100_plus.dispatch import (
         V100FallbackError,
         eager_extend,
         in_prefill,
         prefill_scope,
     )
-    from sglang_v100_lite.kernels import sm70_fp8_kv
+    from sglang_v100_plus.kernels import sm70_fp8_kv
 
 
 class TestV100StrictDispatch(CustomTestCase):
@@ -58,13 +58,13 @@ class TestV100StrictDispatch(CustomTestCase):
 
     def test_inactive_plugin_cannot_silently_ignore_strict_mode(self):
         with patch.object(
-            sglang_v100_lite, "os", SimpleNamespace(environ={"SGLANG_V100_LITE": "0"})
+            sglang_v100_plus, "os", SimpleNamespace(environ={"SGLANG_V100_PLUS": "0"})
         ):
             with envs.SGLANG_DEBUG_V100_STRICT_DISPATCH.override(False):
-                self.assertIsNone(sglang_v100_lite.register())
+                self.assertIsNone(sglang_v100_plus.register())
             with envs.SGLANG_DEBUG_V100_STRICT_DISPATCH.override(True):
                 with self.assertRaisesRegex(V100FallbackError, "plugin.activation"):
-                    sglang_v100_lite.register()
+                    sglang_v100_plus.register()
 
     def test_uncovered_hc_rows_fail(self):
         """Extending small-batch coverage must not reopen silent fallback."""

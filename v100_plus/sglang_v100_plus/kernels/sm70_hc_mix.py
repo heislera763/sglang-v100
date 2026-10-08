@@ -3,8 +3,7 @@
 import os
 
 import torch
-
-from sglang_v100_lite.kernels.utils import cache_once, load_jit
+from sglang_v100_plus.kernels.utils import cache_once, load_jit
 
 
 @cache_once

@@ -27,7 +27,7 @@ if [[ ! -d $marlin/.git ]]; then
   git -C "$marlin" checkout --detach 6d72a49939701d26b15b617a4cd2423174adb2d1
 fi
 [[ $(git -C "$marlin" rev-parse HEAD) == 6d72a49939701d26b15b617a4cd2423174adb2d1 ]]
-for patch in "$PWD"/v100_lite/patches/marlin-v100-*.patch; do
+for patch in "$PWD"/v100_plus/patches/marlin-v100-*.patch; do
   if ! git -C "$marlin" apply --reverse --check "$patch" 2>/dev/null; then
     git -C "$marlin" apply "$patch"
   fi

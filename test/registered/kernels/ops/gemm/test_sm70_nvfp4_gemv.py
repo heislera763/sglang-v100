@@ -38,7 +38,7 @@ pytestmark = pytest.mark.skipif(
     ],
 )
 def test_checkpoint_reference_and_graph_replay(m, topk, n, k):
-    from sglang_v100_lite.quantization import (
+    from sglang_v100_plus.quantization import (
         _dense_repack,
         sm70_nvfp4_marlin_process_global_scale,
         sm70_nvfp4_marlin_process_scales,

@@ -17,10 +17,10 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 maybe_stub_sgl_kernel()
 
 with patch.object(
-    sys, "path", [str(Path(__file__).resolve().parents[4] / "v100_lite"), *sys.path]
+    sys, "path", [str(Path(__file__).resolve().parents[4] / "v100_plus"), *sys.path]
 ):
-    from sglang_v100_lite import prefill
-    from sglang_v100_lite.dispatch import prefill_scope
+    from sglang_v100_plus import prefill
+    from sglang_v100_plus.dispatch import prefill_scope
 
 
 class TestV100Prefill(CustomTestCase):

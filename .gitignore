@@ -284,6 +284,6 @@ artifacts/
 # Internal, non-published docs
 internal-docs/
 
-# V100 lite local environments and measurements
+# V100 plus local environments and measurements
 /.venv/
 /.cache/

@@ -13,7 +13,7 @@ overrides = [
     { name = "cuda-python", specifier = ">=12.9.4,<13" },
     { name = "flashinfer-python", specifier = "==0.6.18" },
     { name = "nvidia-cutlass-dsl", specifier = "==4.6.2" },
-    { name = "sglang-kernel", directory = "v100_lite/aot" },
+    { name = "sglang-kernel", directory = "v100_plus/aot" },
     { name = "torch", url = "https://download.pytorch.org/whl/cu126/torch-2.13.0%2Bcu126-cp312-cp312-manylinux_2_28_x86_64.whl" },
     { name = "torchvision", url = "https://download.pytorch.org/whl/cu126/torchvision-0.28.0%2Bcu126-cp312-cp312-manylinux_2_28_x86_64.whl" },
 ]
@@ -2148,10 +2148,10 @@ provides-extras = ["checkpoint-engine", "runai", "diffusion", "diffusion-qvg", "
 [[package]]
 name = "sglang-kernel"
 version = "0.4.9+v100"
-source = { directory = "v100_lite/aot" }
+source = { directory = "v100_plus/aot" }
 
 [[package]]
-name = "sglang-v100-lite"
+name = "sglang-v100-plus"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
@@ -2173,7 +2173,7 @@ requires-dist = [
     { name = "setuptools-rust", specifier = ">=1.11" },
     { name = "setuptools-scm", specifier = ">=8" },
     { name = "sglang", editable = "python" },
-    { name = "sglang-kernel", directory = "v100_lite/aot" },
+    { name = "sglang-kernel", directory = "v100_plus/aot" },
     { name = "wheel" },
 ]
 

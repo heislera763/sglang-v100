@@ -16,7 +16,7 @@ from .dispatch import eager_extend, in_prefill, reject_fallback
 def install():
     redact_logs()
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
-        raise RuntimeError("SGLANG_V100_LITE=1 requires an SM70 CUDA device")
+        raise RuntimeError("SGLANG_V100_PLUS=1 requires an SM70 CUDA device")
     import sgl_kernel.elementwise as norm_ops
 
     import sglang.srt.layers.layernorm as norms

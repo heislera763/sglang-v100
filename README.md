@@ -7,7 +7,7 @@ selectively porting its kernels into plugin hooks and shared operators. This
 is effectively a rebase of the useful hardware adaptations into an independent
 fork, with a smaller surface for future upstream updates. The integrated
 upstream revision is `affa261e3d28`; exact origins and revisions are recorded in
-[v100_lite/provenance.json](v100_lite/provenance.json).
+[v100_plus/provenance.json](v100_plus/provenance.json).
 
 ## Architecture and scope
 
@@ -302,7 +302,7 @@ Marlin extension and applies its checked-in patches.
 git clone https://github.com/heislera763/sglang-v100-plus.git
 cd sglang-v100-plus
 git switch glm-5.3-flash-fast
-bash v100_lite/setup.sh
+bash v100_plus/setup.sh
 ```
 
 All development runs use `SGLANG_DEBUG_V100_STRICT_DISPATCH=1`. Guarded HC/mHC,
@@ -323,7 +323,7 @@ export PATH="$PWD/.venv/bin:$CUDA_HOME/bin:$PATH"
 export TRITON_PTXAS_PATH="$CUDA_HOME/bin/ptxas"
 export TORCH_CUDA_ARCH_LIST=7.0 OMP_NUM_THREADS=4 MAX_JOBS=4
 export NCCL_P2P_LEVEL=PHB NCCL_NVLS_ENABLE=0
-export SGLANG_PLUGINS=v100_lite SGLANG_V100_LITE=1
+export SGLANG_PLUGINS=v100_plus SGLANG_V100_PLUS=1
 export SGLANG_DEBUG_V100_STRICT_DISPATCH=1
 export SGLANG_V100_MARLIN_DIR="$PWD/artifacts/marlin-v100/vllm"
 export SGLANG_JIT_CACHE_DIR="$PWD/.cache/jit"
@@ -342,7 +342,7 @@ positions is the measured QA/low-entropy alternative in this small suite.
 
 ```bash
 export CUDA_VISIBLE_DEVICES=4,5,6,7
-uv run --no-project .venv/bin/python -m sglang_v100_lite \
+uv run --no-project .venv/bin/python -m sglang_v100_plus \
   --model-path "$HOME/models/sglang/RadixArk-Qwen3.8-Flash-Next-NVFP4" \
   --served-model-name qwen3.8-flash-next --trust-remote-code \
   --host 0.0.0.0 --port 9000 --api-key test-only --random-seed 531 \
@@ -376,7 +376,7 @@ export CUDA_VISIBLE_DEVICES=1,0,2,3,4,5,6,7
 export SGLANG_OPT_USE_TILELANG_MHC_PRE=0 SGLANG_OPT_USE_TILELANG_MHC_POST=0
 export SGLANG_OPT_FUSE_MHC_POST_PRE=0 SGLANG_DSA_FUSE_TOPK=1
 export SGLANG_OPT_SM70_NVFP4_GEMV=1 SGLANG_OPT_SM70_MHC_PROJECTION=1
-uv run --no-project .venv/bin/python -m sglang_v100_lite \
+uv run --no-project .venv/bin/python -m sglang_v100_plus \
   --model-path "$HOME/models/sglang/RadixArk-GLM-5.3-Flash-NVFP4" \
   --served-model-name glm5.3-flash --trust-remote-code --language-only \
   --host 0.0.0.0 --port 9000 --api-key test-only --random-seed 531 \
@@ -412,19 +412,18 @@ here, given the negligible MTP generation gain and reduced prefill throughput.
 
 ## Code organization and upstream maintenance
 
-- `v100_lite/sglang_v100_lite/`: opt-in runtime adapters and CUDA/Triton kernels.
-- `v100_lite/aot/` and `v100_lite/patches/`: native build and Marlin patches.
+- `v100_plus/sglang_v100_plus/`: opt-in runtime adapters and CUDA/Triton kernels.
+- `v100_plus/aot/` and `v100_plus/patches/`: native build and Marlin patches.
 - `python/sglang/kernels/ops/`: shared/public operators, including GLM additions.
-- `v100_lite/tests/gpu_checks.py`, `test/registered/` and `test/manual/`: focused
+- `v100_plus/tests/gpu_checks.py`, `test/registered/` and `test/manual/`: focused
   numerical, dispatch and distributed regressions.
 
 Services, transfer scripts, host runbooks, benchmark harnesses and raw experiment
-artifacts stay outside this source repository. The `v100_lite` package name is
-retained for now; its eventual rename is separate work.
+artifacts stay outside this source repository.
 
-[v100_lite/core-patches.json](v100_lite/core-patches.json) enumerates the core
+[v100_plus/core-patches.json](v100_plus/core-patches.json) enumerates the core
 exceptions. Verify maintained `main` with
-`uv run --no-project .venv/bin/python v100_lite/check-core-diff.py`.
+`uv run --no-project .venv/bin/python v100_plus/check-core-diff.py`.
 Update and validate `main` against upstream first, then integrate it into the
 GLM branches; integrate conservative GLM changes into the fast branch as well.
 Prefer upstream implementations when equivalent fixes land. Keep hardware

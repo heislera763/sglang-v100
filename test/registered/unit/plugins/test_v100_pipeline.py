@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -17,9 +18,9 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 maybe_stub_sgl_kernel()
 
 with patch.object(
-    sys, "path", [str(Path(__file__).resolve().parents[4] / "v100_lite"), *sys.path]
+    sys, "path", [str(Path(__file__).resolve().parents[4] / "v100_plus"), *sys.path]
 ):
-    from sglang_v100_lite.pipeline import (
+    from sglang_v100_plus.pipeline import (
         initialize_local_output,
         receive_output,
         send_output,

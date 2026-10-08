@@ -3,17 +3,17 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "sglang-v100-lite"
+name = "sglang-v100-plus"
 version = "0.1.0"
 requires-python = ">=3.12,<3.13"
 dependencies = ["sglang", "sglang-kernel", "pytest", "scikit-build-core", "cmake>=3.26", "setuptools-rust>=1.11", "setuptools-scm>=8", "wheel"]
 
 [project.entry-points."sglang.srt.plugins"]
-v100_lite = "sglang_v100_lite:register"
+v100_plus = "sglang_v100_plus:register"
 
 [tool.setuptools.packages.find]
-where = ["v100_lite"]
-include = ["sglang_v100_lite*"]
+where = ["v100_plus"]
+include = ["sglang_v100_plus*"]
 
 [tool.uv]
 environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
@@ -24,7 +24,7 @@ no-build-isolation-package = ["sglang", "sglang-kernel"]
 
 [tool.uv.sources]
 sglang = { path = "python", editable = true }
-sglang-kernel = { path = "v100_lite/aot" }
+sglang-kernel = { path = "v100_plus/aot" }
 
 [tool.setuptools.package-data]
-sglang_v100_lite = ["kernels/csrc/*.cu", "kernels/csrc/*.cpp", "kernels/csrc/elementwise/*.cuh"]
+sglang_v100_plus = ["kernels/csrc/*.cu", "kernels/csrc/*.cpp", "kernels/csrc/elementwise/*.cuh"]

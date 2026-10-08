@@ -13,8 +13,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ref", default="main")
     args = parser.parse_args()
-    provenance = json.loads(git("show", args.ref + ":v100_lite/provenance.json"))
-    manifest = json.loads(git("show", args.ref + ":v100_lite/core-patches.json"))
+    paths = git("ls-tree", "-r", "--name-only", args.ref).splitlines()
+    provenance_path = next(p for p in paths if p.endswith("/provenance.json"))
+    manifest_path = next(p for p in paths if p.endswith("/core-patches.json"))
+    provenance = json.loads(git("show", args.ref + ":" + provenance_path))
+    manifest = json.loads(git("show", args.ref + ":" + manifest_path))
     base = provenance["current_upstream"]
     subprocess.run(["git", "merge-base", "--is-ancestor", base, args.ref], check=True)
     changed = set(

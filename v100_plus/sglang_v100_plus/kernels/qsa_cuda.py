@@ -20,10 +20,6 @@ QSA_DECODE_TARGET_CTAS = 160
 QSA_DECODE_TOKENS_PER_SPLIT = 32
 
 
-
-
-
-
 def _load_sm70_cuda_decode_ops():
     """Lazy-load the standalone SM70 long-context decode extension (JIT-built)."""
     global _EXT, _OPS_LOAD_ATTEMPTED
@@ -57,8 +53,6 @@ def _load_sm70_cuda_decode_ops():
         return None
     logger.info("SM70 (V100): CUDA long-context decode partial loaded.")
     return _EXT
-
-
 
 
 def sm70_cuda_qsa_prefill(
@@ -136,7 +130,7 @@ def sm70_cuda_qsa_decode(
         and torch.cuda.get_device_capability(q.device) == (7, 0)
         and os.environ.get("SGLANG_SM70_QSA_COMBINE", "1") == "1"
     ):
-        from sglang_v100_lite.kernels.fusions import combine
+        from sglang_v100_plus.kernels.fusions import combine
 
         return combine(
             partial_o,

@@ -9,7 +9,7 @@ import tilelang.language as T
 import torch
 import triton
 import triton.language as tl
-from sglang_v100_lite.kernels.attention import _D256_PASS_CONFIGS, _LOG2_E
+from sglang_v100_plus.kernels.attention import _D256_PASS_CONFIGS, _LOG2_E
 
 
 @triton.jit
