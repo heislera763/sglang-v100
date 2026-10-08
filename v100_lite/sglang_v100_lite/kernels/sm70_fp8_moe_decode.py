@@ -27,7 +27,12 @@ def _partial(
     route = tl.program_id(2)
     expert = tl.load(Ids + route)
     if expert >= 0:
-        n = tl.program_id(0) * BN + tl.arange(0, BN)
+        # Cover the four interleaved 64-column subtiles together. Adjacent
+        # lanes now read adjacent packed words rather than every fourth word.
+        lane = tl.arange(0, BN)
+        macro = tl.program_id(0) // (MACRO // BN)
+        sub = tl.program_id(0) % (MACRO // BN)
+        n = macro * MACRO + (lane % 4) * 64 + sub * (BN // 4) + lane // 4
         k = tl.program_id(1) * BK + tl.arange(0, BK)
         group_tiles = MACRO // 64
         n_tile = n // 64
@@ -146,12 +151,12 @@ def fp8_moe_decode(x, w13, w2, s13, s2, ids, weights):
     )
     gate, activation, down = scratch
     out = torch.empty_like(x)
-    _partial[(40, 20, topk)](
-        x, w13, s13, ids, gate, 1280, 2560, False, 32, 128, 256, num_warps=4
+    _partial[(20, 20, topk)](
+        x, w13, s13, ids, gate, 1280, 2560, False, 64, 128, 256, num_warps=4
     )
     _activate[(5, topk)](gate, ids, activation, 640, 20, 32, 128, num_warps=4)
-    _partial[(80, 5, topk)](
-        activation, w2, s2, ids, down, 2560, 640, True, 32, 128, 256, num_warps=4
+    _partial[(40, 5, topk)](
+        activation, w2, s2, ids, down, 2560, 640, True, 64, 128, 256, num_warps=4
     )
     _combine[(40,)](
         down,

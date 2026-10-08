@@ -156,25 +156,37 @@ whole experts instead. Native QSA covers three heads for TP8 and six for TP4.
 | --- | --- | ---: | ---: |
 | TP8 + EP8 | Off | 3,249 | 36.1 |
 | TP8 + EP8 | Two steps | 3,112 | 59.6 |
-| TP4 × PP2 + EP4 | Off | 5,847 | 46.4 |
+| TP4 × PP2 + EP4 | Off | 5,981 | 61.8 |
 | TP4 × PP2 + EP4 | Two steps | 5,620 | 46.4 |
 
-PP2 improves prefill by about 80% with either decoding mode. TP8 remains faster
-for generation with MTP: 59.6 versus 46.4 tokens/s. Two-step MTP improves
-generation by 65% on TP8, with 61% accepted draft tokens (excluding bonus
-tokens). PP2's earlier MTP measurement had 58% acceptance; it now roughly
-matches the optimized ordinary-decoding rate. The other three rows predate
-the ordinary PP2 decode optimization and retain their existing execution paths.
+Ordinary PP2 now gives about 84% higher prefill and 71% higher generation
+throughput than ordinary TP8. Its 61.8 tokens/s also narrowly exceeds the older
+TP8 MTP measurement; PP2 MTP still uses its earlier path. Two-step MTP improved
+TP8 generation by 65%, with 61% accepted draft tokens (excluding bonus tokens).
+PP2's earlier MTP measurement had 58% acceptance. The other three rows predate
+the ordinary PP2 optimizations and retain their existing execution paths.
 
-Ordinary TP4 × PP2 now uses a native four-kernel vector expert path for one
-token, retaining E4M3 weights, FP16 dequantization/activation boundaries and
-FP32 partial sums. It avoids padding a single token into a generic GEMM and
-combines activation and route reduction work. Nine fresh requests confirmed
-**19.6% faster generation**, up from 38.8 tokens/s, with unchanged prefill
-throughput; the new run used excluded 64-token warmups. Numerical checks cover
-independent dequantized-weight references and live ten-route graph masking.
+Ordinary TP4 × PP2 uses a native four-kernel vector expert path for one token,
+retaining E4M3 storage, FP16 dequantization/activation boundaries and FP32
+partial sums. Packed-word reads cover the four interleaved output subtiles
+together, reducing scattered traffic. The PP2 scheduler keeps the last stage's
+sampled result locally instead of echoing it back from the first stage;
+postprocessing still runs in its original order and waits for the sampling
+event. This applies only to serialized, single-request, non-speculative PP2.
+Both changes stay in the plugin; core scheduling and model files are unchanged.
 
-Two independent one-request microbatches also work: two measured pairs gave
+Nine matched near-8K/512-token requests confirmed **33.2% faster generation**
+than the preceding 46.4 tokens/s build, and 59% over the earlier 38.8 tokens/s
+Marlin-only profile. Prefill changed from 5,847 to 5,981 tokens/s. The measured
+configuration also enables `SGLANG_ENABLE_METADATA_GLUE_GRAPH=1`: GPU-only
+QSA/GDN metadata refresh runs through a small graph. Warmup checks compared
+all 21 metadata tensors exactly with fresh eager metadata on every rank;
+checks were removed before timing. Numerical references cover finite E4M3
+codes, block scales, live ten-route masking and graph replay. Serving checks
+cover EOS, logprobs, cancellation and reuse after cancellation. Larger 4K
+prefill chunks were slower; the measured profile retains 2K chunks.
+
+An earlier two-request screen, before the current optimizations, gave
 **76.2 aggregate generation tokens/s**, with **38–42 tokens/s per request**.
 Nsight Systems confirms simultaneous stage execution during generation;
 one ordinary request executes the stages in sequence. This small concurrency
@@ -211,7 +223,12 @@ speculative flags. `setup.sh` builds both NVFP4 and FP8 expert kernels.
 
 For TP4 × PP2, replace the TP8/EP8 arguments with
 `--tensor-parallel-size 4 --pipeline-parallel-size 2 --expert-parallel-size 4`
-and set `SGLANG_PP_LAYER_PARTITION=24,24`. For PP2 with MTP, also set
+and set `SGLANG_PP_LAYER_PARTITION=24,24`. For the measured ordinary profile,
+retain `--max-running-requests 1 --disable-overlap-schedule`, 2048-token prefill
+chunks and batch-one full decode graphs, and set
+`SGLANG_ENABLE_METADATA_GLUE_GRAPH=1`. This metadata option was checked for
+this ordinary profile; leave it unset for other configurations until validated.
+For PP2 with MTP, also set
 `SGLANG_ENABLE_PP_SPEC=1`; retain two draft steps, three verification positions,
 top-k one, rejection sampling and `--disable-overlap-schedule`. Ordinary PP2
 omits the speculative flags and leaves `SGLANG_ENABLE_PP_SPEC` unset.

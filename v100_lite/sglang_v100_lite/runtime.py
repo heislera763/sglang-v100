@@ -30,6 +30,7 @@ def install():
         fp8_minimum_capability,
         prepare_fp8_moe,
     )
+    from .pipeline import initialize_local_output, receive_output, send_output
     from .quantization import (
         dense_marlin_gemm,
         marlin_gemm,
@@ -64,6 +65,21 @@ def install():
             raise ValueError("The enabled SM70 profile requires float16 model weights")
 
     hooks = [
+        (
+            "sglang.srt.managers.scheduler_pp_mixin.SchedulerPPMixin.init_pp_loop_state",
+            initialize_local_output,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.managers.scheduler_pp_mixin.SchedulerPPMixin._pp_send_output_to_next_stage",
+            send_output,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.managers.scheduler_pp_mixin.SchedulerPPMixin._pp_recv_dict_from_prev_stage",
+            receive_output,
+            HookType.AROUND,
+        ),
         (
             "sglang.srt.layers.quantization.fp8.Fp8Config.get_min_capability",
             fp8_minimum_capability,
