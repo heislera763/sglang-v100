@@ -207,30 +207,20 @@ def apply_fp8_moe(original, method, layer, dispatch_output):
     from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
-    from sglang.srt.runtime_context import get_parallel, get_schedule, get_spec
+    from sglang.srt.runtime_context import get_exec, get_schedule
 
     config = method.moe_runner_config
     hidden = dispatch_output.hidden_states
     topk = dispatch_output.topk_output
     if (
+        # Scratch is shared by serialized forwards. TP/PP placement and the
+        # number of locally stored experts do not change this operation.
         get_schedule().disable_overlap_schedule
-        and get_parallel().tp_size == 4
-        and (
-            (
-                get_spec().speculative_algorithm is None
-                and get_parallel().pp_size == 2
-                and hidden.shape == (1, 2560)
-            )
-            or (
-                get_spec().speculative_algorithm == "EAGLE"
-                # The one-layer draft temporarily uses a local PP group.
-                and get_parallel().pp_size in (1, 2)
-                and get_schedule().max_running_requests == 1
-                and hidden.ndim == 2
-                and 1 <= hidden.shape[0] <= 4
-                and hidden.shape[1] == 2560
-            )
-        )
+        and not get_exec().overlap.enable_two_batch_overlap
+        and not get_exec().overlap.enable_single_batch_overlap
+        and hidden.ndim == 2
+        and 1 <= hidden.shape[0] <= 4
+        and hidden.shape[1] == 2560
         and hidden.dtype == torch.float16
         and TopKOutputChecker.format_is_standard(topk)
         and topk.topk_ids.shape == (hidden.shape[0], 10)

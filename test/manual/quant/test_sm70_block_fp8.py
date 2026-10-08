@@ -5,6 +5,7 @@ signed E4M3 values and masked EP routes catch scale/layout/type confusion.
 """
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -212,11 +213,15 @@ class TestSM70BlockFP8(CustomTestCase):
                 self.assertFalse(bool(actual[0].any()))
 
     def test_routed_experts_and_masked_rows(self):
-        from sglang_v100_plus.fp8 import prepare_fp8_moe
+        from sglang_v100_plus.fp8 import apply_fp8_moe, prepare_fp8_moe
 
         from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
             fused_marlin_moe,
         )
+        from sglang.srt.layers.moe.token_dispatcher.standard import (
+            StandardDispatchOutput,
+        )
+        from sglang.srt.layers.moe.topk import StandardTopKOutput
         from sglang.srt.layers.moe.utils import initialize_moe_config
         from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
         from sglang.srt.runtime_context import get_context
@@ -439,6 +444,95 @@ class TestSM70BlockFP8(CustomTestCase):
                             torch.testing.assert_close(
                                 ten_actual, ten_expected.half(), rtol=0.005, atol=0.003
                             )
+                            if not masked:
+                                # Place the same independently checked experts
+                                # at the end of real TP8/TP4 local banks. This
+                                # exercises dispatch and large expert offsets.
+                                for local_experts, tp, pp in ((64, 8, 1), (128, 4, 2)):
+                                    bank = SimpleNamespace(
+                                        **{
+                                            name: torch.zeros(
+                                                (
+                                                    local_experts,
+                                                    *getattr(layer, name).shape[1:],
+                                                ),
+                                                device="cuda",
+                                                dtype=getattr(layer, name).dtype,
+                                            )
+                                            for name in (
+                                                "w13_weight",
+                                                "w2_weight",
+                                                "w13_weight_scale_inv",
+                                                "w2_weight_scale_inv",
+                                            )
+                                        }
+                                    )
+                                    # Only the final experts contain data: an
+                                    # index wrapped into the prefix must fail.
+                                    for name, value in vars(bank).items():
+                                        value[-e:].copy_(getattr(layer, name))
+                                    bank_ids = torch.where(
+                                        ten_ids >= 0,
+                                        ten_ids + local_experts - e,
+                                        ten_ids,
+                                    )
+                                    vector_method = SimpleNamespace(
+                                        moe_runner_config=SimpleNamespace(
+                                            is_gated=True,
+                                            activation="silu",
+                                            apply_router_weight_on_input=False,
+                                            routed_scaling_factor=None,
+                                            gemm1_alpha=None,
+                                            gemm1_clamp_limit=None,
+                                            swiglu_limit=None,
+                                        )
+                                    )
+                                    dispatch = StandardDispatchOutput(
+                                        x,
+                                        None,
+                                        StandardTopKOutput(ten_weights, bank_ids, None),
+                                    )
+                                    with get_context().override_server_args(
+                                        model_path="dummy",
+                                        tp_size=tp,
+                                        ep_size=tp,
+                                        pp_size=pp,
+                                        disable_overlap_schedule=True,
+                                    ):
+                                        result = apply_fp8_moe(
+                                            None, vector_method, bank, dispatch
+                                        ).hidden_states
+                                        bank_graph = torch.cuda.CUDAGraph()
+                                        with torch.cuda.graph(bank_graph):
+                                            bank_output = apply_fp8_moe(
+                                                None, vector_method, bank, dispatch
+                                            ).hidden_states
+                                        bank_ids.fill_(-1)
+                                        bank_graph.replay()
+                                        self.assertEqual(
+                                            int(torch.count_nonzero(bank_output)), 0
+                                        )
+                                        bank_ids.copy_(
+                                            torch.where(
+                                                ten_ids >= 0,
+                                                ten_ids + local_experts - e,
+                                                ten_ids,
+                                            )
+                                        )
+                                        bank_graph.replay()
+                                        self.assertTrue(
+                                            torch.equal(
+                                                result.view(torch.int16),
+                                                ten_actual.view(torch.int16),
+                                            )
+                                        )
+                                        self.assertTrue(
+                                            torch.equal(
+                                                bank_output.view(torch.int16),
+                                                ten_actual.view(torch.int16),
+                                            )
+                                        )
+                                    del bank_graph, bank, bank_output, result
                             live_graph = torch.cuda.CUDAGraph()
                             with torch.cuda.graph(live_graph):
                                 live_out = fp8_moe_decode(

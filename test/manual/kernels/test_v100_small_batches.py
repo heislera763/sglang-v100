@@ -180,45 +180,48 @@ class TestV100SmallBatches(CustomTestCase):
                 atol=0,
             )
 
-    def test_fp8_verify_topk_preserves_ties_mass_and_graph_inputs(self):
+    def test_wide_topk_preserves_ties_mass_and_graph_inputs(self):
         """The faster renorm must retain cutoff ties and read each graph replay."""
         from sgl_kernel.sampling import _top_k_renorm_probs_internal
         from sglang_v100_plus.runtime import top_k_renorm_probs
 
-        from sglang.srt.runtime_context import get_context
+        from sglang.srt.sampling.sampling_params import TOP_K_ALL
 
         torch.manual_seed(531)
-        with get_context().override_server_args(
-            model_path="dummy",
-            quantization="fp8",
-            tp_size=4,
-            ep_size=4,
-            pp_size=2,
-            max_running_requests=1,
-            speculative_algorithm="EAGLE",
-        ):
-            for rows in (2, 3, 4):
+        for vocab in (131072, 154880, 248320, 262144):
+            for rows in (1, 2, 3, 4):
                 probs = torch.softmax(
-                    torch.randn(rows, 248320, device="cuda") * 4, dim=-1
+                    torch.randn(rows, vocab, device="cuda") * 4, dim=-1
                 )
                 top_ks = torch.full((rows,), 20, device="cuda", dtype=torch.int32)
                 top_k_renorm_probs(probs, top_ks)
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
                     actual = top_k_renorm_probs(probs, top_ks)
-                for tied, k in ((False, 20), (True, 20), (False, 5)):
-                    with self.subTest(rows=rows, tied=tied, k=k):
+                for tied in (False, True, False):
+                    with self.subTest(vocab=vocab, rows=rows, tied=tied):
                         if tied:
                             probs.fill_(1 / probs.shape[-1])
                         else:
                             probs.copy_(
                                 torch.softmax(torch.randn_like(probs) * 4, dim=-1)
                             )
-                        top_ks.fill_(k)
+                        top_ks.copy_(
+                            torch.tensor(
+                                [1, 20, 50, TOP_K_ALL][:rows],
+                                device="cuda",
+                                dtype=torch.int32,
+                            ).roll(1 if tied else 0)
+                        )
                         graph.replay()
                         # An independent FP64 mass calculation and the old
                         # AOT implementation both constrain the new output.
-                        pivot = probs.double().topk(k, dim=-1).values[:, -1:]
+                        indices = top_ks.long().clamp(max=vocab)[:, None] - 1
+                        pivot = (
+                            probs.double()
+                            .sort(dim=-1, descending=True)
+                            .values.gather(1, indices)
+                        )
                         kept = torch.where(probs >= pivot, probs.double(), 0.0)
                         reference = (kept / kept.sum(-1, keepdim=True)).float()
                         legacy = _top_k_renorm_probs_internal(probs, top_ks, 0)

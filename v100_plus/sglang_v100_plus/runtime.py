@@ -748,30 +748,21 @@ def route_top10(original, scores, bias, topk, *args, **kwargs):
 
 
 def top_k_renorm_probs(probs, top_k):
-    from sglang.srt.runtime_context import (
-        get_model,
-        get_parallel,
-        get_schedule,
-        get_spec,
-    )
-
     if (
         probs.ndim == 2
-        and 2 <= probs.shape[0] <= 4
-        and probs.shape[1] == 248320
+        and 1 <= probs.shape[0] <= 4
+        and 131072 <= probs.shape[1] <= 262144
         and probs.dtype == torch.float32
-        and get_model().quantization == "fp8"
-        and get_spec().speculative_algorithm == "EAGLE"
-        and get_parallel().tp_size == 4
-        and get_parallel().pp_size == 2
-        and get_schedule().max_running_requests == 1
+        and probs.is_cuda
     ):
         from sglang.kernels.ops.sampling.renorm_triton import (
             top_k_renorm_probs_triton,
         )
 
-        # Vocabulary-wide row reductions leave most Volta SMs idle. Device
-        # sorting plus parallel mask/reduction retains the same cutoff ties.
+        # Small batches of wide probability rows leave most Volta SMs idle in
+        # the one-block-per-row implementation. This selection depends on the
+        # probability tensor, not weight quantization or distributed placement.
+        # Sorting plus parallel mask/reduction retains the same cutoff ties.
         return top_k_renorm_probs_triton(probs, top_k)
     return _top_k_renorm_probs_internal(probs, *_to_tensor_scalar_tuple(top_k))
 
