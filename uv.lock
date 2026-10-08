@@ -398,6 +398,17 @@ wheels = [
 ]
 
 [[package]]
+name = "decord"
+version = "0.6.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/11/79/936af42edf90a7bd4e41a6cac89c913d4b47fa48a26b042d5129a9242ee3/decord-0.6.0-py3-none-manylinux2010_x86_64.whl", hash = "sha256:51997f20be8958e23b7c4061ba45d0efcd86bffd5fe81c695d0befee0d442976", size = 13602299, upload-time = "2021-06-14T21:30:55.486Z" },
+]
+
+[[package]]
 name = "dill"
 version = "0.4.1"
 source = { registry = "https://pypi.org/simple" }
@@ -2156,6 +2167,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "cmake" },
+    { name = "decord" },
     { name = "pytest" },
     { name = "scikit-build-core" },
     { name = "setuptools-rust" },
@@ -2168,6 +2180,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "cmake", specifier = ">=3.26" },
+    { name = "decord", specifier = "==0.6.0" },
     { name = "pytest" },
     { name = "scikit-build-core" },
     { name = "setuptools-rust", specifier = ">=1.11" },

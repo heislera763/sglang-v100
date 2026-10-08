@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "sglang-v100-plus"
 version = "0.1.0"
 requires-python = ">=3.12,<3.13"
-dependencies = ["sglang", "sglang-kernel", "pytest", "scikit-build-core", "cmake>=3.26", "setuptools-rust>=1.11", "setuptools-scm>=8", "wheel"]
+dependencies = ["sglang", "sglang-kernel", "pytest", "scikit-build-core", "cmake>=3.26", "setuptools-rust>=1.11", "setuptools-scm>=8", "wheel", "decord==0.6.0"]
 
 [project.entry-points."sglang.srt.plugins"]
 v100_plus = "sglang_v100_plus:register"
