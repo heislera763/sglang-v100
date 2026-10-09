@@ -16,8 +16,6 @@
     "python/sglang/kernels/ops/moe/sm70_nvfp4.py": "Volta NVFP4 expert GEMV with FP32 accumulation and ordinary FP16 activation/sum boundaries.",
     "python/sglang/kernels/ops/speculative/dspark/dspark_accept.py": "Official upstream e902207a/#43012 block verification and explicit SM70 Torch softmax; FlashInfer requires SM75+.",
     "python/sglang/srt/arg_groups/fields/model.py": "Allow explicit float16 QSA index cache.",
-    "python/sglang/srt/arg_groups/fields/spec.py": "Official upstream e902207a/#43012 block-verification CLI help.",
-    "python/sglang/srt/arg_groups/speculative_hook.py": "Official upstream e902207a/#43012 DFlash block-verification resolution.",
     "python/sglang/srt/environ.py": "Typed SM70 optimization switches, HC prefill partitions, sampled verification graphs and strict V100 dispatch diagnostics.",
     "python/sglang/srt/layers/attention/dsa/dsa_indexer_kpool.py": "Dispatch supported SM70 K-pool/indexer decode operations.",
     "python/sglang/srt/layers/attention/dsa_backend.py": "Allocate and dispatch Volta-compatible FP16 sparse attention/indexer paths.",
@@ -25,9 +23,6 @@
     "python/sglang/srt/managers/scheduler_pp_mixin.py": "Relay exact draft probabilities into sampled PP verification; cold rows fall back to target sampling.",
     "python/sglang/srt/managers/utils.py": "Carry proposal probabilities with the next PP verification tree.",
     "python/sglang/srt/mem_cache/qsa_kv_pool.py": "FP16 QSA index-cache allocation and safe dtype validation.",
-    "python/sglang/srt/speculative/dflash_worker_v2.py": "Official upstream e902207a/#43012 DFlash sampled block-verification selection.",
-    "python/sglang/srt/speculative/dspark_components/dspark_verify.py": "Official upstream e902207a/#43012 DSpark block-verification forwarding.",
-    "python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py": "Official upstream e902207a/#43012 DSpark block-verification setting.",
     "python/sglang/srt/speculative/eagle_worker_v2.py": "Avoid optional newer-GPU DSA imports; preserve PP draft probabilities and per-request greedy prefill proposals.",
     "python/sglang/srt/speculative/pp_spec_relay.py": "Keep proposal probabilities aligned with request identities across the PP relay."
   }
