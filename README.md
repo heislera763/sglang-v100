@@ -23,9 +23,10 @@ The integrated upstream revision is `c892301ff76f`; see
   embeddings; GLM sparse MLA/K-pool indexing, KDA and mHC. Qwen FP8 uses vector
   experts for compatible ordinary/MTP rows across TP/PP layouts; top-k for wide
   vocabularies is shared with NVFP4. Compatible FP8 experts share 32-row route
-  alignment, and FP8/NVFP4 share masked Tensor Core QSA prefill. TP4 HC prefill
-  partitions FP16 token work within each quad on PP1/PP2, trimming padding before
-  consumers. PP2 adds GPU metadata graphs and block-scale reuse. Sampled
+  alignment, and FP8/NVFP4 share masked Tensor Core QSA prefill. HC prefill
+  partitions FP16 token work within TP4 stages or independent quad groups on TP8;
+  model attention/experts retain their topology and consumers receive trimmed
+  full rows. PP2 adds GPU metadata graphs and block-scale reuse. Sampled
   MTP keeps exact draft probabilities locally, packs nested PP result tensors
   for both models and retains Tensor Core Qwen target/draft prompt attention.
   Qwen PP2 also captures accepted recurrent/PLE copies for one-to-three-step
@@ -134,7 +135,10 @@ uv run --no-project .venv/bin/python -m sglang_v100_plus "${sglang_args[@]}" \
   --preferred-sampling-params '{"temperature":1.0,"top_p":0.95,"top_k":20,"min_p":0.0,"presence_penalty":0.0,"frequency_penalty":0.0,"repetition_penalty":1.0}'
 ```
 
-For FP8 TP8, use TP8/EP8, omit PP and unset the partition/HC/metadata flags.
+For FP8 TP8, use TP8/EP8, omit PP and unset `SGLANG_PP_LAYER_PARTITION`,
+`SGLANG_ENABLE_PP_SPEC` and `SGLANG_ENABLE_METADATA_GLUE_GRAPH`. Keep
+`SGLANG_OPT_SM70_HC_PREFILL_SP=1` and 4352-token chunks. Each consecutive group
+of four launch ranks must be one NVLink quad; HC gathers stay within that quad.
 For FP8 PP2 MTP, keep HC/metadata flags and 4352-token chunks, set
 `SGLANG_ENABLE_PP_SPEC=1` and add Qwen's two-step speculative arguments above.
 The metadata flag also enables Qwen first-stage commit graphs for one-to-three-step
@@ -199,8 +203,8 @@ excludes the first token. Warmups, cached input and retractions are excluded.
 **A/F** and **G MTP** use nine-request confirmations; **C** and **G ordinary**
 are three-request checks. **H** compares six requests per TP8 variant and
 three per NVFP4 variant. **I** uses six requests each for baseline/best prefill
-profiles, plus three per component screen. **J** uses six alternating requests
-per eager/captured commit variant. Rows from different revisions are not
+profiles, plus three per component screen. **J/K** use six alternating requests
+per variant. Rows from different revisions are not
 controlled A/Bs.
 
 | Checkpoint / layout | MTP steps | Prefill tokens/s | Generation tokens/s | Evidence |
@@ -212,8 +216,8 @@ controlled A/Bs.
 | GLM NVFP4 / TP4×PP2 | 3 | 1,593 | 36.1 | F |
 | Qwen FP8 / TP4×PP2 + EP4 | Off | 8,092 | 61.6 | G |
 | Qwen FP8 / TP4×PP2 + EP4 | 2 | 7,609 | 70.6 | G |
-| Qwen FP8 / TP8 + EP8 | Off | 4,532 | 51.8 | I |
-| Qwen FP8 / TP8 + EP8 | 2 | 4,012 | 75.0 | H |
+| Qwen FP8 / TP8 + EP8 | Off | 5,035 | 51.3 | K |
+| Qwen FP8 / TP8 + EP8 | 2 | 4,859 | 75.2 | K |
 | GLM NVFP4 / TP8 | Off | 1,163 | 39.6 | C |
 | GLM NVFP4 / TP8 | 3 | 1,084 | 37.5 | C |
 
@@ -224,9 +228,10 @@ Runtime revisions: **A** [`cf7f7e9f`](https://github.com/heislera763/sglang-v100
 **H** [`e054ff4d`](https://github.com/heislera763/sglang-v100-plus/commit/e054ff4d072616ec5678683adcf14c65e377e17d),
 **I** [`27e5127d`](https://github.com/heislera763/sglang-v100-plus/commit/27e5127dca21525f0d56d3e1c15760d7b9e7ceac),
 **J** [`0b635664`](https://github.com/heislera763/sglang-v100-plus/commit/0b6356649e995fabb6527028c10094264bcf7b6f),
+**K** [`3aa8b41e`](https://github.com/heislera763/sglang-v100-plus/commit/3aa8b41e29b70f61190973891f58f1b83850ba5a),
 2026-10-07/08, Torch `2.13.0+cu126`. Eager prefill/full batch-one decode,
 strict dispatch, no overlap/radix, context/cache 12288. A/C/F GLM use 2048-token
-chunks; G/I/J Qwen use 4352 with HC/metadata where admitted. H uses 4352,
+chunks; G/I/J/K Qwen use 4352 with HC/metadata where admitted. H uses 4352,
 without HC partitioning or metadata graphs.
 
 Matched controls:
@@ -244,14 +249,18 @@ Matched controls:
   Verification execution improves 3.9%/5.5%; acceptance varies slightly. All 192
   native state byte comparisons, exact proposal/payload and lifecycle checks pass.
   The recommended FP8 two-step setting is unchanged; this compares commit implementations.
+- **K:** HC-only quad groups improve TP8 ordinary prefill **4,506→5,035 (+11.7%)**
+  and two-step MTP **4,368→4,859 (+11.2%)**. Model TP8/EP8 and decode stay intact;
+  verification execution is flat. All 9,456 native HC checks pass at matched GEMM
+  geometry, including exact reconstructed inputs across quads; lifecycle checks pass.
 
-G MTP category means (three requests each):
+K TP8 MTP category rates (two requests each):
 
 | Category | Prefill tokens/s | Generation tokens/s |
 | --- | ---: | ---: |
-| Coding | 7,647 | 74.4 |
-| Book continuation | 7,648 | 67.6 |
-| Document briefing | 7,532 | 69.9 |
+| Coding | 4,909 | 82.3 |
+| Book continuation | 4,858 | 72.1 |
+| Document briefing | 4,810 | 72.1 |
 
 Benchmark tooling and raw responses stay outside Git.
 
