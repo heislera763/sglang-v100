@@ -17,7 +17,9 @@ def mhc_pre(original, residual, *args, **kwargs):
     from sglang.srt.environ import envs
 
     fuse_projection = (
-        residual.shape == (1, 4, 4096) and envs.SGLANG_OPT_SM70_MHC_PROJECTION.get()
+        1 <= residual.shape[0] <= 8
+        and residual.shape[1:] == (4, 4096)
+        and envs.SGLANG_OPT_SM70_MHC_PROJECTION.get()
     )
     fuse_pointwise = (
         residual.shape == (1, 4, 4096) and envs.SGLANG_OPT_SM70_MHC_POINTWISE.get()

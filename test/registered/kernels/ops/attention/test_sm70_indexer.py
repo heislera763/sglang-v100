@@ -6,6 +6,7 @@ import torch
 from sglang.kernels.ops.attention.dsa.sm70_indexer import (
     fp8_quantize_sm70,
     kpool_compress_sm70,
+    mqa_logits_sm70,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -22,6 +23,50 @@ def reference_quantize(x, round_scale):
     if round_scale:
         scale = torch.exp2(torch.ceil(torch.log2(scale)))
     return (x / scale).clamp(-448, 448).to(torch.float8_e4m3fn), scale
+
+
+@pytest.mark.parametrize("query_chunk", [32, 64, 128])
+def test_scoring_query_batches_preserve_causality_and_head_reduction(query_chunk):
+    """Larger launches must not expose a future pool or mix query/head rows."""
+    torch.manual_seed(739)
+    query, _ = fp8_quantize_sm70(torch.randn(151, 32, 128, device="cuda"))
+    keys, scales = fp8_quantize_sm70(torch.randn(521, 128, device="cuda"))
+    weights = torch.randn(151, 32, device="cuda") * 0.01
+    lengths = torch.arange(151, device="cuda", dtype=torch.int32) // 4 + 485
+    lengths[0] = 0
+    chunks = [
+        mqa_logits_sm70(
+            query[i : i + query_chunk],
+            keys,
+            scales,
+            weights[i : i + query_chunk],
+            lengths[i : i + query_chunk],
+        )
+        for i in range(0, query.shape[0], query_chunk)
+    ]
+    actual = torch.cat(chunks).cpu()
+    reference_dots = torch.einsum(
+        "thd,kd->thk", query.cpu().float(), keys.cpu().float()
+    )
+    expected = (reference_dots.relu() * weights.cpu()[:, :, None]).sum(1)
+    expected *= scales.cpu().reshape(1, -1)
+    future = torch.arange(keys.shape[0])[None, :] >= lengths.cpu()[:, None]
+    expected.masked_fill_(future, float("-inf"))
+    assert torch.equal(torch.isneginf(actual), future)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-4)
+    baseline = torch.cat(
+        [
+            mqa_logits_sm70(
+                query[i : i + 32],
+                keys,
+                scales,
+                weights[i : i + 32],
+                lengths[i : i + 32],
+            )
+            for i in range(0, query.shape[0], 32)
+        ]
+    ).cpu()
+    assert torch.equal(actual, baseline)
 
 
 @pytest.mark.parametrize("round_scale", [False, True])

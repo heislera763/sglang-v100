@@ -252,6 +252,61 @@ def moe_runner(original, cls, dispatch_name, runner_name):
     def run(dispatch, quant, config):
         h = dispatch.hidden_states
         topk = dispatch.topk_output
+        from sglang.srt.environ import envs
+
+        if (
+            envs.SGLANG_OPT_SM70_NVFP4_MOE_GEMV.get()
+            and h.is_cuda
+            and h.dtype == torch.float16
+            and h.ndim == 2
+            and 1 <= h.shape[0] <= 4
+            and h.shape[1] == 4096
+            and tuple(topk.topk_ids.shape) == (h.shape[0], 8)
+            and topk.topk_ids.dtype == torch.int32
+            and topk.topk_weights.dtype == torch.float32
+            and tuple(quant.w2_qweight.shape) in ((288, 16, 8192), (288, 32, 8192))
+            and tuple(quant.w13_qweight.shape)
+            == (288, 256, quant.w2_qweight.shape[1] * 64)
+            and quant.weight_bits == 4
+            and quant.w13_scales.dtype == quant.w2_scales.dtype == torch.float8_e4m3fn
+            and quant.w13_qzeros is None
+            and quant.w2_qzeros is None
+            and quant.w13_global_scale is not None
+            and quant.w2_global_scale is not None
+            and quant.expert_map is None
+            and config.num_experts == config.num_local_experts == 288
+            and config.activation == "silu"
+            and config.is_gated
+            and not config.apply_router_weight_on_input
+            and not config.no_combine
+            and config.swiglu_limit == 10.0
+            and config.routed_scaling_factor == 2.5
+            and config.gemm1_clamp_limit is None
+            and config.gemm1_alpha is None
+            and config.gemm1_beta is None
+            and quant.w13_bias is None
+            and quant.w2_bias is None
+            and torch.cuda.get_device_capability(h.device) == (7, 0)
+        ):
+            from sglang.kernels.ops.moe.sm70_nvfp4 import sm70_nvfp4_moe
+            from sglang.srt.layers.moe.token_dispatcher.standard import (
+                StandardCombineInput,
+            )
+
+            output = sm70_nvfp4_moe(
+                h,
+                topk.topk_ids,
+                topk.topk_weights,
+                quant.w13_qweight,
+                quant.w2_qweight,
+                quant.w13_scales,
+                quant.w2_scales,
+                quant.w13_global_scale,
+                quant.w2_global_scale,
+                config.swiglu_limit,
+                config.routed_scaling_factor,
+            )
+            return StandardCombineInput(hidden_states=output)
         if (
             h.dtype == torch.float16
             and quant.weight_bits == 8

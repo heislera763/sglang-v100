@@ -50,6 +50,31 @@
     "python/sglang/kernels/aot/csrc/moe/moe_align_kernel.cu": {
       "commit": "fc9bdc8a3e60a0896e58d84ac261cc470ab4a24c",
       "change": "Bound vector padding stores and fill the scalar tail"
+    },
+    "python/sglang/kernels/ops/speculative/dspark/dspark_accept.py": {
+      "commit": "e902207a4e65f80da20046c52567eb923cb8ccce",
+      "change": "Forward sampled DFlash/DSpark block verification",
+      "local_adaptation": "Select explicit Torch CUDA softmax on SM70; installed FlashInfer requires SM75 or newer"
+    },
+    "python/sglang/srt/arg_groups/fields/spec.py": {
+      "commit": "e902207a4e65f80da20046c52567eb923cb8ccce",
+      "change": "Document DFlash/DSpark block-verification CLI support"
+    },
+    "python/sglang/srt/arg_groups/speculative_hook.py": {
+      "commit": "e902207a4e65f80da20046c52567eb923cb8ccce",
+      "change": "Resolve sampled DFlash/DSpark block verification without EAGLE rejection flags"
+    },
+    "python/sglang/srt/speculative/dflash_worker_v2.py": {
+      "commit": "e902207a4e65f80da20046c52567eb923cb8ccce",
+      "change": "Select sampled DFlash block verification; explain point-mass draft limitation"
+    },
+    "python/sglang/srt/speculative/dspark_components/dspark_verify.py": {
+      "commit": "e902207a4e65f80da20046c52567eb923cb8ccce",
+      "change": "Forward block-verification setting to sampled proposal verification"
+    },
+    "python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py": {
+      "commit": "e902207a4e65f80da20046c52567eb923cb8ccce",
+      "change": "Retain the configured DSpark block-verification setting"
     }
   },
   "consolidated": {

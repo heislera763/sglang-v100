@@ -192,6 +192,15 @@ del _fn
 
 register_kernel(
     KernelSpec(
+        op="attention.sparse_mla_prefill_sm70",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.dsa.sm70_sparse_prefill:sparse_mla_prefill_sm70",
+        capabilities={CapabilityRequirement.cuda(min_sm=(7, 0), max_sm=(7, 0))},
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="attention.pool4_decode_sm70",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.attention.dsa.sm70_pool4_decode:pool4_decode_sm70",

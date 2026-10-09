@@ -21,6 +21,19 @@ _HIP = frozenset({CapabilityRequirement.HIP})
 
 register_kernel(
     KernelSpec(
+        op="moe.sm70_nvfp4_moe",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.sm70_nvfp4:sm70_nvfp4_moe",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(7, 0), max_sm=(7, 0))}
+        ),
+        format_signature=FormatSignature(supported_dtypes=("float16",)),
+        description="Volta small-row NVFP4 experts with FP32 GEMV accumulation.",
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="moe.moe_align_block_size",
         backend=KernelBackend.AOT,
         target="sgl_kernel:moe_align_block_size",

@@ -180,6 +180,33 @@ class TestV100Pipeline(CustomTestCase):
                         self.assertEqual(result, "eager")
                         self.assertEqual(len(commits), before)
 
+                # GLM Triton KDA shares the stable-row scatter contract. A
+                # replacement linear backend must retain/capture new owners.
+                worker.model_runner.model_config.hf_config.architectures = [
+                    "Glm5NextForConditionalGeneration"
+                ]
+                backend = SimpleNamespace(
+                    linear_attn_backend=SimpleNamespace(accept_lens_pool=None)
+                )
+                worker.model_runner.attn_backend = backend
+                commit_relayed_states(eager, worker, batch, accept, indices, 3)
+                first = commits[-1][0]
+                backend.linear_attn_backend = SimpleNamespace(accept_lens_pool=None)
+                commit_relayed_states(eager, worker, batch, accept, indices, 3)
+                self.assertIsNot(commits[-1][0], first)
+                for arch, accept_pool in (
+                    ("Glm5NextForConditionalGeneration", object()),
+                    ("OtherModel", None),
+                ):
+                    worker.model_runner.model_config.hf_config.architectures = [arch]
+                    backend.linear_attn_backend.accept_lens_pool = accept_pool
+                    before = len(commits)
+                    self.assertEqual(
+                        commit_relayed_states(eager, worker, batch, accept, indices, 3),
+                        "eager",
+                    )
+                    self.assertEqual(len(commits), before)
+
     def test_nested_logprobs_do_not_put_storage_in_pickle_metadata(self):
         """Nested logprobs formerly bypassed extraction and restored on the sender GPU."""
         import pickle

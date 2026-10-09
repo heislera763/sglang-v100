@@ -1,7 +1,7 @@
 """FP16 mHC pre-mix with an FP32 projection and fused Sinkhorn finalization.
 
 Volta has neither BF16 tensor cores nor TF32. The default learned projection
-uses FP32 cuBLAS. An opt-in batch-one path fuses FP32 projection and squared
+uses FP32 cuBLAS. An opt-in small-batch path fuses FP32 projection and squared
 norm partials, then reduces them with the gates and Sinkhorn finalization.
 Another opt-in path retains both reference reductions and fuses only the
 surrounding pointwise operations.
@@ -32,10 +32,14 @@ def _project_rms_kernel(
     K: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    SPLITS: tl.constexpr,
 ):
-    """FP32 projection and squared-norm partials for a single decode row."""
+    """Independent FP32 projection and squared-norm partials per decode row."""
     split = tl.program_id(0)
     group = tl.program_id(1)
+    row = tl.program_id(2)
+    RESIDUAL += row * K
+    PARTIALS += row * SPLITS * 25
     k = split * BLOCK_K + tl.arange(0, BLOCK_K)
     n = group * BLOCK_N + tl.arange(0, BLOCK_N)
     x = tl.load(RESIDUAL + k, k < K, 0).to(tl.float32)
@@ -71,6 +75,7 @@ def _finalize_kernel(
     j = tl.arange(0, HC)
     jj, kk = j[:, None], j[None, :]
     if PROJECTION_SPLITS:
+        MIXES += row * PROJECTION_SPLITS * 25
         split = tl.arange(0, PROJECTION_SPLITS)
         valid = split < PROJECTION_SPLITS
         squares = tl.load(MIXES + split * 25 + 24, valid, 0)
@@ -147,8 +152,9 @@ def mhc_pre_sm70(
 
     HC=4 contiguous FP16 residuals and contiguous FP32 parameters are required.
     Epsilons and the post multiplier retain the torch fallback's semantics.
-    ``fuse_projection`` supports only (M, HC, H) = (1, 4, 4096); its split
+    ``fuse_projection`` supports (M, HC, H) = (1..8, 4, 4096); its split
     FP32 summation has a different reduction order from cuBLAS/torch.
+    Rows retain the batch-one reduction, including speculative verification.
     ``fuse_pointwise`` retains cuBLAS projection and torch mean reduction,
     fusing only cast/square and epsilon/rsqrt operations for the same shape.
     """
@@ -161,7 +167,7 @@ def mhc_pre_sm70(
     assert fn.shape == (24, hc * h)
     assert hc_scale.numel() == 3 and hc_base.numel() == 24
     assert sinkhorn_repeat >= 1
-    assert not fuse_projection or (m == 1 and h == 4096)
+    assert not fuse_projection or (1 <= m <= 8 and h == 4096)
     assert not fuse_pointwise or (m == 1 and h == 4096)
     assert not (fuse_projection and fuse_pointwise)
     pre = torch.empty((m, hc), dtype=torch.float32, device=residual.device)
@@ -173,16 +179,17 @@ def mhc_pre_sm70(
         if fuse_projection:
             splits = triton.cdiv(hc * h, 1024)
             mixes = torch.empty(
-                (splits, 25), dtype=torch.float32, device=residual.device
+                (m, splits, 25), dtype=torch.float32, device=residual.device
             )
             rms = mixes  # The fused finalizer reads norm partials from mixes.
-            _project_rms_kernel[(splits, 6)](
+            _project_rms_kernel[(splits, 6, m)](
                 residual,
                 fn,
                 mixes,
                 K=hc * h,
                 BLOCK_K=1024,
                 BLOCK_N=4,
+                SPLITS=splits,
                 num_warps=4,
                 enable_fp_fusion=False,
             )

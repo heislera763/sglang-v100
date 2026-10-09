@@ -915,11 +915,15 @@ class Envs:
     # V100 fast branch: measured batch-one GLM NVFP4 projections only.
     # These paths change accumulation order; set either flag to 0 to opt out.
     SGLANG_OPT_SM70_NVFP4_GEMV = EnvBool(True)
-    # Fuse the batch-one GLM FP32 mHC projection and RMS partials. This fast
+    # Fuse the small-batch GLM FP32 mHC projection and RMS partials. This fast
     # branch accepts numerical differences from the unfused reference.
     SGLANG_OPT_SM70_MHC_PROJECTION = EnvBool(True)
     # Keep cuBLAS projection and torch mean; fuse only surrounding pointwise work.
     SGLANG_OPT_SM70_MHC_POINTWISE = EnvBool(False)
+    # Share two GLM prefill queries' exact sparse support; reduction order changes.
+    SGLANG_OPT_SM70_SPARSE_PREFILL_UNION = EnvBool(False)
+    # GLM gated experts: FP32 accumulation and ordinary Half boundaries.
+    SGLANG_OPT_SM70_NVFP4_MOE_GEMV = EnvBool(False)
     # Partition Qwen FP8 eager-prefill HC tokens within a TP4 NVLink quad.
     SGLANG_OPT_SM70_HC_PREFILL_SP = EnvBool(False)
     # Capture unpenalized linear rejection sampling for one serialized request.

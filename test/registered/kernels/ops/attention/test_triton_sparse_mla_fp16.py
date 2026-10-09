@@ -149,6 +149,110 @@ def test_splitk_workspace_preserves_dtype_and_old_allocations():
     assert len(workspace) == 2
 
 
+def test_empty_tile_prefill_replays_without_changing_valid_tile_math():
+    """Skipping padding must retain holes, pool4 tails and graph input refresh."""
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("Volta prefill padding dispatch")
+    torch.manual_seed(738)
+    packed = torch.randn(129, 8, 576, device="cuda", dtype=torch.float16)
+    q, rope = packed[:, :, :512], packed[:, :, 512:512]
+    kv = torch.randn(4099, 1, 512, device="cuda", dtype=torch.float16)
+    indices = torch.full((129, 1, 2051), -1, device="cuda", dtype=torch.int32)
+    args = (q, rope, kv, indices, 256**-0.5, 512)
+    for _ in range(3):
+        triton_sparse_mla_fwd(*args, skip_empty_tiles=True)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = triton_sparse_mla_fwd(*args, skip_empty_tiles=True)
+    for count in (0, 1, 33, 128, 2048, 2051, 0):
+        indices.fill_(-1)
+        if count:
+            indices[:, :, :count] = torch.arange(count, device="cuda")
+            if count < 2048:
+                indices[:, :, 16:32] = -1  # Empty interior tile/partial masks.
+                indices[:, :, 2048:] = torch.tensor([7, -1, 31], device="cuda")
+        packed.normal_()
+        kv.normal_()
+        reference = triton_sparse_mla_fwd(*args)
+        graph.replay()
+        # The independent softmax fixtures above establish the arithmetic;
+        # this pins its reduction/rounding order across the padding branch.
+        assert torch.equal(actual.view(torch.uint8), reference.view(torch.uint8))
+
+
+@pytest.mark.parametrize("heads", [8, 16])
+def test_sm70_query_union_preserves_support_ragged_tail_and_graph_replay(
+    heads, monkeypatch
+):
+    """Disjoint/empty neighbours must not receive each other's KV values."""
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("Volta query union")
+    from sglang_v100_plus import glm_dsa
+
+    from sglang.kernels.ops.attention.dsa import sm70_sparse_prefill
+    from sglang.kernels.ops.attention.dsa.sm70_sparse_prefill import (
+        sparse_mla_prefill_sm70,
+    )
+
+    # Installed hooks also wrap the ordinary API used by an odd last query.
+    # Exercise its optional d_v argument rather than bypassing that boundary.
+    monkeypatch.setattr(glm_dsa, "get_attn_backend", lambda: None)
+    monkeypatch.setattr(
+        sm70_sparse_prefill,
+        "triton_sparse_mla_fwd",
+        lambda *args, **kwargs: glm_dsa.sparse_prefill(
+            triton_sparse_mla_fwd, *args, **kwargs
+        ),
+    )
+
+    torch.manual_seed(740)
+    # Head-strided input, odd query count and non-power-of-two pool4 width.
+    packed = torch.randn(33, heads, 576, device="cuda", dtype=torch.float16)
+    q = packed[:, :, :512]
+    kv = torch.randn(257, 1, 512, device="cuda", dtype=torch.float16)
+    indices = torch.full((33, 1, 67), -1, device="cuda", dtype=torch.int32)
+    scale = 256**-0.5
+    for _ in range(3):
+        sparse_mla_prefill_sm70(q, kv, indices, scale)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = sparse_mla_prefill_sm70(q, kv, indices, scale)
+    for update in range(3):
+        packed.normal_()
+        kv.normal_()
+        indices.fill_(-1)
+        for row in range(33):
+            if (row + update) % 5 == 0:
+                continue
+            valid = torch.randperm(257, device="cuda")[: min(67, row * 3 + 1)]
+            columns = torch.randperm(67, device="cuda")[: valid.numel()]
+            indices[row, 0, columns] = valid.int()
+        # A populated first query with an entirely empty second query guards
+        # the all-masked initial tile: a finite sentinel would leak KV values.
+        indices[0].fill_(-1)
+        indices[0, 0, :3] = torch.tensor([5, 17, 31], device="cuda")
+        indices[1].fill_(-1)
+        before = indices.clone()
+        graph.replay()
+        eager = sparse_mla_prefill_sm70(q, kv, indices, scale)
+        expected = torch.zeros_like(q, dtype=torch.float64)
+        for row in range(33):
+            ids = indices[row, 0]
+            selected = kv[ids[ids >= 0].long(), 0].double()
+            if selected.numel():
+                expected[row] = (q[row].double() @ selected.T * scale).softmax(
+                    -1
+                ) @ selected
+        for result in (actual, eager):
+            assert torch.isfinite(result).all()
+            torch.testing.assert_close(
+                result[0].double(), expected, rtol=0.01, atol=0.001
+            )
+            assert torch.count_nonzero(result[0, 1]) == 0
+        assert torch.equal(indices, before)
+        assert torch.equal(actual.view(torch.uint8), eager.view(torch.uint8))
+
+
 if __name__ == "__main__":
     import sys
 

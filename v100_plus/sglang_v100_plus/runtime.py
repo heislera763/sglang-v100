@@ -68,6 +68,7 @@ def install():
         SM70SparseAttnBackend,
         sm70_dsa_cache_default,
         sm70_dsa_constraints,
+        sparse_prefill,
     )
     from .glm_kda import SM70KDAKernel
     from .glm_mhc import mhc_post, mhc_pre
@@ -225,6 +226,11 @@ def install():
             "sglang.srt.layers.attention.dsa_backend.DeepseekSparseAttnBackend",
             SM70SparseAttnBackend,
             HookType.REPLACE,
+        ),
+        (
+            "sglang.kernels.ops.attention.dsa.triton_sparse_mla.triton_sparse_mla_fwd",
+            sparse_prefill,
+            HookType.AROUND,
         ),
         (
             "sglang.srt.layers.attention.linear.kernels.kda_triton.TritonKDAKernel",

@@ -619,6 +619,9 @@ def _sparse_mla_fused_kernel(
     USE_I64_PAGE: tl.constexpr = True,
     PIPE_STAGES: tl.constexpr = 3,
     SKIP_EMPTY_TILES: tl.constexpr = False,
+    union_bits_ptr=None,
+    UNION_GROUP_SIZE: tl.constexpr = 1,
+    BASE_HEADS: tl.constexpr = 0,
 ):
     """Single-pass with head-block splitting. grid=(seq, head_blocks)."""
     t = tl.program_id(0)
@@ -637,6 +640,12 @@ def _sparse_mla_fused_kernel(
         p_dot_scale = 1.0
 
     qn_row = q_nope_ptr + t * STRIDE_QN_T + h_offs[:, None] * STRIDE_QN_H
+    if UNION_GROUP_SIZE > 1:
+        qn_row = (
+            q_nope_ptr
+            + (t * UNION_GROUP_SIZE + h_offs[:, None] // BASE_HEADS) * STRIDE_QN_T
+            + (h_offs[:, None] % BASE_HEADS) * STRIDE_QN_H
+        )
     q0 = tl.load(qn_row + g[None, :], mask=h_mask[:, None], other=0.0).to(input_type)
     if NUM_GROUPS >= 2:
         q1 = tl.load(
@@ -728,7 +737,18 @@ def _sparse_mla_fused_kernel(
             if D_TAIL > 0:
                 scores += tl.dot(q_tail, tl.trans(kv_tail))
             scores = scores * qk_scale
-            scores = tl.where(valid[None, :], scores, neg_large)
+            if UNION_GROUP_SIZE > 1:
+                bits = tl.load(
+                    union_bits_ptr + t * topk + k_pos,
+                    mask=k_pos < valid_topk,
+                    other=0,
+                )
+                owned = ((bits[None, :] >> (h_offs[:, None] // BASE_HEADS)) & 1) != 0
+                # Other queries own nonzero KV values. Their masked scores
+                # must contribute zero even before this row's first valid tile.
+                scores = tl.where(valid[None, :] & owned, scores, -float("inf"))
+            else:
+                scores = tl.where(valid[None, :], scores, neg_large)
 
             m_block = tl.max(scores, axis=1)
             m_new = tl.maximum(m_i, m_block)
@@ -1065,6 +1085,7 @@ def _triton_sparse_mla_fwd_splitk(
     kv_splits: int,
     topk_length: torch.Tensor | None = None,
     use_topk_length: bool = False,
+    skip_empty_tiles: bool = False,
 ) -> torch.Tensor:
     """Split-K path for short sequences."""
     is_fp8 = _validate_input_dtypes(q_nope, q_rope, kv)
@@ -1155,6 +1176,7 @@ def _triton_sparse_mla_fwd_splitk(
             BLOCK_K=BLOCK_K,
             USE_I64_PAGE=not (i32_page_safe and i32_page_tuned),
             PIPE_STAGES=1 if use_topk_length else 3,
+            SKIP_EMPTY_TILES=skip_empty_tiles,
             num_warps=fused_num_warps,
             num_stages=2,
         )
@@ -1235,6 +1257,7 @@ def triton_sparse_mla_fwd(
     d_v: int = 512,
     topk_length: torch.Tensor | None = None,
     max_topk_length: int | None = None,
+    skip_empty_tiles: bool = False,
 ) -> torch.Tensor:
     """Unified sparse MLA forward. Auto-selects single-pass vs split-K.
 
@@ -1243,6 +1266,8 @@ def triton_sparse_mla_fwd(
     supported. indices: [seq, 1, topk].
     topk_length optionally gives a per-row upper bound on the last valid index;
     max_topk_length is its host-known batch maximum.
+    skip_empty_tiles avoids wholly invalid tiles on the single-pass path;
+    callers should restrict it to padded query rows to avoid branch/spill cost.
 
     Returns [1, seq, H, d_v], FP16 for FP16 inputs and BF16 otherwise.
     """
@@ -1289,7 +1314,14 @@ def triton_sparse_mla_fwd(
         if optimize_gfx950_fp8 or q_nope.dtype == torch.float16:
             with _no_async_copy():
                 return _triton_sparse_mla_fwd_splitk(
-                    q_nope, q_rope, kv, indices, sm_scale, d_v, kv_splits=1
+                    q_nope,
+                    q_rope,
+                    kv,
+                    indices,
+                    sm_scale,
+                    d_v,
+                    kv_splits=1,
+                    skip_empty_tiles=skip_empty_tiles,
                 )
         return _triton_sparse_mla_fwd_single(q_nope, q_rope, kv, indices, sm_scale, d_v)
     kv_splits = min(

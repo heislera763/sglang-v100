@@ -20,6 +20,10 @@ register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
         (256, 20, False),
         (1, 1, True),
         (1, 20, True),
+        (2, 1, True),
+        (3, 20, True),
+        (4, 20, True),
+        (8, 20, True),
     ],
 )
 def test_fp16_mhc_matches_torch(tokens, iterations, fuse_projection):
@@ -56,14 +60,15 @@ def test_fp16_mhc_matches_torch(tokens, iterations, fuse_projection):
     torch.testing.assert_close(got, expected, atol=0.002, rtol=0.001)
 
 
-def test_fp16_mhc_projection_graph_refresh():
+@pytest.mark.parametrize("tokens", [1, 3, 8])
+def test_fp16_mhc_projection_graph_refresh(tokens):
     """Decode graphs must read current residuals and FP32 learned parameters."""
     if not torch.cuda.is_available() or torch.version.hip is not None:
         pytest.skip("CUDA FP16 mHC coverage")
     from sglang.kernels.ops.layernorm.mhc_sm70 import mhc_pre_sm70
 
     torch.manual_seed(534)
-    residual = torch.randn(1, 4, 4096, device="cuda", dtype=torch.float16)
+    residual = torch.randn(tokens, 4, 4096, device="cuda", dtype=torch.float16)
     fn = torch.randn(24, 16384, device="cuda") * 0.015
     scale = torch.tensor([0.5, 0.7, 0.9], device="cuda")
     base = torch.randn(24, device="cuda") * 0.3
@@ -86,6 +91,14 @@ def test_fp16_mhc_projection_graph_refresh():
         for got, ref in zip(actual, expected):
             assert torch.isfinite(got).all()
             torch.testing.assert_close(got, ref, atol=0.002, rtol=0.001)
+        # Projection partials and norm reductions are row-owned. A row offset
+        # omitted in either kernel mixes different draft positions silently.
+        singles = [
+            mhc_pre_sm70(residual[row : row + 1], *args[1:], fuse_projection=True)
+            for row in range(tokens)
+        ]
+        for output, rows in zip(actual, zip(*singles)):
+            assert torch.equal(output, torch.cat(rows))
 
 
 @pytest.mark.parametrize("iterations,rms_eps", [(1, 1e-6), (20, 1e-6), (20, 1e-5)])

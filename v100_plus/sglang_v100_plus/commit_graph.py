@@ -1,6 +1,6 @@
 """Capture the first PP stage's accepted recurrent/PLE state copies.
 
-Serialized Qwen chain profiles have stable pools but new acceptance
+Serialized Qwen/GLM chain profiles have stable pools but new acceptance
 tensors every round. Refresh those inputs before replay; never capture their
 addresses directly. The last stage retains its ordinary verify commit.
 """
@@ -30,7 +30,12 @@ class CommitGraph:
         pool = runner.req_to_token_pool
         # Cached graph nodes borrow state addresses. Retain their owners even
         # when the worker switches pools, so identities/storage cannot be reused.
-        self._owners = (pool, pool.mamba_pool, runner.attn_backend)
+        self._owners = (
+            pool,
+            pool.mamba_pool,
+            runner.attn_backend,
+            getattr(runner.attn_backend, "linear_attn_backend", None),
+        )
         self.batch = copy.copy(batch)
         self.inputs = [
             value.clone()
@@ -76,12 +81,22 @@ def commit_relayed_states(
     parallel, schedule, spec = get_parallel(), get_schedule(), get_spec()
     pool = worker.model_runner.req_to_token_pool
     mamba_pool = getattr(pool, "mamba_pool", None)
+    backend = worker.model_runner.attn_backend
+    linear = getattr(backend, "linear_attn_backend", None)
+    hf_config = worker.model_runner.model_config.hf_config
+    supported_model = is_qwen4_exp(hf_config) or (
+        "Glm5NextForConditionalGeneration" in getattr(hf_config, "architectures", ())
+        and linear is not None
+        # The qualified Triton KDA path scatters full SSM/conv snapshots.
+        # Fused-accept has another persistent buffer and a separate contract.
+        and getattr(linear, "accept_lens_pool", None) is None
+    )
     if not (
         envs.SGLANG_ENABLE_METADATA_GLUE_GRAPH.get()
         # Stable-row PP commits derive pool slots from the refreshed request
         # indices, rather than a forward_metadata view frozen during capture.
         and envs.SGLANG_ENABLE_PP_SPEC.get()
-        and is_qwen4_exp(worker.model_runner.model_config.hf_config)
+        and supported_model
         and parallel.pp_size == 2
         and parallel.pp_rank == 0
         and parallel.pp_async_batch_depth == 0
@@ -127,7 +142,8 @@ def commit_relayed_states(
         id(worker),
         id(pool),
         id(mamba_pool),
-        id(worker.model_runner.attn_backend),
+        id(backend),
+        id(linear),
         draft_token_num,
         tuple(
             (value.shape, value.dtype, value.device)
