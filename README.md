@@ -28,7 +28,8 @@ The integrated upstream revision is `c892301ff76f`; see
   consumers. PP2 adds GPU metadata graphs and block-scale reuse. Sampled
   MTP keeps exact draft probabilities locally, packs nested PP result tensors
   for both models and retains Tensor Core Qwen target/draft prompt attention.
-  Qwen's two-step PP2 profile also captures accepted recurrent/PLE state copies.
+  Qwen PP2 also captures accepted recurrent/PLE copies for one-to-three-step
+  linear chains, refreshing live inputs and retaining captured pool owners.
 - **Upstream maintenance:** adapters live in `v100_plus/sglang_v100_plus/`;
   shared operators live in `python/sglang/kernels/ops/`; native builds and Marlin
   patches live in `v100_plus/aot/` and `v100_plus/patches/`. Keep host services,
@@ -136,12 +137,17 @@ uv run --no-project .venv/bin/python -m sglang_v100_plus "${sglang_args[@]}" \
 For FP8 TP8, use TP8/EP8, omit PP and unset the partition/HC/metadata flags.
 For FP8 PP2 MTP, keep HC/metadata flags and 4352-token chunks, set
 `SGLANG_ENABLE_PP_SPEC=1` and add Qwen's two-step speculative arguments above.
-The metadata flag also enables the tested first-stage commit graph, with live
-request/acceptance buffers refreshed each round; tracking and broader batching
-keep eager commits. Both TP4 groups use their quad's NVLink peers and CPU socket.
+The metadata flag also enables Qwen first-stage commit graphs for one-to-three-step
+linear chains, across FP8/NVFP4 and TP/EP widths. Live request/acceptance tensors
+are refreshed each round; captured pool owners stay alive. Tracking, ReplaySSM
+and broader batching keep eager commits. Both TP4 groups use their quad's NVLink peers and CPU socket.
 Two-step MTP improves sampled generation in these measurements; prefill remains
 slower because the draft also processes the prompt. Ordinary/MTP table rows
 from different revisions are not a controlled speedup comparison.
+For NVFP4 PP2, use the same eight-GPU placement/partition and HC/metadata flags,
+replace the checkpoint/quantization with the NVFP4 recipe, add `--fp4-gemm-backend marlin`
+and use EP1. Two-step MTP also requires the PP-spec flag. This measured profile
+has lower generation throughput than NVFP4 TP4 and leaves more per-GPU memory for caches.
 The JSON language-only override skips vision loading; Qwen's CLI `--language-only`
 selects a separate encoder workflow.
 
@@ -193,13 +199,15 @@ excludes the first token. Warmups, cached input and retractions are excluded.
 **A/F** and **G MTP** use nine-request confirmations; **C** and **G ordinary**
 are three-request checks. **H** compares six requests per TP8 variant and
 three per NVFP4 variant. **I** uses six requests each for baseline/best prefill
-profiles, plus three per component screen. Rows from different revisions are
-not controlled A/Bs.
+profiles, plus three per component screen. **J** uses six alternating requests
+per eager/captured commit variant. Rows from different revisions are not
+controlled A/Bs.
 
 | Checkpoint / layout | MTP steps | Prefill tokens/s | Generation tokens/s | Evidence |
 | --- | ---: | ---: | ---: | :---: |
 | Qwen NVFP4 / TP4 | Off | 3,712 | 70.1 | A |
 | Qwen NVFP4 / TP4 | 2 | 5,274 | 105.1 | I |
+| Qwen NVFP4 / TP4×PP2 | 2 | 6,605 | 76.7 | J |
 | GLM NVFP4 / TP4×PP2 | Off | 1,719 | 24.8 | A |
 | GLM NVFP4 / TP4×PP2 | 3 | 1,593 | 36.1 | F |
 | Qwen FP8 / TP4×PP2 + EP4 | Off | 8,092 | 61.6 | G |
@@ -215,34 +223,28 @@ Runtime revisions: **A** [`cf7f7e9f`](https://github.com/heislera763/sglang-v100
 **G** [`d1d93041`](https://github.com/heislera763/sglang-v100-plus/commit/d1d93041f4bf78e13c49bb752fb6c1384c306527),
 **H** [`e054ff4d`](https://github.com/heislera763/sglang-v100-plus/commit/e054ff4d072616ec5678683adcf14c65e377e17d),
 **I** [`27e5127d`](https://github.com/heislera763/sglang-v100-plus/commit/27e5127dca21525f0d56d3e1c15760d7b9e7ceac),
+**J** [`0b635664`](https://github.com/heislera763/sglang-v100-plus/commit/0b6356649e995fabb6527028c10094264bcf7b6f),
 2026-10-07/08, Torch `2.13.0+cu126`. Eager prefill/full batch-one decode,
 strict dispatch, no overlap/radix, context/cache 12288. A/C/F GLM use 2048-token
-chunks; G Qwen FP8 uses 4352, HC partitioning and metadata graphs. H uses
-4352 on TP8 and NVFP4 TP4, without HC partitioning or metadata graphs. On TP8,
-dispatch by tensor geometry improves ordinary generation **36.2→51.0 (+41.0%)**
-and two-step MTP
-**61.2→75.0 (+22.5%)**; prefill stays flat. Numerical masks, cutoff ties,
-FP64 normalization, high expert indices and refreshed CUDA graph inputs pass;
-FP8 scale/activation boundaries are unchanged. The three-prompt NVFP4 top-k
-check gives **97.8→100.7** generation tokens/s at matching settings; treat this
-smaller gain as preliminary.
+chunks; G/I/J Qwen use 4352 with HC/metadata where admitted. H uses 4352,
+without HC partitioning or metadata graphs.
 
-I retains three geometry/ownership-based prefill selections. At matching 4352
-chunks, TP8 FP8 improves **4,205→4,532 (+7.8%)**: route alignment adds about 1.2%,
-masked QSA about 6.4%. NVFP4 TP4 MTP improves **4,313→5,274 (+22.3%)**: QSA adds
-about 8.4%, within-quad HC partitioning about 11.8%. Component figures are
-three-prompt screens; baseline/best are alternating six-request confirmations.
-Decode execution stays flat; NVFP4's sampled 105.1 TPS
-also reflects acceptance variation. 3,480 native expert byte comparisons,
-1,200 attention comparisons at unchanged tolerances and 2,400 HC byte comparisons
-at matched GEMM geometry pass. The existing FP8 PP2 recipe also passes.
+Matched controls:
 
-G retains two matched prefill gains: ragged HC plus chunk selection
-**6,612→7,359 (+11.3%)**, then expert route alignment **7,370→7,609 (+3.2%)**.
-A fresh process confirms the latter at **7,394→7,668 (+3.7%)**. Generation stays
-flat; acceptance variation is checked against verification-cycle timing.
-4352 makes these prompts two chunks; 4608 gave no further gain. Expert alignment
-avoids empty 32-row CTAs created by 64-row padding, preserving native outputs.
+- **G:** ragged HC/chunk selection improves FP8 PP2 prefill **+11.3%**, then
+  32-row expert alignment **+3.2%** (fresh process +3.7%), with generation flat.
+  Alignment removes empty CTAs from 64-row padding; 4352 makes these inputs two chunks.
+- **H:** shape-based dispatch improves TP8 ordinary generation **36.2→51.0 (+41.0%)**
+  and two-step MTP **61.2→75.0 (+22.5%)**, with prefill flat and FP8 boundaries unchanged.
+- **I:** TP8 FP8 prefill **4,205→4,532 (+7.8%)**; NVFP4 TP4 MTP **4,313→5,274 (+22.3%)**.
+  Component screens: route alignment ~1.2%/QSA ~6.4% on TP8; QSA ~8.4%/HC ~11.8%
+  on NVFP4. Decode execution stays flat; sampled TG also reflects acceptance variation.
+- **J:** captured Qwen PP2 commits improve three-step FP8 generation
+  **65.1→68.8 (+5.6%)** and two-step NVFP4 **71.7→76.7 (+7.1%)**, with prefill flat.
+  Verification execution improves 3.9%/5.5%; acceptance varies slightly. All 192
+  native state byte comparisons, exact proposal/payload and lifecycle checks pass.
+  The recommended FP8 two-step setting is unchanged; this compares commit implementations.
+
 G MTP category means (three requests each):
 
 | Category | Prefill tokens/s | Generation tokens/s |
@@ -253,11 +255,11 @@ G MTP category means (three requests each):
 
 Benchmark tooling and raw responses stay outside Git.
 
-Validation: 3,200 bitwise HC checks at matched GEMM geometry, 416 real QSA
-comparisons (rtol=.005/atol=.003), 980 byte-exact expert comparisons, native
-EOS/logprob/cancel/reuse and 11,324-input/128-output ordinary/MTP checks.
-Operator agreement does not guarantee identical tokens across TP/PP or GEMM
-batch geometries. Rejected kernel and bookkeeping trials stay outside the runtime.
+Validation uses independent kernel references, unchanged QSA tolerances
+(rtol=.005/atol=.003), byte-exact route/state/payload checks, refreshed graph
+inputs and native EOS/logprob/cancel/reuse. HC comparisons match GEMM geometry;
+operator agreement does not guarantee identical tokens across TP/PP or GEMM batch shapes.
+Rejected experiments and diagnostic probes stay outside the runtime.
 
 Inputs: [SPEED-Bench `throughput_8k`](https://huggingface.co/datasets/nvidia/SPEED-Bench/tree/454f88454792dfa3ccfd7ef15fff248efde44cd1),
 first turns of `91d6ca2afe114d3c99312e8758b6f964` (code),
