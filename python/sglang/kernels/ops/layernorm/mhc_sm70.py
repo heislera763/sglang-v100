@@ -210,8 +210,11 @@ def mhc_pre_sm70(
             mixes = F.linear(x, fn)
         else:
             x = residual.view(m, hc * h).float()
-            rms = torch.rsqrt(x.square().mean(-1) + rms_eps)
             mixes = F.linear(x, fn)
+            # FP16 -> FP32 owns a private copy. Enqueue projection first on
+            # the same stream, then reuse that copy for the identical square
+            # and mean reduction instead of allocating another full tensor.
+            rms = torch.rsqrt(x.square_().mean(-1) + rms_eps)
         _finalize_kernel[(m,)](
             mixes,
             rms,

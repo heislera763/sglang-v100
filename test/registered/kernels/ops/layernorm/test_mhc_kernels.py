@@ -7,6 +7,7 @@ import torch
 from sglang.kernels.ops.layernorm import mhc
 from sglang.kernels.ops.layernorm.mhc import mhc_fused_post_pre, mhc_post, mhc_pre
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
 
@@ -18,6 +19,7 @@ register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
         (1, 1, False),
         (17, 20, False),
         (256, 20, False),
+        (2048, 20, False),
         (1, 1, True),
         (1, 20, True),
         (2, 1, True),
@@ -45,8 +47,10 @@ def test_fp16_mhc_matches_torch(tokens, iterations, fuse_projection):
     scale = torch.tensor([0.5, 0.7, 0.9], device="cuda")
     base = torch.randn(24, device="cuda") * 0.3
     args = (residual, fn, scale, base, 1e-6, 1e-5, 1e-7, 1.7, iterations)
+    unchanged_residual = residual.clone()
     reference = mhc._mhc_pre_torch(*args)
     actual = mhc_pre_sm70(*args, fuse_projection=fuse_projection)
+    assert torch.equal(residual, unchanged_residual)
     for got, expected in zip(actual, reference):
         assert got.dtype == expected.dtype
         torch.testing.assert_close(got, expected, atol=0.002, rtol=0.001)
@@ -58,6 +62,40 @@ def test_fp16_mhc_matches_torch(tokens, iterations, fuse_projection):
     expected = mhc._mhc_post_torch(x, residual, reference[0], reference[1])
     got = mhc_post_split_h(x, residual, post, comb)
     torch.testing.assert_close(got, expected, atol=0.002, rtol=0.001)
+
+
+class TestFP16MHCWorkspace(CustomTestCase):
+    def test_prefill_avoids_two_full_fp32_workspaces(self):
+        """A 2048-row chunk must not hold both cast and square copies live.
+
+        The redundant square temporary caused a real 128 MiB CUDA allocation
+        failure on GLM PP2 MTP. Live residual storage must remain unchanged.
+        """
+        if not torch.cuda.is_available() or torch.version.hip is not None:
+            self.skipTest("CUDA FP16 mHC coverage")
+        from sglang.kernels.ops.layernorm.mhc_sm70 import mhc_pre_sm70
+
+        torch.manual_seed(535)
+        residual = torch.randn(2048, 4, 4096, device="cuda", dtype=torch.float16)
+        original = residual.clone()
+        fn = torch.randn(24, 16384, device="cuda") * 0.015
+        scale = torch.tensor([0.5, 0.7, 0.9], device="cuda")
+        base = torch.randn(24, device="cuda") * 0.3
+        args = (residual, fn, scale, base, 1e-6, 1e-5, 1e-7, 1.7, 20)
+        warm = mhc_pre_sm70(*args)
+        torch.cuda.synchronize()
+        del warm
+        baseline = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+        outputs = mhc_pre_sm70(*args)
+        torch.cuda.synchronize()
+        peak_extra = torch.cuda.max_memory_allocated() - baseline
+        fp32_input_bytes = residual.numel() * 4
+        self.assertLess(peak_extra, 2 * fp32_input_bytes)
+        self.assertTrue(torch.equal(residual, original))
+        reference = mhc._mhc_pre_torch(*args)
+        for got, expected in zip(outputs, reference):
+            torch.testing.assert_close(got, expected, atol=0.002, rtol=0.001)
 
 
 @pytest.mark.parametrize("tokens", [1, 3, 8])
