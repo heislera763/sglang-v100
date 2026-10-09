@@ -17,6 +17,9 @@ def install():
     redact_logs()
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
         raise RuntimeError("SGLANG_V100_PLUS=1 requires an SM70 CUDA device")
+    from .cuda_memory import install as install_module_memory_guard
+
+    install_module_memory_guard()
     import sgl_kernel.elementwise as norm_ops
 
     import sglang.srt.layers.layernorm as norms
