@@ -1,6 +1,6 @@
 """Capture the first PP stage's accepted recurrent/PLE state copies.
 
-The serialized two-step Qwen profile has stable pools but new acceptance
+Serialized Qwen chain profiles have stable pools but new acceptance
 tensors every round. Refresh those inputs before replay; never capture their
 addresses directly. The last stage retains its ordinary verify commit.
 """
@@ -14,7 +14,6 @@ from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_buffer,
     get_disagg,
-    get_model,
     get_parallel,
     get_schedule,
     get_spec,
@@ -27,6 +26,11 @@ class CommitGraph:
     ):
         self.original = original
         self.worker = worker
+        runner = worker.model_runner
+        pool = runner.req_to_token_pool
+        # Cached graph nodes borrow state addresses. Retain their owners even
+        # when the worker switches pools, so identities/storage cannot be reused.
+        self._owners = (pool, pool.mamba_pool, runner.attn_backend)
         self.batch = copy.copy(batch)
         self.inputs = [
             value.clone()
@@ -77,9 +81,7 @@ def commit_relayed_states(
         # Stable-row PP commits derive pool slots from the refreshed request
         # indices, rather than a forward_metadata view frozen during capture.
         and envs.SGLANG_ENABLE_PP_SPEC.get()
-        and get_model().quantization == "fp8"
         and is_qwen4_exp(worker.model_runner.model_config.hf_config)
-        and parallel.tp_size == parallel.ep_size == 4
         and parallel.pp_size == 2
         and parallel.pp_rank == 0
         and parallel.pp_async_batch_depth == 0
@@ -87,13 +89,19 @@ def commit_relayed_states(
         and schedule.max_running_requests == 1
         and get_disagg().disaggregation_mode == "null"
         and spec.speculative_algorithm == "EAGLE"
-        and spec.speculative_num_steps == 2
+        and spec.speculative_num_steps in (1, 2, 3)
         and spec.speculative_eagle_topk == 1
-        and spec.speculative_num_draft_tokens == 3
+        and spec.speculative_num_draft_tokens == spec.speculative_num_steps + 1
         and spec.speculative_use_rejection_sampling
-        and draft_token_num == 3
-        and accept_lens.shape[0] == 1
-        and accept_index.is_cuda
+        and draft_token_num == spec.speculative_num_draft_tokens
+        and accept_lens.shape == batch.req_pool_indices.shape == (1,)
+        and accept_index.shape == (1, draft_token_num)
+        and all(
+            value.is_cuda
+            and value.device == accept_index.device
+            and value.dtype in (torch.int32, torch.int64)
+            for value in (batch.req_pool_indices, accept_lens, accept_index)
+        )
         # This is a ScheduleBatch snapshot, restored to DECODE by forward
         # isolation, rather than the model's TARGET_VERIFY ForwardBatch.
         and (batch.forward_mode.is_decode() or batch.forward_mode.is_target_verify())
@@ -112,11 +120,15 @@ def commit_relayed_states(
             prepared_step_indices,
         )
     states = get_buffer("v100_pp_commit_graphs", dict)
-    # Each worker owns its pools. A replacement backend/pool or input layout
-    # must capture a new graph, rather than replaying old addresses.
+    # Captured copies use the worker's own stable state buffers, not its
+    # quantized weights or TP/EP communicator. Replacement owners, chain width
+    # or input layout must capture a new graph rather than replay old addresses.
     key = (
+        id(worker),
         id(pool),
+        id(mamba_pool),
         id(worker.model_runner.attn_backend),
+        draft_token_num,
         tuple(
             (value.shape, value.dtype, value.device)
             for value in (batch.req_pool_indices, accept_lens, accept_index)

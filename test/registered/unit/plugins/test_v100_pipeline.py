@@ -40,7 +40,7 @@ class TestV100Pipeline(CustomTestCase):
         )
 
     def test_decode_snapshot_can_commit_a_speculative_verify_graph(self):
-        """PP snapshots keep DECODE after forward isolation restores the scheduler batch."""
+        """Restored DECODE snapshots share copy graphs across weight/TP layouts."""
         from sglang_v100_plus.commit_graph import commit_relayed_states
 
         from sglang.srt.environ import envs
@@ -70,35 +70,115 @@ class TestV100Pipeline(CustomTestCase):
             req_pool_indices=tensor([1]),
             mamba_track_indices=None,
         )
-        accept, indices = tensor([1]), tensor([1, 3])
         settings = dict(
             model_path="dummy",
-            quantization="fp8",
             tp_size=4,
             ep_size=4,
             pp_size=2,
             max_running_requests=1,
             disable_overlap_schedule=True,
             speculative_algorithm="EAGLE",
-            speculative_num_steps=2,
             speculative_eagle_topk=1,
-            speculative_num_draft_tokens=3,
             speculative_use_rejection_sampling=True,
         )
+        states, commits = {}, []
+
+        # CUDA allocation/capture is the dependency boundary. Exercise the real
+        # selector/cache below; GPU tests exercise actual capture and state bits.
+        def capture(original, owner, snapshot, accept, indices, width):
+            state = SimpleNamespace(draft_tokens=width)
+            state.run = lambda *args: commits.append((state, args))
+            return state
+
+        def eager(*_args):
+            return "eager"
+
         with (
-            get_context().override_server_args(**settings),
-            get_parallel().override(pp_rank=0),
             envs.SGLANG_ENABLE_METADATA_GLUE_GRAPH.override(True),
             envs.SGLANG_ENABLE_PP_SPEC.override(True),
-            patch("sglang_v100_plus.commit_graph.get_buffer", return_value={}),
-            patch("sglang_v100_plus.commit_graph.CommitGraph") as graph,
+            patch("sglang_v100_plus.commit_graph.get_buffer", return_value=states),
+            patch("sglang_v100_plus.commit_graph.CommitGraph", side_effect=capture),
         ):
+            for quant, tp, ep in (("fp8", 4, 4), ("modelopt_fp4", 4, 1), (None, 2, 2)):
+                for steps in (1, 2, 3):
+                    width = steps + 1
+                    accept, indices = tensor([1]), tensor([1, width])
+                    with (
+                        self.subTest(quant=quant, tp=tp, ep=ep, steps=steps),
+                        get_context().override_server_args(
+                            **(
+                                settings
+                                | dict(
+                                    quantization=quant,
+                                    tp_size=tp,
+                                    ep_size=ep,
+                                    speculative_num_steps=steps,
+                                    speculative_num_draft_tokens=width,
+                                )
+                            ),
+                        ),
+                        get_parallel().override(pp_rank=0),
+                    ):
+                        self.assertIsNone(
+                            commit_relayed_states(
+                                eager, worker, batch, accept, indices, width
+                            )
+                        )
+                        self.assertEqual(commits[-1][0].draft_tokens, width)
+                        self.assertEqual(commits[-1][1], (batch, accept, indices))
+            self.assertEqual(len(states), 3)
+            self.assertIs(commits[0][0], commits[3][0])
+            self.assertIs(commits[1][0], commits[4][0])
 
-            def eager(*_args):
-                self.fail("A serialized PP verify commit was incorrectly kept eager")
-
-            commit_relayed_states(eager, worker, batch, accept, indices, 3)
-            graph.return_value.run.assert_called_once_with(batch, accept, indices)
+            with (
+                get_context().override_server_args(
+                    **settings,
+                    quantization="fp8",
+                    speculative_num_steps=2,
+                    speculative_num_draft_tokens=3,
+                ),
+                get_parallel().override(pp_rank=0),
+            ):
+                accept, indices = tensor([1]), tensor([1, 3])
+                previous = commits[1][0]
+                # Replacing just the state pool under the same request pool
+                # must not replay a graph captured against old state storage.
+                worker.model_runner.req_to_token_pool.mamba_pool = SimpleNamespace()
+                commit_relayed_states(eager, worker, batch, accept, indices, 3)
+                self.assertIsNot(commits[-1][0], previous)
+                self.assertEqual(len(states), 4)
+                for fields, value in (
+                    ({"pp_size": 3}, None),
+                    ({"pp_async_batch_depth": 1}, None),
+                    ({"max_running_requests": 2}, None),
+                    ({"disable_overlap_schedule": False}, None),
+                    ({"disaggregation_mode": "prefill"}, None),
+                    ({"speculative_eagle_topk": 2}, None),
+                    ({"speculative_use_rejection_sampling": False}, None),
+                    ({}, (tensor([1]), tensor([1, 4]))),
+                    ({}, (tensor([2]), tensor([2, 3]))),
+                ):
+                    with self.subTest(fields=fields, tensors=value):
+                        before = len(commits)
+                        with (
+                            get_context().override_server_args(
+                                **(
+                                    settings
+                                    | dict(
+                                        quantization="fp8",
+                                        speculative_num_steps=2,
+                                        speculative_num_draft_tokens=3,
+                                    )
+                                    | fields
+                                )
+                            ),
+                            get_parallel().override(pp_rank=0),
+                        ):
+                            result = commit_relayed_states(
+                                eager, worker, batch, *(value or (accept, indices)), 3
+                            )
+                        self.assertEqual(result, "eager")
+                        self.assertEqual(len(commits), before)
 
     def test_nested_logprobs_do_not_put_storage_in_pickle_metadata(self):
         """Nested logprobs formerly bypassed extraction and restored on the sender GPU."""
@@ -219,7 +299,7 @@ class TestV100Pipeline(CustomTestCase):
 
         # Unvalidated scheduling/topology variants retain their existing wire protocol.
         for changes in (
-            {"ep_size": 2},
+            {"pp_size": 3},
             {"pp_async_batch_depth": 1},
             {"max_running_requests": 2},
             {"speculative_eagle_topk": 2},
@@ -384,54 +464,65 @@ class TestV100Pipeline(CustomTestCase):
             speculative_num_draft_tokens=3,
             speculative_use_rejection_sampling=True,
         )
-        with (
-            get_context().override_server_args(**settings),
-            get_parallel().override(pp_rank=1),
+        for layout in (
+            {},
+            {"quantization": "modelopt_fp4", "ep_size": 1},
+            {"tp_size": 2, "ep_size": 2},
+            {"tp_size": 8, "ep_size": 8},
+            {"quantization": None, "tp_size": 2, "ep_size": 1},
         ):
-            initialize_local_output(lambda _: None, owner)
-            for token in (7, 11, 13):
-                event = object()
-                tensors = {
-                    "next_token_ids": torch.tensor([token, token + 1]),
-                    "spec_accept_lens": torch.tensor([2]),
-                    "spec_new_seq_lens": torch.tensor([token + 100]),
-                    "spec_bonus_tokens": torch.tensor([token + 1]),
-                    "spec_accept_index": torch.tensor([[0, 1, -1]]),
-                    "spec_next_chain": torch.tensor([[token + 1, token + 2, 0]]),
-                    "spec_next_parents": torch.tensor([[-1, 0]]),
-                    "spec_next_top_scores": torch.tensor([[0, 1]]),
-                    "spec_next_draft_probs": torch.tensor(
-                        [[[0.125, 0.875], [0.25, 0.75]]], dtype=torch.float32
-                    ),
-                }
-                queue.append((event, PPProxyTensors(tensors)))
-                first = SchedulerPPMixin._pp_send_recv_and_preprocess_output_tensors(
-                    owner, 0, 1, batches, metadata, queue, None
-                )
-                self.assertEqual(len(first[-1]), 1)
-                self.assertFalse(queue)
-                # The next microbatch is empty, but must receive the previous
-                # result before its empty send in the upstream parity order.
-                second = SchedulerPPMixin._pp_send_recv_and_preprocess_output_tensors(
-                    owner, 1, 0, batches, metadata, queue, None
-                )
-                self.assertEqual(second[-1], [])
-                self.assertIs(received[-1], tensors)
-                self.assertIs(waits[-1], event)
-                self.assertFalse(owner._v100_pp_local_outputs)
-                wire = unpack_output(sent[-1][1])
-                self.assertNotIn("spec_next_draft_probs", wire)
-                self.assertEqual(set(wire), set(tensors) - {"spec_next_draft_probs"})
-                for key, value in wire.items():
-                    self.assertTrue(torch.equal(value, tensors[key]))
-        self.assertEqual(len(sent), 3)
-        self.assertEqual(len(received), 3)
-        # Keep the wire protocol for modes outside the tested chain/layout
+            with (
+                get_context().override_server_args(**(settings | layout)),
+                get_parallel().override(pp_rank=1),
+            ):
+                initialize_local_output(lambda _: None, owner)
+                for token in (7, 11, 13):
+                    event = object()
+                    tensors = {
+                        "next_token_ids": torch.tensor([token, token + 1]),
+                        "spec_accept_lens": torch.tensor([2]),
+                        "spec_new_seq_lens": torch.tensor([token + 100]),
+                        "spec_bonus_tokens": torch.tensor([token + 1]),
+                        "spec_accept_index": torch.tensor([[0, 1, -1]]),
+                        "spec_next_chain": torch.tensor([[token + 1, token + 2, 0]]),
+                        "spec_next_parents": torch.tensor([[-1, 0]]),
+                        "spec_next_top_scores": torch.tensor([[0, 1]]),
+                        "spec_next_draft_probs": torch.tensor(
+                            [[[0.125, 0.875], [0.25, 0.75]]], dtype=torch.float32
+                        ),
+                    }
+                    queue.append((event, PPProxyTensors(tensors)))
+                    first = (
+                        SchedulerPPMixin._pp_send_recv_and_preprocess_output_tensors(
+                            owner, 0, 1, batches, metadata, queue, None
+                        )
+                    )
+                    self.assertEqual(len(first[-1]), 1)
+                    self.assertFalse(queue)
+                    # The next microbatch is empty, but must receive the previous
+                    # result before its empty send in the upstream parity order.
+                    second = (
+                        SchedulerPPMixin._pp_send_recv_and_preprocess_output_tensors(
+                            owner, 1, 0, batches, metadata, queue, None
+                        )
+                    )
+                    self.assertEqual(second[-1], [])
+                    self.assertIs(received[-1], tensors)
+                    self.assertIs(waits[-1], event)
+                    self.assertFalse(owner._v100_pp_local_outputs)
+                    wire = unpack_output(sent[-1][1])
+                    self.assertNotIn("spec_next_draft_probs", wire)
+                    self.assertEqual(
+                        set(wire), set(tensors) - {"spec_next_draft_probs"}
+                    )
+                    for key, value in wire.items():
+                        self.assertTrue(torch.equal(value, tensors[key]))
+        self.assertEqual(len(sent), 15)
+        self.assertEqual(len(received), 15)
+        # Keep the wire protocol for modes outside the chain/schedule
         # contract; enabling locality unconditionally could silently consume
         # graph buffers from a different request or unsupported relay.
         for unsupported in (
-            {"quantization": "modelopt_fp4"},
-            {"tp_size": 8, "ep_size": 8},
             {"speculative_eagle_topk": 2},
             {"speculative_num_steps": 4, "speculative_num_draft_tokens": 5},
             {"speculative_use_rejection_sampling": False},

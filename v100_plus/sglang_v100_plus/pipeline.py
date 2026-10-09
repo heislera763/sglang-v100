@@ -32,7 +32,6 @@ def _map_tensors(value, visit):
 def initialize_local_output(original, scheduler):
     from sglang.srt.runtime_context import (
         get_disagg,
-        get_model,
         get_parallel,
         get_schedule,
         get_spec,
@@ -44,14 +43,13 @@ def initialize_local_output(original, scheduler):
     spec = get_spec()
     local_spec = (
         spec.speculative_algorithm == "EAGLE"
-        and parallel.tp_size == 4
-        and (get_model().quantization, parallel.ep_size)
-        in (("fp8", 4), ("modelopt_fp4", 1))
         and spec.speculative_eagle_topk == 1
         and spec.speculative_num_steps in (1, 2, 3)
         and spec.speculative_num_draft_tokens == spec.speculative_num_steps + 1
         and spec.speculative_use_rejection_sampling
     )
+    # Only the final PP stage owns sampling and exact proposal q. Its output
+    # FIFO/event contract is independent of TP width and weight packing.
     enabled = (
         parallel.pp_size == 2
         and parallel.pp_async_batch_depth == 0

@@ -2,6 +2,7 @@
 
 import sys
 import unittest
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -25,40 +26,113 @@ with patch.object(
 )
 class TestV100SmallBatches(CustomTestCase):
     def test_pp_commit_graph_refreshes_request_acceptance_and_source_state(self):
-        """New request slots/acceptance addresses must not replay the first inputs."""
-        from sglang_v100_plus.commit_graph import CommitGraph
+        """Capture must refresh inputs and keep chain/state-pool owners distinct."""
+        from sglang_v100_plus.commit_graph import commit_relayed_states
 
-        destination = torch.zeros(4, 8, device="cuda")
-        source = torch.arange(3 * 8, device="cuda", dtype=torch.float32).reshape(3, 8)
-        expected = torch.zeros(4, 8)
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.runtime_context import get_context, get_parallel
 
-        def original(worker, batch, accept_lens, accept_index, draft_tokens):
-            steps = accept_index.gather(1, (accept_lens - 1).reshape(-1, 1)).flatten()
-            destination.index_copy_(
-                0, batch.req_pool_indices, source.index_select(0, steps)
+        def pool(width):
+            return SimpleNamespace(
+                destination=torch.zeros(4, 8, device="cuda"),
+                source=torch.empty(width, 8, device="cuda"),
             )
 
-        state = None
-        with torch.inference_mode():
-            for iteration in range(9):
-                slot, count = iteration % 4, iteration % 3 + 1
-                # Every turn uses new GPU tensors, while the graph must also
-                # read the current contents of the persistent source pool.
-                batch = SimpleNamespace(
-                    req_pool_indices=torch.tensor([slot], device="cuda")
+        def original(
+            worker, batch, accept_lens, accept_index, draft_tokens, prepared=None
+        ):
+            state = worker.model_runner.req_to_token_pool.mamba_pool
+            steps = accept_index.gather(1, (accept_lens - 1).reshape(-1, 1)).flatten()
+            state.destination.index_copy_(
+                0,
+                batch.req_pool_indices,
+                state.source.reshape(draft_tokens, 8).index_select(0, steps),
+            )
+
+        for quant, ep in (("fp8", 4), ("modelopt_fp4", 1)):
+            for width in (2, 3, 4):
+                request_pool = SimpleNamespace(mamba_pool=pool(width))
+                worker = SimpleNamespace(
+                    model_runner=SimpleNamespace(
+                        req_to_token_pool=request_pool,
+                        attn_backend=object(),
+                        model_config=SimpleNamespace(
+                            hf_config=SimpleNamespace(
+                                architectures=["Qwen4ExpForConditionalGeneration"]
+                            )
+                        ),
+                    )
                 )
-                accept = torch.tensor([count], device="cuda")
-                indices = torch.tensor([[2, 0, 1]], device="cuda")
-                source.copy_(
-                    torch.arange(24, device="cuda").reshape(3, 8) + iteration * 100
-                )
-                if state is None:
-                    state = CommitGraph(original, None, batch, accept, indices, 3)
-                state.run(batch, accept, indices)
-                step = [2, 0, 1][count - 1]
-                expected[slot] = torch.arange(8) + step * 8 + iteration * 100
-                torch.testing.assert_close(destination.cpu(), expected, rtol=0, atol=0)
-        self.assertIsNotNone(state.graph)
+                graphs, expected = {}, torch.zeros(4, 8)
+                old_source = old_destination = old_output = None
+                with (
+                    self.subTest(quant=quant, width=width),
+                    torch.inference_mode(),
+                    get_context().override_server_args(
+                        model_path="dummy",
+                        quantization=quant,
+                        tp_size=4,
+                        ep_size=ep,
+                        pp_size=2,
+                        max_running_requests=1,
+                        disable_overlap_schedule=True,
+                        speculative_algorithm="EAGLE",
+                        speculative_num_steps=width - 1,
+                        speculative_eagle_topk=1,
+                        speculative_num_draft_tokens=width,
+                        speculative_use_rejection_sampling=True,
+                    ),
+                    get_parallel().override(pp_rank=0),
+                    envs.SGLANG_ENABLE_METADATA_GLUE_GRAPH.override(True),
+                    envs.SGLANG_ENABLE_PP_SPEC.override(True),
+                    patch(
+                        "sglang_v100_plus.commit_graph.get_buffer", return_value=graphs
+                    ),
+                ):
+                    for iteration in range(16):
+                        if iteration == 8:
+                            old_state = request_pool.mamba_pool
+                            old_output = old_state.destination.clone()
+                            old_source = weakref.ref(old_state.source)
+                            old_destination = weakref.ref(old_state.destination)
+                            request_pool.mamba_pool = pool(width)
+                            del old_state
+                            expected.zero_()
+                        state = request_pool.mamba_pool
+                        slot, count = iteration % 4, iteration % width + 1
+                        batch = SimpleNamespace(
+                            req_pool_indices=torch.tensor([slot], device="cuda"),
+                            forward_mode=ForwardMode.DECODE,
+                            mamba_track_indices=None,
+                        )
+                        accept = torch.tensor([count], device="cuda")
+                        indices = torch.tensor(
+                            [list(reversed(range(width)))], device="cuda"
+                        )
+                        state.source.copy_(
+                            torch.arange(width * 8, device="cuda").reshape(width, 8)
+                            + iteration * 100
+                        )
+                        commit_relayed_states(
+                            original, worker, batch, accept, indices, width
+                        )
+                        expected[slot] = (
+                            torch.arange(8) + (width - count) * 8 + iteration * 100
+                        )
+                        self.assertTrue(
+                            torch.equal(
+                                state.destination.cpu().view(torch.uint8),
+                                expected.view(torch.uint8),
+                            )
+                        )
+                        if old_source is not None:
+                            self.assertIsNotNone(old_source())
+                            self.assertIsNotNone(old_destination())
+                            self.assertTrue(torch.equal(old_destination(), old_output))
+                    self.assertEqual(len(graphs), 2)
+                    self.assertTrue(
+                        all(value.graph is not None for value in graphs.values())
+                    )
 
     def test_pp_output_pack_preserves_bits_and_cross_stream_readiness(self):
         from collections import deque
