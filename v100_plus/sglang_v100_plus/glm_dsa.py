@@ -1,5 +1,7 @@
 """Request-owned GLM pool4: eager prefill, decode and chain MTP on SM70."""
 
+import logging
+
 import torch
 import torch.nn.functional as F
 
@@ -23,6 +25,38 @@ from sglang.srt.model_executor.forward_context import (
     get_req_to_token_pool,
     get_token_to_kv_pool,
 )
+
+logger = logging.getLogger(__name__)
+
+
+def sm70_glm_kv_cache_dtype(original, **kwargs):
+    """Keep GLM's supported compute-dtype KV when auto sees an FP8 recipe.
+
+    Weight quantization and the separate FP8 indexer are unchanged. The plugin
+    only registers this adapter on SM70; explicit cache requests stay explicit.
+    """
+    model = kwargs.get("model")
+    config = getattr(model, "config", None)
+    config = getattr(config, "text_config", config)
+    quant = getattr(model, "quant_config", None)
+    draft_dtype = kwargs.get("speculative_draft_kv_cache_dtype")
+    effective = (
+        draft_dtype
+        if kwargs.get("is_draft_worker") and draft_dtype is not None
+        else kwargs.get("server_args_kv_cache_dtype")
+    )
+    if (
+        getattr(config, "model_type", None) in ("glm5_next", "glm5_next_text")
+        and kwargs.get("model_dtype") == torch.float16
+        and effective == "auto"
+        and str(getattr(quant, "kv_cache_quant_algo", "")).upper() == "FP8"
+    ):
+        logger.info(
+            "SM70 GLM auto KV uses FP16; checkpoint FP8 KV recipe requires "
+            "separate backend qualification. Weight quantization is unchanged."
+        )
+        return "auto", torch.float16
+    return original(**kwargs)
 
 
 def sparse_prefill(original, q_nope, q_rope, kv, indices, sm_scale, d_v=512, **kwargs):

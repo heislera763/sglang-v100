@@ -23,7 +23,9 @@
     "python/sglang/srt/managers/scheduler_pp_mixin.py": "Relay exact draft probabilities into sampled PP verification; cold rows fall back to target sampling.",
     "python/sglang/srt/managers/utils.py": "Carry proposal probabilities with the next PP verification tree.",
     "python/sglang/srt/mem_cache/qsa_kv_pool.py": "FP16 QSA index-cache allocation and safe dtype validation.",
+    "python/sglang/srt/multimodal/processors/qwen_vl.py": "Honor request-scoped video preprocessing settings without shared mutation or image artifact-cache collisions.",
     "python/sglang/srt/speculative/eagle_worker_v2.py": "Avoid optional newer-GPU DSA imports; preserve PP draft probabilities and per-request greedy prefill proposals.",
-    "python/sglang/srt/speculative/pp_spec_relay.py": "Keep proposal probabilities aligned with request identities across the PP relay."
+    "python/sglang/srt/speculative/pp_spec_relay.py": "Keep proposal probabilities aligned with request identities across the PP relay.",
+    "python/sglang/test/test_utils.py": "Handle CPU-only and UUID CUDA visibility without breaking numeric CI test-port lanes."
   }
 }

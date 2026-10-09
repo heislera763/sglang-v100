@@ -68,6 +68,7 @@ def install():
         SM70SparseAttnBackend,
         sm70_dsa_cache_default,
         sm70_dsa_constraints,
+        sm70_glm_kv_cache_dtype,
         sparse_prefill,
     )
     from .glm_kda import SM70KDAKernel
@@ -210,6 +211,11 @@ def install():
         (
             "sglang.srt.arg_groups.overrides._dsa_kv_cache_dtype_default",
             sm70_dsa_cache_default,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.mem_cache.kv_cache_dtype.configure_kv_cache_dtype",
+            sm70_glm_kv_cache_dtype,
             HookType.AROUND,
         ),
         (

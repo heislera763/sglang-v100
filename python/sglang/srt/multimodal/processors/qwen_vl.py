@@ -130,7 +130,7 @@ def _get_processor_video_config(video_config, video_metadata):
             for key, value in video_config.items()
             if key not in QWEN_VIDEO_PREPROCESS_CONFIG_KEYS
         }
-    return None
+    return dict(video_config)
 
 
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -1021,10 +1021,24 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         load_time = time.perf_counter()
         rid = getattr(request_obj, "rid", "anonymous_rid")
 
+        # Requests override startup defaults without mutating the shared
+        # processor. Video requests bypass the image artifact cache below;
+        # their embedding cache identities are computed from processed data.
+        video_config = {
+            **self.video_config,
+            **{
+                key: value
+                for key, value in (
+                    getattr(request_obj, "video_config", None) or {}
+                ).items()
+                if not key.startswith("_")
+            },
+        }
+
         video_metadata = None
         if base_output.videos and not isinstance(base_output.videos[0], dict):
             videos_processed = [
-                await preprocess_video(video, video_config=self.video_config)
+                await preprocess_video(video, video_config=video_config)
                 for video in base_output.videos
             ]
             base_output.videos, video_metadata = map(list, zip(*videos_processed))
@@ -1033,7 +1047,7 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
 
         processor_kwargs = {}
         processor_video_config = _get_processor_video_config(
-            self.video_config, video_metadata
+            video_config, video_metadata
         )
         if processor_video_config is not None:
             processor_kwargs["processor_video_config"] = processor_video_config

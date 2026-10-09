@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 import unittest
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from functools import wraps
@@ -237,14 +238,26 @@ def _use_cached_default_models(model_repo: str):
     return ""
 
 
-if is_in_ci():
-    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
-        10000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 2000
-    )
-else:
-    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
-        20000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 1000
-    )
+def _default_test_port(visible_devices: Optional[str], in_ci: bool) -> int:
+    """Keep numeric CI port lanes; handle CPU visibility and UUID device names.
+
+    UUIDs use stable extra lanes, not Python's process-randomized hash. This is
+    a default allocation convention, not a guarantee that a port is free.
+    """
+    first = (visible_devices or "").split(",", 1)[0].strip()
+    if first.isdecimal():
+        # Preserve the existing port convention, including multi-digit IDs.
+        lane = int(first[0])
+    elif first.startswith(("GPU-", "MIG-")):
+        lane = 10 + zlib.crc32(first.encode()) % 10
+    else:
+        lane = 0
+    return (10000 + lane * 2000) if in_ci else (20000 + lane * 1000)
+
+
+DEFAULT_PORT_FOR_SRT_TEST_RUNNER = _default_test_port(
+    os.environ.get("CUDA_VISIBLE_DEVICES"), is_in_ci()
+)
 DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000}"
 
 if is_in_amd_ci():
