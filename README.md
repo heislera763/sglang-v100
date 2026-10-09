@@ -30,6 +30,20 @@ module-load OOM is handled by cold-load allocator reclamation, without changing
 checkpoint, arithmetic or workload limits. NVIDIA Qwen NVFP4 remains deferred;
 full GLM FP8 routed weights alone need roughly 283.5 GiB.
 
+Single-session target: the checkpoint's native context, with only required page,
+sentinel and speculative workspace overhead. GPU cache estimates exclude weights,
+state and execution scratch:
+
+| Model | Native tokens | TP8 main KV + index / GPU | PP2 largest main KV + index / GPU |
+| --- | ---: | ---: | ---: |
+| Qwen FP8 | 262,144 | 1.69 GiB | 0.84 GiB |
+| NVIDIA GLM | 1,048,576 | 11.35 GiB | 6.19 GiB |
+
+Qwen MTP adds about0.14GiB on its owning stage. GLM's FP16 latent KV is replicated
+across TP ranks; its native1M pool cannot fit the current weight/workspace layout.
+The GLM launch below remains a bounded12K test reference, not a native-context
+configuration. Compact/sharded KV support is required before claiming1M support.
+
 ## SM70 execution
 
 Volta supports FP16 Tensor Cores. FP4/FP8/BF16 checkpoint storage is decoded or cast
@@ -76,8 +90,7 @@ common=(
   --host 0.0.0.0 --port 9000 --api-key test-only --random-seed 531 --dtype float16 --trust-remote-code
   --moe-runner-backend marlin --sampling-backend pytorch --reasoning-parser auto --tool-call-parser auto
   --disable-overlap-schedule --disable-radix-cache --mm-attention-backend sdpa
-  --mamba-ssm-dtype float16 --mamba-full-memory-ratio 0.2 --max-running-requests 1
-  --context-length 12288 --max-total-tokens 12288 --disable-prefill-cuda-graph
+  --mamba-ssm-dtype float16 --max-running-requests 1 --disable-prefill-cuda-graph
   --cuda-graph-backend-decode full --cuda-graph-bs-decode 1
 )
 ```
@@ -91,7 +104,8 @@ uv run --no-project .venv/bin/python -m sglang_v100_plus "${common[@]}" \
   --model-path "$HOME/models/sglang/Qwen-Qwen3.8-Flash-Next-FP8" --served-model-name qwen3.8-flash-next \
   --quantization fp8 --json-model-override-args '{"language_model_only":true}' \
   --tensor-parallel-size 4 --pipeline-parallel-size 2 --expert-parallel-size 4 \
-  --mem-fraction-static 0.88 --chunked-prefill-size 4352 --attention-backend triton \
+  --context-length 262144 --max-total-tokens 262272 \
+  --chunked-prefill-size 4352 --attention-backend triton \
   --linear-attn-prefill-backend tilelang_v100 --linear-attn-decode-backend triton \
   --page-size 64 --kv-cache-dtype fp8_e5m2 --qsa-indexer-dtype float16 \
   --ple-offload-embedding --mamba-radix-cache-strategy extra_buffer \
@@ -107,6 +121,7 @@ export SGLANG_OPT_SM70_SPARSE_PREFILL_UNION=1
 uv run --no-project .venv/bin/python -m sglang_v100_plus "${common[@]}" \
   --model-path "$HOME/models/sglang/nvidia-GLM-5.3-Flash-NVFP4" --served-model-name glm5.3-flash --language-only \
   --quantization modelopt_fp4 --fp4-gemm-backend marlin --tensor-parallel-size 8 --expert-parallel-size 1 \
+  --context-length 12288 --max-total-tokens 12288 \
   --mem-fraction-static 0.92 --chunked-prefill-size 2048 --attention-backend dsa \
   --dsa-prefill-backend triton --dsa-decode-backend triton --linear-attn-prefill-backend triton --linear-attn-decode-backend triton \
   --page-size 256 --kv-cache-dtype auto --mamba-radix-cache-strategy no_buffer \
@@ -133,7 +148,8 @@ classical sampled rejection. Lab sampling sources: [Qwen](https://huggingface.co
 | NCCL PHB/NVLS0, OMP4 | Retained host policy; removing PHB did not help the fresh Qwen screen. NVLS is unavailable on SM70. No universal-optimum claim. |
 | Max1/serialized/radix off | Qualified graph/scratch/state ownership and uncached timing. Overlap/concurrency is separate work. |
 | Eager prefill/full decode graphs | Qualified native paths; earlier Qwen prefill-graph screens lost. Chunk4352/2048 are measured per-model choices. |
-| Context/static fraction/pool ratio | Near8K capacity limits. Fraction defaults are automatic heuristics; these explicit values pass measured fit checks. Qwen.88, GLMTP8.92, NVIDIAPP2MTP.95; host PLE saves device memory. |
+| Context and pool capacity | Qwen reserves its native262144-token context plus128slots: page-rounded prompt admission, one reserved page and MTP lookahead. These do not increase usable context. Explicit uncached max1 reservations fail instead of shrinking. Full-length quality is separate from capacity qualification. |
+| Static fraction/state pool | Qwen uses the automatic fraction estimate. GLMTP8.92/NVIDIAPP2MTP.95 are short-context fit settings. With radix off/max1, state slots derive from the request count; a state-memory ratio is redundant. Host PLE saves device memory. |
 | GLM mHC flags0 | Select supported mHC paths; fused DSA top-k retains its default1. |
 | CPU-only tests | `CUDA_VISIBLE_DEVICES=""`; numeric/disabled/UUID port allocation is supported. No999 workaround. |
 

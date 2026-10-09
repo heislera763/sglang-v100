@@ -6,6 +6,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -90,6 +93,87 @@ class TestV100ModuleMemory(CustomTestCase):
                         None, None, "kernel", {}, "hash"
                     )
                 self.assertEqual((allocator.reserved, allocator.free), before)
+
+
+class TestSingleSessionReservation(CustomTestCase):
+    """Explicit pools used to be silently clamped, reducing session capacity."""
+
+    def test_native_context_tail_needs_admission_headroom(self):
+        allocator = SimpleNamespace(page_size=64)
+        for capacity, expected in ((262208, 0), (262272, 32)):
+            self.assertEqual(
+                BaseTokenToKVPoolAllocator.max_new_tokens_for_memory(
+                    allocator,
+                    262144 - 38,  # 32 output + 4 draft + 2 guard positions
+                    32,
+                    token_capacity=capacity,
+                    sliding_window_size=None,
+                    chunk_size=4352,
+                ),
+                expected,
+            )
+
+    def test_shortfall_rejected_after_pipeline_minimum(self):
+        def remote_stage_minimum(tensor, **_):
+            tensor.fill_(8192)
+
+        with (
+            get_context().override_server_args(
+                model_path="dummy",
+                max_running_requests=1,
+                disable_radix_cache=True,
+                max_total_tokens=12288,
+                page_size=64,
+                pp_size=2,
+            ),
+            get_parallel().override(world_group=SimpleNamespace(cpu_group=object())),
+            patch("torch.distributed.all_reduce", remote_stage_minimum),
+            self.assertRaisesRegex(RuntimeError, "requires 12288.*only 8192"),
+        ):
+            cuda_memory.require_single_session_capacity(
+                KVCacheConfigurator._apply_token_constraints, None, 65536
+            )
+
+    def test_page_rounding_cannot_hide_a_shortfall(self):
+        with (
+            get_context().override_server_args(
+                model_path="dummy",
+                max_running_requests=1,
+                disable_radix_cache=True,
+                max_total_tokens=12289,
+                page_size=64,
+                pp_size=1,
+            ),
+            self.assertRaisesRegex(RuntimeError, "requires 12289.*only 12288"),
+        ):
+            cuda_memory.require_single_session_capacity(
+                KVCacheConfigurator._apply_token_constraints, None, 65536
+            )
+
+    def test_explicit_cap_and_other_serving_policies(self):
+        for requests, cached, requested, budget, expected in (
+            (1, False, 262208, 1048576, 262208),
+            (2, False, 12288, 8192, 8192),
+            (1, True, 12288, 8192, 8192),
+            (1, False, None, 8192, 8192),
+        ):
+            with (
+                self.subTest(requests=requests, cached=cached, requested=requested),
+                get_context().override_server_args(
+                    model_path="dummy",
+                    max_running_requests=requests,
+                    disable_radix_cache=not cached,
+                    max_total_tokens=requested,
+                    page_size=64,
+                    pp_size=1,
+                ),
+            ):
+                self.assertEqual(
+                    cuda_memory.require_single_session_capacity(
+                        KVCacheConfigurator._apply_token_constraints, None, budget
+                    ),
+                    expected,
+                )
 
 
 if __name__ == "__main__":

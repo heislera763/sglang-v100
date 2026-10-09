@@ -18,6 +18,7 @@ def install():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
         raise RuntimeError("SGLANG_V100_PLUS=1 requires an SM70 CUDA device")
     from .cuda_memory import install as install_module_memory_guard
+    from .cuda_memory import require_single_session_capacity
 
     install_module_memory_guard()
     import sgl_kernel.elementwise as norm_ops
@@ -89,6 +90,11 @@ def install():
             raise ValueError("The enabled SM70 profile requires float16 model weights")
 
     hooks = [
+        (
+            "sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator._apply_token_constraints",
+            require_single_session_capacity,
+            HookType.AROUND,
+        ),
         (
             "sglang.srt.sampling.sampling_batch_info.SamplingBatchInfo.copy_for_forward",
             copy_penalty_metadata,

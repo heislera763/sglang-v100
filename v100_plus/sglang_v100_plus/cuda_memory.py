@@ -1,8 +1,35 @@
-"""Leave cold Triton module loads access to idle Torch allocator blocks."""
+"""SM70 memory guards for explicit session pools and cold module loads."""
 
 import torch
 
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_exec, get_memory, get_schedule
+
+
+def require_single_session_capacity(original, configurator, token_capacity):
+    """An explicit uncached one-session reservation must not silently shrink.
+
+    Run the upstream constraint/PP synchronization first so every stage checks
+    the same final capacity. Other serving policies retain upstream semantics.
+    """
+    capacity = original(configurator, token_capacity)
+    schedule = get_schedule()
+    requested = schedule.max_total_tokens
+    if (
+        schedule.max_running_requests == 1
+        and get_memory().disable_radix_cache
+        and requested is not None
+    ):
+        aligned_capacity = capacity // schedule.page_size * schedule.page_size
+        if aligned_capacity < requested:
+            raise RuntimeError(
+                f"Single-session KV reservation requires {requested} tokens, but the "
+                f"profiled, PP-synchronized and page-aligned budget holds only "
+                f"{aligned_capacity}. "
+                "Refusing to shrink the requested pool. Check weights, draft/state "
+                "reservations and runtime headroom; increasing the static fraction "
+                "cannot create additional physical memory."
+            )
+    return capacity
 
 
 def reclaim_for_triton_load(_module, _function, _name, _metadata_group, _hash):
