@@ -498,6 +498,7 @@ class TestSM70BlockFP8(CustomTestCase):
                                         ep_size=tp,
                                         pp_size=pp,
                                         disable_overlap_schedule=True,
+                                        max_running_requests=1,
                                     ):
                                         result = apply_fp8_moe(
                                             None, vector_method, bank, dispatch
@@ -532,6 +533,78 @@ class TestSM70BlockFP8(CustomTestCase):
                                                 ten_actual.view(torch.int16),
                                             )
                                         )
+                                        if rows == 4:
+                                            # Ragged prefill changes route padding
+                                            # but must preserve every output bit.
+                                            import importlib
+
+                                            marlin = importlib.import_module(
+                                                "sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe"
+                                            )
+                                            bank.w13_weight_scale_inv._sm70_fp8_scale = True
+                                            bank.w2_weight_scale_inv._sm70_fp8_scale = (
+                                                True
+                                            )
+                                            prefill_rows = 4165
+                                            repeats = (prefill_rows + rows - 1) // rows
+                                            prefill_x = x.repeat(repeats, 1)[
+                                                :prefill_rows
+                                            ].contiguous()
+                                            prefill_ids = bank_ids.repeat(repeats, 1)[
+                                                :prefill_rows
+                                            ].contiguous()
+                                            prefill_ids[:2].fill_(-1)
+                                            prefill_weights = ten_weights.repeat(
+                                                repeats, 1
+                                            )[:prefill_rows].contiguous()
+
+                                            def run_prefill():
+                                                return fused_marlin_moe(
+                                                    prefill_x,
+                                                    bank.w13_weight,
+                                                    bank.w2_weight,
+                                                    bank.w13_weight_scale_inv,
+                                                    bank.w2_weight_scale_inv,
+                                                    torch.zeros(
+                                                        prefill_rows,
+                                                        local_experts,
+                                                        device="cuda",
+                                                    ),
+                                                    prefill_weights,
+                                                    prefill_ids,
+                                                    num_bits=8,
+                                                    inplace=False,
+                                                    expert_map=torch.arange(
+                                                        local_experts,
+                                                        device="cuda",
+                                                        dtype=torch.int32,
+                                                    ),
+                                                    global_num_experts=local_experts,
+                                                )
+
+                                            aligned = run_prefill()
+                                            with patch.object(
+                                                marlin,
+                                                "select_marlin_moe_block_size",
+                                                return_value=64,
+                                            ):
+                                                control = run_prefill()
+                                            self.assertTrue(
+                                                torch.equal(
+                                                    aligned.view(torch.uint8),
+                                                    control.view(torch.uint8),
+                                                )
+                                            )
+                                            self.assertEqual(
+                                                int(torch.count_nonzero(aligned[:2])), 0
+                                            )
+                                            del (
+                                                aligned,
+                                                control,
+                                                prefill_x,
+                                                prefill_ids,
+                                                prefill_weights,
+                                            )
                                     del bank_graph, bank, bank_output, result
                             live_graph = torch.cuda.CUDAGraph()
                             with torch.cuda.graph(live_graph):

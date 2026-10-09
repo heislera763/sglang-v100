@@ -13,7 +13,6 @@ from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_buffer,
     get_exec,
-    get_model,
     get_parallel,
     get_schedule,
     get_spec,
@@ -94,8 +93,9 @@ def _partition(self, input_ids, forward_batch):
         and self.hc_count == 4
         and self.hidden_size == 2560
         and parallel.tp_size == parallel.attn_tp_size == 4
-        and parallel.pp_size == 2
-        and get_model().quantization == "fp8"
+        # HC's FP16 token-row operations are independent of weight format.
+        # Keep the within-quad TP4 collectives and validated PP boundary roles.
+        and parallel.pp_size in (1, 2)
         and get_schedule().disable_overlap_schedule
         and get_schedule().max_running_requests == 1
         and get_spec().speculative_algorithm in (None, "EAGLE")

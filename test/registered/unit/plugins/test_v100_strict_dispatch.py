@@ -259,8 +259,8 @@ class TestV100StrictDispatch(CustomTestCase):
                     x.sum(-1),
                 )
 
-    def test_mtp_prefill_keeps_tensor_core_attention_on_target_and_local_draft(self):
-        """MTP must not disable the exact-membership prefill kernel on either stage."""
+    def test_qsa_prefill_dispatch_is_independent_of_model_layout(self):
+        """Compatible prefill reuses its query/cache contract across model layouts."""
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
         backend = object.__new__(qsa.QwenSparseAttnBackend)
@@ -311,9 +311,12 @@ class TestV100StrictDispatch(CustomTestCase):
             ({}, True),
             ({"speculative_algorithm": "EAGLE"}, True),
             ({"speculative_algorithm": "EAGLE", "pp_size": 1}, True),
-            ({"pp_size": 1}, False),
-            ({"tp_size": 8, "speculative_algorithm": "EAGLE"}, False),
-            ({"speculative_algorithm": "STANDALONE"}, False),
+            ({"pp_size": 1}, True),
+            ({"tp_size": 8}, True),
+            ({"tp_size": 8, "speculative_algorithm": "EAGLE"}, True),
+            ({"quantization": "modelopt_fp4", "pp_size": 1}, True),
+            ({"speculative_algorithm": "STANDALONE"}, True),
+            ({"disable_overlap_schedule": False}, False),
             ({"speculative_algorithm": "EAGLE", "max_running_requests": 2}, False),
         ]
         with (

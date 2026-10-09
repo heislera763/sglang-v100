@@ -7,7 +7,7 @@ import torch
 from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
     QwenSparseAttnBackend as BaseQSA,
 )
-from sglang.srt.runtime_context import get_model, get_parallel, get_schedule, get_spec
+from sglang.srt.runtime_context import get_schedule
 
 from .dispatch import reject_fallback
 
@@ -167,16 +167,6 @@ class QwenSparseAttnBackend(BaseQSA):
                     and lengths is not None
                     and len(lengths) == 1
                     and rows >= 128
-                    and get_model().quantization == "fp8"
-                    and get_parallel().tp_size == 4
-                    and (
-                        get_parallel().pp_size == 2
-                        or (
-                            get_parallel().pp_size == 1
-                            and get_spec().speculative_algorithm == "EAGLE"
-                        )
-                    )
-                    and get_spec().speculative_algorithm in (None, "EAGLE")
                     and get_schedule().disable_overlap_schedule
                     and get_schedule().max_running_requests == 1
                     and self.qsa_profile.budget
@@ -186,8 +176,8 @@ class QwenSparseAttnBackend(BaseQSA):
                     # Sparse per-query scalar work underuses Volta. Share K/V
                     # tiles across queries/heads and mask their exact selections
                     # while using FP16 Tensor Cores with FP32 accumulation.
-                    # MTP prompt prefill has the same selection contract; its
-                    # final-stage draft temporarily uses a local PP1 group.
+                    # Query/cache geometry and per-query membership determine
+                    # eligibility; weight format and TP/PP placement do not.
                     from .kernels.qsa_prefill import qsa_masked_prefill
 
                     out = qsa_masked_prefill(

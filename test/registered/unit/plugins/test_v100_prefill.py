@@ -26,8 +26,8 @@ with patch.object(
 
 
 class TestV100Prefill(CustomTestCase):
-    def test_fp8_route_alignment_matches_native_tile_and_preserves_other_profiles(self):
-        """Only the whole-expert FP8/EP4 profile may replace generic route alignment."""
+    def test_fp8_route_alignment_matches_packing_and_native_tile(self):
+        """The native row tile applies to either local expert bank/layout."""
         from sglang_v100_plus.fp8 import fp8_route_block_size
 
         from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
@@ -51,9 +51,9 @@ class TestV100Prefill(CustomTestCase):
         )
         for changes, tuning, tagged, expected in (
             ({}, False, True, 32),
-            ({"ep_size": 1}, False, True, 64),
-            ({"tp_size": 8}, False, True, 64),
-            ({"pp_size": 1}, False, True, 64),
+            ({"ep_size": 1}, False, True, 32),
+            ({"tp_size": 8, "ep_size": 8}, False, True, 32),
+            ({"pp_size": 1}, False, True, 32),
             ({"max_running_requests": 2}, False, True, 64),
             ({}, True, True, 64),
             ({}, False, False, 64),
@@ -71,6 +71,25 @@ class TestV100Prefill(CustomTestCase):
                     select_marlin_moe_block_size, hidden, ids, w1, w2, scales
                 )
                 self.assertEqual(actual, expected)
+        with get_context().override_server_args(**fields):
+            scales._sm70_fp8_scale = True
+            for experts, down_experts, width, expected in (
+                (64, 64, 5120, 32),
+                (128, 128, 5120, 32),
+                (64, 128, 5120, 64),
+                (64, 64, 1280, 64),
+            ):
+                with self.subTest(
+                    experts=experts, down_experts=down_experts, width=width
+                ):
+                    w1.shape = (experts, 160, width)
+                    w2.shape = (down_experts, 40, 10240)
+                    self.assertEqual(
+                        fp8_route_block_size(
+                            select_marlin_moe_block_size, hidden, ids, w1, w2, scales
+                        ),
+                        expected,
+                    )
 
     def test_dflash_residual_addition_does_not_overflow_before_norm(self):
         norm = SM70DFlashResidualNorm(
@@ -202,7 +221,7 @@ class TestV100Prefill(CustomTestCase):
                 local,
             )
 
-    def test_only_eager_serialized_fp8_prefill_is_partitioned(self):
+    def test_only_eager_serialized_tp4_prefill_is_partitioned(self):
         """Only ordinary/MTP eager prefill may partition; verification stays full."""
         owner = SimpleNamespace(hc_count=4, hidden_size=2560)
         batch = SimpleNamespace(
@@ -222,7 +241,9 @@ class TestV100Prefill(CustomTestCase):
                 {},
                 {"pp_size": 1},
                 {"tp_size": 8},
-                {"quantization": "nvfp4"},
+                {"quantization": "modelopt_fp4"},
+                {"quantization": "modelopt_fp4", "pp_size": 1},
+                {"pp_size": 3},
                 {"max_running_requests": 2},
                 {"disable_prefill_cuda_graph": False},
                 {"enable_return_hidden_states": True},
@@ -240,6 +261,9 @@ class TestV100Prefill(CustomTestCase):
                         actual = prefill._partition(owner, torch.empty(rows), batch)
                         if rows >= 256 and changes in (
                             {},
+                            {"pp_size": 1},
+                            {"quantization": "modelopt_fp4"},
+                            {"quantization": "modelopt_fp4", "pp_size": 1},
                             {"speculative_algorithm": "EAGLE"},
                         ):
                             self.assertEqual(actual, prefill.Partition(rows, 2))

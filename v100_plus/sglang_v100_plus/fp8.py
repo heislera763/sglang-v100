@@ -177,8 +177,8 @@ def fp8_marlin_scalar_type(original, num_bits, has_zp, scales=None, global_scale
 
 
 def fp8_route_block_size(original, hidden, ids, w1, w2, scales):
-    """Align Qwen prefill routes to the native kernel's 32-row CTA."""
-    from sglang.srt.runtime_context import get_parallel, get_schedule
+    """Align compatible packed FP8 routes to the native kernel's 32-row CTA."""
+    from sglang.srt.runtime_context import get_schedule
 
     from .kernels.moe_marlin import _sm70_marlin_user_tuning
 
@@ -186,8 +186,6 @@ def fp8_route_block_size(original, hidden, ids, w1, w2, scales):
         not _sm70_marlin_user_tuning
         and get_schedule().disable_overlap_schedule
         and get_schedule().max_running_requests == 1
-        and get_parallel().tp_size == get_parallel().ep_size == 4
-        and get_parallel().pp_size == 2
         and hidden.dtype == scales.dtype == torch.float16
         and hidden.is_cuda
         and hidden.ndim == 2
@@ -195,8 +193,10 @@ def fp8_route_block_size(original, hidden, ids, w1, w2, scales):
         and hidden.shape[1] == 2560
         and ids.shape == (hidden.shape[0], 10)
         and ids.dtype == torch.int32
-        and tuple(w1.shape) == (128, 160, 5120)
-        and tuple(w2.shape) == (128, 40, 10240)
+        and len(w1.shape) == len(w2.shape) == 3
+        and w1.shape[0] == w2.shape[0] > 0
+        and tuple(w1.shape[1:]) == (160, 5120)
+        and tuple(w2.shape[1:]) == (40, 10240)
         and getattr(scales, "_sm70_fp8_scale", False)
     ):
         return 32
