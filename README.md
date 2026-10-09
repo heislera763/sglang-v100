@@ -22,9 +22,10 @@ The integrated upstream revision is `c892301ff76f`; see
 - **Architecture coverage:** Qwen QSA/GDN, gated residuals and pinned-host PLE
   embeddings; GLM sparse MLA/K-pool indexing, KDA and mHC. Qwen FP8 uses vector
   experts for compatible ordinary/MTP rows across TP/PP layouts; top-k for wide
-  vocabularies is shared with NVFP4. PP2 adds block-scale reuse, ragged HC
-  prefill with padding trimmed before consumers, 32-row expert route alignment,
-  masked Tensor Core sparse attention and GPU metadata graphs. Sampled
+  vocabularies is shared with NVFP4. Compatible FP8 experts share 32-row route
+  alignment, and FP8/NVFP4 share masked Tensor Core QSA prefill. TP4 HC prefill
+  partitions FP16 token work within each quad on PP1/PP2, trimming padding before
+  consumers. PP2 adds GPU metadata graphs and block-scale reuse. Sampled
   MTP keeps exact draft probabilities locally, packs nested PP result tensors
   for both models and retains Tensor Core Qwen target/draft prompt attention.
   Qwen's two-step PP2 profile also captures accepted recurrent/PLE state copies.
@@ -95,7 +96,8 @@ does not instrument every upstream operation or guarantee the fastest kernel.
 ```bash
 export CUDA_VISIBLE_DEVICES=4,5,6,7
 unset SGLANG_PP_LAYER_PARTITION SGLANG_ENABLE_PP_SPEC
-unset SGLANG_OPT_SM70_HC_PREFILL_SP SGLANG_ENABLE_METADATA_GLUE_GRAPH
+unset SGLANG_ENABLE_METADATA_GLUE_GRAPH
+export SGLANG_OPT_SM70_HC_PREFILL_SP=1
 uv run --no-project .venv/bin/python -m sglang_v100_plus "${sglang_args[@]}" \
   --model-path "$HOME/models/sglang/RadixArk-Qwen3.8-Flash-Next-NVFP4" \
   --served-model-name qwen3.8-flash-next --quantization modelopt_fp4 --fp4-gemm-backend marlin \
@@ -190,17 +192,19 @@ settings. Prefill is input tokens divided by native prefill duration; generation
 excludes the first token. Warmups, cached input and retractions are excluded.
 **A/F** and **G MTP** use nine-request confirmations; **C** and **G ordinary**
 are three-request checks. **H** compares six requests per TP8 variant and
-three per NVFP4 variant. Rows from different revisions are not controlled A/Bs.
+three per NVFP4 variant. **I** uses six requests each for baseline/best prefill
+profiles, plus three per component screen. Rows from different revisions are
+not controlled A/Bs.
 
 | Checkpoint / layout | MTP steps | Prefill tokens/s | Generation tokens/s | Evidence |
 | --- | ---: | ---: | ---: | :---: |
 | Qwen NVFP4 / TP4 | Off | 3,712 | 70.1 | A |
-| Qwen NVFP4 / TP4 | 2 | 4,324 | 100.7 | H |
+| Qwen NVFP4 / TP4 | 2 | 5,274 | 105.1 | I |
 | GLM NVFP4 / TP4×PP2 | Off | 1,719 | 24.8 | A |
 | GLM NVFP4 / TP4×PP2 | 3 | 1,593 | 36.1 | F |
 | Qwen FP8 / TP4×PP2 + EP4 | Off | 8,092 | 61.6 | G |
 | Qwen FP8 / TP4×PP2 + EP4 | 2 | 7,609 | 70.6 | G |
-| Qwen FP8 / TP8 + EP8 | Off | 4,183 | 51.0 | H |
+| Qwen FP8 / TP8 + EP8 | Off | 4,532 | 51.8 | I |
 | Qwen FP8 / TP8 + EP8 | 2 | 4,012 | 75.0 | H |
 | GLM NVFP4 / TP8 | Off | 1,163 | 39.6 | C |
 | GLM NVFP4 / TP8 | 3 | 1,084 | 37.5 | C |
@@ -210,6 +214,7 @@ Runtime revisions: **A** [`cf7f7e9f`](https://github.com/heislera763/sglang-v100
 **F** [`9212de6d`](https://github.com/heislera763/sglang-v100-plus/commit/9212de6ddcac40b7a4617782d9e98a395d618076),
 **G** [`d1d93041`](https://github.com/heislera763/sglang-v100-plus/commit/d1d93041f4bf78e13c49bb752fb6c1384c306527),
 **H** [`e054ff4d`](https://github.com/heislera763/sglang-v100-plus/commit/e054ff4d072616ec5678683adcf14c65e377e17d),
+**I** [`27e5127d`](https://github.com/heislera763/sglang-v100-plus/commit/27e5127dca21525f0d56d3e1c15760d7b9e7ceac),
 2026-10-07/08, Torch `2.13.0+cu126`. Eager prefill/full batch-one decode,
 strict dispatch, no overlap/radix, context/cache 12288. A/C/F GLM use 2048-token
 chunks; G Qwen FP8 uses 4352, HC partitioning and metadata graphs. H uses
@@ -221,6 +226,16 @@ FP64 normalization, high expert indices and refreshed CUDA graph inputs pass;
 FP8 scale/activation boundaries are unchanged. The three-prompt NVFP4 top-k
 check gives **97.8→100.7** generation tokens/s at matching settings; treat this
 smaller gain as preliminary.
+
+I retains three geometry/ownership-based prefill selections. At matching 4352
+chunks, TP8 FP8 improves **4,205→4,532 (+7.8%)**: route alignment adds about 1.2%,
+masked QSA about 6.4%. NVFP4 TP4 MTP improves **4,313→5,274 (+22.3%)**: QSA adds
+about 8.4%, within-quad HC partitioning about 11.8%. Component figures are
+three-prompt screens; baseline/best are alternating six-request confirmations.
+Decode execution stays flat; NVFP4's sampled 105.1 TPS
+also reflects acceptance variation. 3,480 native expert byte comparisons,
+1,200 attention comparisons at unchanged tolerances and 2,400 HC byte comparisons
+at matched GEMM geometry pass. The existing FP8 PP2 recipe also passes.
 
 G retains two matched prefill gains: ragged HC plus chunk selection
 **6,612→7,359 (+11.3%)**, then expert route alignment **7,370→7,609 (+3.2%)**.
