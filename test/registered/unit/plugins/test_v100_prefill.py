@@ -169,7 +169,15 @@ class TestV100Prefill(CustomTestCase):
         residual = torch.arange(4 * 12, dtype=torch.float32).reshape(4, 12)
         normed = residual * 0.5
         gate = torch.arange(4 * 8 * 3).reshape(4, 8, 3)
-        state = SM70GatedResidualState(None, None, None, None, None, normed, gate)
+        state = SM70GatedResidualState(
+            expand=None,
+            attn_mix=None,
+            ffn_mix=None,
+            attn_combine=None,
+            ffn_combine=None,
+            normed=normed,
+            gate=gate,
+        )
         parallel = SimpleNamespace(attn_tp_size=2, attn_tp_rank=1)
         with (
             patch("sglang_v100_plus.hc_state.get_parallel", return_value=parallel),

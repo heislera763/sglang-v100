@@ -398,7 +398,11 @@ def initialize(original, self, config, *args, **kwargs):
     return original(self, config, *args, **kwargs)
 
 
-def mix(original, self, hyper_input):
+def mix(original, self, hyper_input, *, normalized_input=None):
+    if normalized_input is not None:
+        reject_fallback("qwen.hc_mix", "prepared HC norms require SM70 qualification")
+        return original(self, hyper_input, normalized_input=normalized_input)
+
     if (
         hyper_input.ndim == 2
         and hyper_input.shape[0] > 4
@@ -528,7 +532,9 @@ def combine(original, self, block_output, residuals):
         "[rows, 2560] output, [rows, 10240] residuals and [4, 10240] injection weights",
         output=block_output,
     )
-    return original(self, block_output, residuals)
+    return original(
+        self, block_output, residuals if len(residuals) == 3 else (*residuals, None)
+    )
 
 
 def embedding_output(original, self, *args, **kwargs):
