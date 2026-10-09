@@ -56,6 +56,7 @@ def install():
         prepare_nvfp4_dense,
         prepare_nvfp4_moe,
     )
+    from .sampling import copy_penalty_metadata, exact_eagle_sample
 
     norm_ops._has_flashinfer = False
     norms._flashinfer_layernorm_available = False
@@ -83,6 +84,16 @@ def install():
             raise ValueError("The enabled SM70 profile requires float16 model weights")
 
     hooks = [
+        (
+            "sglang.srt.sampling.sampling_batch_info.SamplingBatchInfo.copy_for_forward",
+            copy_penalty_metadata,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.speculative.eagle_worker_common.eagle_sample",
+            exact_eagle_sample,
+            HookType.AROUND,
+        ),
         (
             "sglang.srt.models.dflash.DFlashGroupedConv",
             SM70DFlashGroupedConv,

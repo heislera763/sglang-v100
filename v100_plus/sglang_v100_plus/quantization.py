@@ -150,6 +150,51 @@ def _dense_repack(weight, num_bits=4):
     return result
 
 
+def pad_nvfp4_expert_width(layer):
+    """Preserve both gated halves when an 80-wide shard needs a 64-column tile."""
+    from sglang.srt.layers.utils import copy_or_rebind_param
+
+    w13, w2 = layer.w13_weight, layer.w2_weight
+    if (
+        w13.ndim != 3
+        or w2.ndim != 3
+        or w13.shape[0] != w2.shape[0]
+        or tuple(w13.shape[1:]) != (160, 1280)
+        or tuple(w2.shape[1:]) != (2560, 40)
+        or w13.dtype != torch.uint8
+        or w2.dtype != torch.uint8
+    ):
+        return
+    # Marlin requires N divisible by64. Padding each gate/up half80->96
+    # also gives FC2 a K divisible by32. Checkpoint bytes/scales stay intact;
+    # new columns and FC2 rows represent exact zeros, not requantization.
+    for prefix in ("w13", "w2"):
+        weight = getattr(layer, prefix + "_weight")
+        scales = getattr(layer, prefix + "_weight_scale").view(torch.uint8)
+        if prefix == "w13":
+            weight = torch.cat(
+                [
+                    torch.nn.functional.pad(v, (0, 0, 0, 16))
+                    for v in weight.chunk(2, dim=1)
+                ],
+                dim=1,
+            )
+            scales = torch.cat(
+                [
+                    torch.nn.functional.pad(v, (0, 0, 0, 16))
+                    for v in scales.chunk(2, dim=1)
+                ],
+                dim=1,
+            )
+        else:
+            weight = torch.nn.functional.pad(weight, (0, 8))
+            scales = torch.nn.functional.pad(scales, (0, 1))
+        copy_or_rebind_param(layer, prefix + "_weight", weight)
+        copy_or_rebind_param(
+            layer, prefix + "_weight_scale", scales.view(torch.float8_e4m3fn)
+        )
+
+
 def prepare_nvfp4_moe(original, layer):
     from sglang.srt.layers.utils import copy_or_rebind_param
 
@@ -161,6 +206,7 @@ def prepare_nvfp4_moe(original, layer):
         raise ValueError("The V100 NVFP4 profile requires group_size=16")
     if any(getattr(layer, name, None) is not None for name in ("w13_bias", "w2_bias")):
         raise ValueError("The V100 NVFP4 profile does not support expert bias")
+    pad_nvfp4_expert_width(layer)
     # Match mainline's Marlin workspace contract: four counters per SM.
     layer.workspace = torch.zeros(
         torch.cuda.get_device_properties(layer.w13_weight.device).multi_processor_count
@@ -220,8 +266,9 @@ def moe_runner(original, cls, dispatch_name, runner_name):
             and 1 <= h.shape[0] <= 4
             and h.shape[1] == 2560
             and tuple(topk.topk_ids.shape) == (h.shape[0], 10)
-            and tuple(quant.w13_qweight.shape) == (512, 160, 640)
-            and tuple(quant.w2_qweight.shape) == (512, 10, 5120)
+            and tuple(quant.w2_qweight.shape) in ((512, 6, 5120), (512, 10, 5120))
+            and tuple(quant.w13_qweight.shape)
+            == (512, 160, quant.w2_qweight.shape[1] * 64)
             and quant.w13_scales.dtype == quant.w2_scales.dtype == torch.float8_e4m3fn
             and quant.weight_bits == 4
             and quant.w13_qzeros is None
@@ -279,7 +326,7 @@ def moe_runner(original, cls, dispatch_name, runner_name):
             "moe.nvfp4_decode",
             "native Qwen MoE requires SGLANG_V100_NVFP4_MOE_DECODE=1, "
             "FP16 [1..4, 2560], 512 NVFP4 gated experts with intermediate "
-            "size 160, topk=10 and default activation/routing options",
+            "size 96 (padded80) or160, topk=10 and default activation/routing options",
             input=h,
             route_ids=getattr(topk, "topk_ids", None),
             w13=getattr(quant, "w13_qweight", None),

@@ -12,7 +12,7 @@
     "python/sglang/kernels/ops/layernorm/mhc_post_split_h.py": "Select the SM70-compatible FP16/FP32 mHC post-combine path.",
     "python/sglang/kernels/ops/layernorm/mhc_sm70.py": "Volta mHC projection/RMS and pointwise implementations.",
     "python/sglang/srt/arg_groups/fields/model.py": "Allow explicit float16 QSA index cache.",
-    "python/sglang/srt/environ.py": "Typed SM70 optimization switches, HC prefill partitioning and strict V100 dispatch diagnostics.",
+    "python/sglang/srt/environ.py": "Typed SM70 optimization switches, HC prefill partitions, sampled verification graphs and strict V100 dispatch diagnostics.",
     "python/sglang/srt/layers/attention/dsa/dsa_indexer_kpool.py": "Dispatch supported SM70 K-pool/indexer decode operations.",
     "python/sglang/srt/layers/attention/dsa_backend.py": "Allocate and dispatch Volta-compatible FP16 sparse attention/indexer paths.",
     "python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py": "Expose route-alignment selection so the plugin can match the native GEMM row tile; the default policy is unchanged.",

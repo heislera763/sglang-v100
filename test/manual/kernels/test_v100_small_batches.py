@@ -25,6 +25,99 @@ with patch.object(
     "Requires a V100",
 )
 class TestV100SmallBatches(CustomTestCase):
+    def test_spec_sample_graph_preserves_native_tokens_rng_and_retained_results(self):
+        from contextlib import nullcontext
+        from inspect import unwrap
+
+        from sglang_v100_plus.sample_graph import SampleGraph
+
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.runtime_context import get_context, get_parallel
+        from sglang.srt.speculative.eagle_utils import eagle_sample
+
+        original = unwrap(eagle_sample)
+        group = SimpleNamespace(world_size=1)
+        for width in (2, 3, 4):
+            info = SimpleNamespace(
+                temperatures=torch.ones(1, 1, device="cuda"),
+                top_ps=torch.ones(1, device="cuda"),
+                top_ks=torch.full((1,), -1, device="cuda", dtype=torch.int32),
+                min_ps=torch.zeros(1, device="cuda"),
+                is_all_greedy=False,
+                need_top_k_sampling=False,
+                need_top_p_sampling=False,
+                sampling_seed=None,
+                acc_additive_penalties=None,
+                acc_scaling_penalties=None,
+                logit_bias=None,
+            )
+            batch = SimpleNamespace(
+                device="cuda",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                seq_lens=torch.tensor([32], device="cuda"),
+                sampling_info=info,
+            )
+            plan = SimpleNamespace(
+                tree_topk=1,
+                draft_token_num=width,
+                max_tree_depth=width,
+                draft_token=torch.arange(width, device="cuda"),
+                retrieve_index=torch.arange(width, device="cuda")[None, :],
+                retrieve_next_token=torch.tensor(
+                    [list(range(1, width)) + [-1]], device="cuda"
+                ),
+                retrieve_next_sibling=torch.full((1, width), -1, device="cuda"),
+                draft_probs=torch.softmax(
+                    torch.randn(1, width - 1, 4096, device="cuda"), dim=-1
+                ),
+            )
+            logits = SimpleNamespace(
+                next_token_logits=torch.randn(width, 4096, device="cuda")
+            )
+            with (
+                self.subTest(width=width),
+                torch.inference_mode(),
+                get_context().override_server_args(
+                    model_path="dummy",
+                    speculative_algorithm="EAGLE",
+                    speculative_use_rejection_sampling=True,
+                ),
+                get_parallel().override(tp_group=group),
+                # This single-GPU test needs no distributed capture context;
+                # native multi-rank runs separately exercise NCCL broadcasts.
+                patch(
+                    "sglang.srt.distributed.graph_capture", return_value=nullcontext()
+                ),
+            ):
+                before = torch.cuda.get_rng_state()
+                graph = SampleGraph(original, plan, batch, logits, group)
+                self.assertTrue(torch.equal(before, torch.cuda.get_rng_state()))
+                retained = saved = None
+                for iteration in range(6):
+                    logits.next_token_logits.normal_()
+                    plan.draft_probs.copy_(
+                        torch.softmax(torch.randn_like(plan.draft_probs), dim=-1)
+                    )
+                    plan.draft_token.add_(17).remainder_(4096)
+                    info.temperatures.fill_(0.7 if iteration % 2 else 1.0)
+                    batch.seq_lens.add_(1)
+                    proposal = plan.draft_probs.clone()
+                    before = torch.cuda.get_rng_state()
+                    reference = tuple(v.clone() for v in original(plan, batch, logits))
+                    expected_rng = torch.cuda.get_rng_state()
+                    torch.cuda.set_rng_state(before)
+                    actual = graph.run(plan, batch, logits)
+                    for value, expected in zip(actual, reference):
+                        torch.testing.assert_close(value, expected, rtol=0, atol=0)
+                    self.assertTrue(
+                        torch.equal(expected_rng, torch.cuda.get_rng_state())
+                    )
+                    self.assertTrue(torch.equal(proposal, plan.draft_probs))
+                    if retained is not None:
+                        for value, expected in zip(retained, saved):
+                            torch.testing.assert_close(value, expected, rtol=0, atol=0)
+                    retained, saved = actual, tuple(v.clone() for v in actual)
+
     def test_pp_commit_graph_refreshes_request_acceptance_and_source_state(self):
         """Capture must refresh inputs and keep chain/state-pool owners distinct."""
         from sglang_v100_plus.commit_graph import commit_relayed_states

@@ -74,20 +74,28 @@ def sm70_nvfp4_moe_decode(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
 ) -> torch.Tensor:
-    """Run the exact TP4 M<=4/H=2560/I=160/top-k=10 decode shape."""
+    """Run M<=4/H=2560/top-k=10 with physical expert width 96 or 160."""
     ext = _load_sm70_nvfp4_moe_decode_ops()
     if ext is None:
         raise RuntimeError("SM70 NVFP4 MoE decode extension is unavailable")
     batch_size = hidden_states.shape[0]
     num_routes = batch_size * 10
+    intermediate = w2.shape[1] * 16
+    if intermediate not in (96, 160):
+        raise ValueError("NVFP4 decode requires physical width 96 or 160")
+    down_splits = 5 if intermediate == 160 else 3
     gate_up_partials = torch.empty(
-        (40, num_routes, 320), dtype=torch.float32, device=hidden_states.device
+        (40, num_routes, 2 * intermediate),
+        dtype=torch.float32,
+        device=hidden_states.device,
     )
     activated = torch.empty(
-        (num_routes, 160), dtype=torch.float16, device=hidden_states.device
+        (num_routes, intermediate), dtype=torch.float16, device=hidden_states.device
     )
     down_partials = torch.empty(
-        (num_routes, 5, 2560), dtype=torch.float32, device=hidden_states.device
+        (num_routes, down_splits, 2560),
+        dtype=torch.float32,
+        device=hidden_states.device,
     )
     output = torch.empty_like(hidden_states)
     ext.decode(

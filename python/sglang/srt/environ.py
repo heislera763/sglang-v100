@@ -922,6 +922,8 @@ class Envs:
     SGLANG_OPT_SM70_MHC_POINTWISE = EnvBool(False)
     # Partition Qwen FP8 eager-prefill HC tokens within a TP4 NVLink quad.
     SGLANG_OPT_SM70_HC_PREFILL_SP = EnvBool(False)
+    # Capture unpenalized linear rejection sampling for one serialized request.
+    SGLANG_OPT_SM70_SPEC_SAMPLE_GRAPH = EnvBool(False)
     # Fuse the `residual_add + RMSNorm + zero-pad` triplet that appears
     # before the MoE block for models whose MoE input hidden_size must be
     # padded up to a stride (e.g. GPT-OSS MXFP4 needs pad to multiple of
