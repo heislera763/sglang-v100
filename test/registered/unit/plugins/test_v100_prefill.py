@@ -303,6 +303,108 @@ class TestV100Prefill(CustomTestCase):
                 raise RuntimeError("failed forward")
             self.assertIs(prefill.gather_input(full), full)
 
+    def test_tp8_hc_uses_cached_quad_groups_without_changing_model_tp(self):
+        """Both quads own all tokens; subgroup lifetime follows its parent world."""
+        owner = SimpleNamespace(hc_count=4, hidden_size=2560)
+        batch = SimpleNamespace(
+            batch_size=1, forward_mode=SimpleNamespace(is_extend=lambda: True)
+        )
+        fields = dict(
+            model_path="dummy",
+            tp_size=8,
+            ep_size=8,
+            pp_size=1,
+            max_running_requests=1,
+            disable_overlap_schedule=True,
+            disable_prefill_cuda_graph=True,
+        )
+        with (
+            get_context().override_server_args(**fields),
+            envs.SGLANG_OPT_SM70_HC_PREFILL_SP.override(True),
+            prefill_scope(True),
+        ):
+            for rank in range(8):
+                parent = SimpleNamespace(ranks=list(range(8)), device_group=object())
+                world = SimpleNamespace(ranks=list(range(8)), local_rank=rank)
+                group = SimpleNamespace(rank_in_group=rank % 4)
+                with (
+                    self.subTest(rank=rank),
+                    get_parallel().override(
+                        attn_tp_size=8,
+                        attn_tp_rank=rank,
+                        attn_tp_group=parent,
+                        world_group=world,
+                    ),
+                    patch("torch.distributed.get_backend", return_value="nccl"),
+                    patch(
+                        "sglang.srt.distributed.init_model_parallel_group",
+                        return_value=group,
+                    ) as create,
+                ):
+                    for rows in (257, 4352):
+                        plan = prefill._partition(owner, torch.empty(rows), batch)
+                        self.assertEqual(
+                            plan, prefill.Partition(rows, rank % 4, group=group)
+                        )
+                    create.assert_called_once_with(
+                        [list(range(4)), list(range(4, 8))],
+                        local_rank=rank,
+                        backend="nccl",
+                        use_pynccl=False,
+                        use_custom_allreduce=False,
+                        use_mscclpp=False,
+                        use_torch_symm_mem_allreduce=False,
+                        group_name="v100_hc_prefill",
+                    )
+                    self.assertIs(get_parallel().attn_tp_group, parent)
+                    self.assertEqual(get_parallel().attn_tp_size, 8)
+                    world.ranks = list(range(16))
+                    with self.assertRaisesRegex(RuntimeError, "complete TP8 world"):
+                        prefill._partition(owner, torch.empty(257), batch)
+
+    def test_explicit_quad_gather_cannot_mix_other_quads_or_use_model_tp(self):
+        """Distinct quad data detects an accidental world gather, including PLE."""
+        from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+
+        class ModelGroup:
+            def all_gather(*_args, **_kwargs):
+                raise AssertionError("HC gather used the model TP8 group")
+
+        with (
+            get_context().override_server_args(model_path="dummy", tp_size=8),
+            get_parallel().override(attn_tp_group=ModelGroup()),
+        ):
+            for quad in range(2):
+                full = torch.arange(257 * 5).reshape(257, 5) + quad * 10000
+                padded = torch.cat((full, full.new_zeros(3, 5)))
+                for rank in range(4):
+                    expected = padded[rank * 65 : (rank + 1) * 65]
+
+                    class QuadGroup:
+                        def all_gather(_, value, dim):
+                            self.assertEqual(dim, 0)
+                            torch.testing.assert_close(value, expected, rtol=0, atol=0)
+                            return padded
+
+                    plan = prefill.Partition(257, rank, group=QuadGroup())
+                    with prefill.partition_scope(plan):
+                        local = prefill.local_input(full)
+                        torch.testing.assert_close(local, expected, rtol=0, atol=0)
+                        torch.testing.assert_close(
+                            prefill.gather_input(local), full, rtol=0, atol=0
+                        )
+                        batch = SimpleNamespace(residual_stream=None)
+                        residual_batch.set_written(local, batch)
+                        gathered = prefill.prepare_attention(
+                            lambda owner, hidden, fb, ple: hidden,
+                            SimpleNamespace(ple=object()),
+                            local,
+                            batch,
+                            None,
+                        )
+                        torch.testing.assert_close(gathered, full, rtol=0, atol=0)
+                        residual_batch.stream_of(batch).check(gathered)
+
     def test_ragged_partitions_pad_only_hc_and_trim_before_consumers(self):
         """Equal collective counts must retain every real row, including short tails."""
         with get_context().override_server_args(model_path="dummy"):

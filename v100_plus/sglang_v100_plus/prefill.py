@@ -1,4 +1,4 @@
-"""Partition replicated Qwen HC work by token within each TP4 stage.
+"""Partition replicated Qwen HC work by token within each four-rank group.
 
 Attention and experts still receive the complete token matrix. Residual streams
 stay partitioned between HC calls; only the mixed input is gathered per branch.
@@ -26,6 +26,7 @@ class Partition:
     rows: int
     rank: int
     size: int = 4
+    group: object = None
 
     @property
     def local_rows(self):
@@ -76,10 +77,44 @@ def gather_input(x):
         return x
     if x.shape[0] != partition.local_rows:
         raise ValueError("HC gather requires one rank's token partition")
-    gathered = get_parallel().attn_tp_group.all_gather(x.contiguous(), dim=0)
+    group = partition.group
+    if group is None:
+        group = get_parallel().attn_tp_group
+    gathered = group.all_gather(x.contiguous(), dim=0)
     return (
         gathered if gathered.shape[0] == partition.rows else gathered[: partition.rows]
     )
+
+
+def _quad_group():
+    """Create eager HC-only groups; retain the parent groups for their lifetime."""
+    import torch.distributed as dist
+
+    from sglang.srt.distributed import init_model_parallel_group
+
+    parallel = get_parallel()
+    parent, world = parallel.attn_tp_group, parallel.world_group
+    if parent is None or world is None or len(parent.ranks) != 8:
+        raise RuntimeError("TP8 HC partition requires initialized eight-rank groups")
+    if parent.ranks != world.ranks:
+        raise RuntimeError("TP8 HC partition requires one complete TP8 world")
+    groups = get_buffer("v100_hc_prefill_quad_groups", dict)
+    key = (id(parent), id(world))
+    if key not in groups:
+        # Every world rank creates both groups in the same order. Launch ranks
+        # must place each NVLink quad consecutively; model TP/EP remain intact.
+        group = init_model_parallel_group(
+            [parent.ranks[:4], parent.ranks[4:]],
+            local_rank=world.local_rank,
+            backend=dist.get_backend(parent.device_group),
+            use_pynccl=False,
+            use_custom_allreduce=False,
+            use_mscclpp=False,
+            use_torch_symm_mem_allreduce=False,
+            group_name="v100_hc_prefill",
+        )
+        groups[key] = (parent, world, group)
+    return groups[key][2]
 
 
 def _partition(self, input_ids, forward_batch):
@@ -92,10 +127,6 @@ def _partition(self, input_ids, forward_batch):
         and forward_batch.batch_size == 1
         and self.hc_count == 4
         and self.hidden_size == 2560
-        and parallel.tp_size == parallel.attn_tp_size == 4
-        # HC's FP16 token-row operations are independent of weight format.
-        # Keep the within-quad TP4 collectives and validated PP boundary roles.
-        and parallel.pp_size in (1, 2)
         and get_schedule().disable_overlap_schedule
         and get_schedule().max_running_requests == 1
         and get_spec().speculative_algorithm in (None, "EAGLE")
@@ -103,7 +134,15 @@ def _partition(self, input_ids, forward_batch):
         and not get_exec().features.enable_return_hidden_states
         and get_exec().features.return_hidden_states_mode is None
     ):
-        return Partition(input_ids.shape[0], parallel.attn_tp_rank)
+        # HC's FP16 token-row operations are independent of weight format.
+        if parallel.tp_size == parallel.attn_tp_size == 4 and parallel.pp_size in (
+            1,
+            2,
+        ):
+            return Partition(input_ids.shape[0], parallel.attn_tp_rank)
+        if parallel.tp_size == parallel.attn_tp_size == 8 and parallel.pp_size == 1:
+            group = _quad_group()
+            return Partition(input_ids.shape[0], group.rank_in_group, group=group)
     return None
 
 
