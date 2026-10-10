@@ -10,7 +10,7 @@ from sglang.kernels.ops.attention.dsa.sm70_indexer import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.version.hip is not None,
     reason="CUDA software FP8 kernels",
@@ -604,6 +604,100 @@ def test_prefill_cache_uses_compact_pooled_token_locations(
     actual_keys, actual_scales = read_pooled_cache(cache, locations.flip(0))
     assert torch.equal(actual_keys.view(torch.uint8), codes.flip(0))
     assert torch.equal(actual_scales, scales.flip(0))
+
+
+@pytest.mark.parametrize("rows,capacity", [(1, 67), (3, 521), (4, 65601), (8, 521)])
+def test_decode_scoring_live_bounds_graph_refresh_and_fp64_reference(rows, capacity):
+    """Tile skipping must preserve ragged causal rows, graph refresh and FP32 scores."""
+    from sglang.kernels.ops.attention.dsa.sm70_indexer_decode import (
+        mqa_logits_decode_sm70,
+    )
+
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("Volta Tensor Core index scoring")
+    torch.manual_seed(749)
+    query, query_scale = fp8_quantize_sm70(
+        torch.randn(rows, 32, 128, device="cuda") * 0.2
+    )
+    if rows == 3:
+        # Also exercise non-E4M3-representable FP16 query mantissas.
+        query = (torch.randn(rows, 32, 128, device="cuda") * 60).half()
+    encoded, scales = fp8_quantize_sm70(
+        torch.randn(rows, capacity, 128, device="cuda") * 0.2
+    )
+    keys = encoded.half()
+    scales = scales.squeeze(-1)
+    weights = torch.randn(rows, 32, device="cuda") * 0.1 * query_scale.squeeze(-1)
+    lengths = torch.full((rows,), min(capacity, 2051), device="cuda", dtype=torch.int32)
+    inputs = (query, keys, scales, weights, lengths)
+    mqa_logits_decode_sm70(*inputs)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = mqa_logits_decode_sm70(*inputs)
+    ptr = output.data_ptr()
+    # Cross both sides of the tile boundary and the final reserved column.
+    for pattern in (
+        [0, 1, 63, 64],
+        [65, capacity - 1, capacity, capacity + 7],
+        [-1, 0, 1, 65],
+    ):
+        lengths.copy_(
+            torch.tensor((pattern * 2)[:rows], device="cuda", dtype=torch.int32)
+        )
+        keys.mul_(0.5)
+        weights.mul_(-0.75)
+        query.copy_(query.half().neg().to(query.dtype))
+        saved = [x.clone() for x in inputs]
+        graph.replay()
+        eager = mqa_logits_decode_sm70(*inputs)
+        assert output.data_ptr() == ptr
+        assert torch.equal(output.view(torch.int32), eager.view(torch.int32))
+        q64, k64 = query.cpu().double(), keys.cpu().double()
+        expected = (
+            torch.bmm(q64, k64.transpose(1, 2)).relu()
+            * weights.cpu().double()[:, :, None]
+        ).sum(1)
+        expected *= scales.cpu().double()
+        future = torch.arange(capacity)[None, :] >= lengths.cpu()[:, None]
+        expected.masked_fill_(future, float("-inf"))
+        assert torch.equal(torch.isneginf(output.cpu()), future)
+        torch.testing.assert_close(
+            output.cpu().double(), expected, rtol=2e-5, atol=2e-6
+        )
+        for value, snapshot in zip(inputs, saved):
+            dtype = torch.uint8 if value.dtype == torch.float8_e4m3fn else value.dtype
+            assert torch.equal(value.view(dtype), snapshot.view(dtype))
+
+
+@pytest.mark.parametrize(
+    "bad_input", ["key_alignment", "query_alignment", "length_dtype"]
+)
+def test_decode_scoring_rejects_unsafe_inputs(bad_input):
+    """Contiguous storage-offset views can violate generated vector-load alignment."""
+    from sglang.kernels.ops.attention.dsa.sm70_indexer_decode import (
+        mqa_logits_decode_sm70,
+    )
+
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("Volta Tensor Core index scoring")
+    query = torch.zeros(1, 32, 128, device="cuda", dtype=torch.float16)
+    keys = torch.zeros(1, 67, 128, device="cuda", dtype=torch.float16)
+    scales = torch.ones(1, 67, device="cuda")
+    weights = torch.ones(1, 32, device="cuda")
+    lengths = torch.ones(1, device="cuda", dtype=torch.int32)
+    if bad_input == "key_alignment":
+        keys = torch.zeros(keys.numel() + 1, device="cuda", dtype=keys.dtype)[
+            1:
+        ].view_as(keys)
+    elif bad_input == "query_alignment":
+        query = torch.zeros(query.numel() + 1, device="cuda", dtype=query.dtype)[
+            1:
+        ].view_as(query)
+    else:
+        lengths = lengths.long()
+    with pytest.raises(ValueError):
+        mqa_logits_decode_sm70(query, keys, scales, weights, lengths)
 
 
 if __name__ == "__main__":

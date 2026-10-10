@@ -10,6 +10,9 @@ from sglang.kernels.ops.attention.dsa.sm70_indexer import (
     kpool_compress_sm70,
     mqa_logits_sm70,
 )
+from sglang.kernels.ops.attention.dsa.sm70_indexer_decode import (
+    mqa_logits_decode_sm70,
+)
 from sglang.kernels.ops.attention.dsa.sm70_pool4_decode import (
     pool4_cache_page_size,
     pool4_decode_sm70,
@@ -261,7 +264,7 @@ class SM70IndexerKPool(IndexerKPool):
             )
             if not return_indices:
                 return None
-            logits = mqa_logits_sm70(
+            logits = mqa_logits_decode_sm70(
                 query_fp8, cached_keys, cached_scales, weights, pools
             )
             return topk_from_pooled_history_logits(
@@ -454,7 +457,9 @@ class SM70IndexerKPool(IndexerKPool):
             * (self.n_heads**-0.5 * self.softmax_scale)
             * query_scale.squeeze(-1)
         )
-        logits = mqa_logits_sm70(query_fp8, cached_keys, cached_scales, weights, pools)
+        logits = mqa_logits_decode_sm70(
+            query_fp8, cached_keys, cached_scales, weights, pools
+        )
         return topk_from_pooled_history_logits(
             logits,
             pools,

@@ -14,7 +14,7 @@ Integrated upstream: [3831e7e0](https://github.com/sgl-project/sglang/commit/383
 Hardware adapters live in [v100_plus/sglang_v100_plus](v100_plus/sglang_v100_plus),
 reusable operators in [python/sglang/kernels/ops](python/sglang/kernels/ops), and
 build/Marlin changes in [v100_plus/aot](v100_plus/aot) and [v100_plus/patches](v100_plus/patches).
-[Provenance](v100_plus/provenance.json) and [31 recorded core changes](v100_plus/core-patches.json)
+[Provenance](v100_plus/provenance.json) and [32 recorded core changes](v100_plus/core-patches.json)
 make upstream updates auditable. Services, benchmark clients, traces and project notes
 stay outside Git. This assumes familiarity with SGLang.
 
@@ -62,7 +62,7 @@ in software; it does not imply native arithmetic in those formats.
 | Block-FP8 GEMMs | Patched Marlin and small-row vector kernels: W8A16, complete 128×128 scale blocks. Qwen EP4/EP8 preserves whole experts. |
 | FP16 routed experts | [Volta MMA GEMM](python/sglang/kernels/ops/moe/sm70_fp16.py), used by NVIDIA GLM's unquantized MTP experts. FP16 inputs/weights/output, FP32 accumulation and router multiply; upstream routing, activation and expert sum retained. Automatically selected by the SM70 plugin; unsupported epilogues fail under strict dispatch. |
 | Qwen QSA/GDN/HC | Direct FP16-cache sparse prefill/decode/verification, masked Tensor Core prefill, SM70 GDN and gated-residual kernels; HC eager prefill partitions within each quad, including TP8. |
-| GLM sparse MLA / indexer | Explicit Volta Tensor Core FP16 sparse prefill for128+queries/H8/H16/latent512/no-tail; direct selected-KV gather, FP32 reductions and FP16 probabilities. Small-row decode/verification uses Volta MMA split-K, FP16 normalized partials and FP32 LSE combine. Software FP8 learned indexer, request-owned pool4 compression and bounded FP32 scoring workspace. |
+| GLM sparse MLA / indexer | Explicit Volta Tensor Core FP16 sparse prefill for128+queries/H8/H16/latent512/no-tail; direct selected-KV gather, FP32 reductions and FP16 probabilities. Small-row decode/verification uses Volta MMA split-K, FP16 normalized partials and FP32 LSE combine. Software FP8 learned indexer and request-owned pool4 compression. Decode/verification uses [live-history MMA scoring](python/sglang/kernels/ops/attention/dsa/sm70_indexer_decode.py) with fused FP32 head reduction; prefill keeps bounded FP32 scoring workspace. |
 | GLM KDA / mHC | Range-safe KDA; FP32 mHC projection/RMS/Sinkhorn, private prefill buffer reused for square/mean (~128MiB lower peak at2048rows). BF16-to-FP16 conversion needs operation-specific range handling. |
 | Storage | Unquantized FP16 attention KV for both models; Qwen FP16 QSA index, GLM's separate model-native FP8 indexer. KV-cache quantization is excluded from the project recipes. FP16 recurrent state is retained. |
 | Cold module loading | Return idle Torch allocator blocks to CUDA when first-use Triton loads have little headroom; leave live tensors unchanged. Skip capture/custom arenas; steady kernel replay has no callback. |
@@ -203,15 +203,18 @@ compatible post-sync paths; NVIDIA PP2 MTP additionally uses the allocator fix
 [9f057466](https://github.com/heislera763/sglang-v100-plus/commit/9f057466).
 GLM PP2 MTP uses [Volta MMA sparse prefill](python/sglang/kernels/ops/attention/dsa/sm70_sparse_prefill.py)
 and [FP16 routed expert GEMMs](python/sglang/kernels/ops/moe/sm70_fp16.py).
-Fresh A/B/B/A processes on 2026-10-10 gave 1,713 → 2,359 prefill tokens/s for
-sparse attention (+37.7%). On that base, routed experts give 2,357 → 2,548 PP
-(+8.1%) and 43.3 → 45.9 TG (+6.0%); verification cycles shorten
-~8% without an acceptance increase. The subsequent [small-row attention pass](python/sglang/kernels/ops/attention/dsa/sm70_sparse_decode.py)
-measures 46.9 → 50.4 TG (+7.4%), with prefill essentially unchanged
-(~2,548 PP). Cycles shorten ~3.1%; sampled acceptance variation, especially one book
-run, contributes to the larger TG change. Same 262K context, chunks and FP16 KV.
+Fresh native A/B/B/A passes on 2026-10-10 gave 1,713 → 2,359 prefill tokens/s
+for sparse attention (+37.7%), then 2,357 → 2,548 PP for routed experts (+8.1%).
+Small-row attention shortened verification cycles ~3.1%. The subsequent
+[live-history indexer](python/sglang/kernels/ops/attention/dsa/sm70_indexer_decode.py)
+replaces full-reservation scoring and separate reduction passes: fresh paired
+48.1 → 53.2 TG (+10.6%), cycles ~10.2% shorter despite slightly lower acceptance.
+Prefill implementation is unchanged (~2,548 PP); baseline prefill varies between
+processes, so no prefill gain is attributed to this decode change. Same 262K
+context, chunks and FP16 KV. The tables below use the latest paired candidate.
 [Attention tests](test/registered/kernels/ops/attention/test_triton_sparse_mla_fp16.py) and
-[expert tests](test/registered/kernels/ops/moe/test_sm70_fp16.py) cover independent
+[expert tests](test/registered/kernels/ops/moe/test_sm70_fp16.py) and
+[indexer tests](test/registered/kernels/ops/attention/test_sm70_indexer.py) cover independent
 reference math, routing/masks and graph refresh. Precision boundaries are retained;
 MMA reduction order is not bit-exact to scalar outputs. Images, 262106-input/32-output
 capacity and reuse pass; full-context quality is separate. TP8 below is an earlier
@@ -223,7 +226,7 @@ screen preceding these implementations.
 | Qwen FP8 TP4×PP2/EP4 | 3 | 7,588 | 72.5 |
 | NVIDIA GLM TP8/EP1 | 3 | 1,366 | 42.7 |
 | NVIDIA GLM TP4×PP2/EP1 | Off | 1,882 | 28.2 |
-| NVIDIA GLM TP4×PP2/EP1 | 3 | 2,548 | 50.4 |
+| NVIDIA GLM TP4×PP2/EP1 | 3 | 2,548 | 53.2 |
 
 MTP3 categories (PP/TG tokens/s; GLM PP2 averages two processes, others one):
 
@@ -232,9 +235,9 @@ MTP3 categories (PP/TG tokens/s; GLM PP2 averages two processes, others one):
 | Qwen coding | 4,882 | 82.3 | 7,668 | 82.2 |
 | Qwen book continuation | 4,831 | 82.6 | 7,607 | 66.3 |
 | Qwen document briefing | 4,779 | 73.3 | 7,489 | 69.0 |
-| NVIDIA GLM coding | 1,370 | 48.6 | 2,565 | 51.8 |
-| NVIDIA GLM book continuation | 1,367 | 37.6 | 2,542 | 50.7 |
-| NVIDIA GLM document briefing | 1,360 | 43.2 | 2,538 | 48.7 |
+| NVIDIA GLM coding | 1,370 | 48.6 | 2,564 | 58.5 |
+| NVIDIA GLM book continuation | 1,367 | 37.6 | 2,541 | 47.2 |
+| NVIDIA GLM document briefing | 1,360 | 43.2 | 2,538 | 53.9 |
 
 Inputs: [SPEED-Bench throughput_8k](https://huggingface.co/datasets/nvidia/SPEED-Bench/tree/454f88454792dfa3ccfd7ef15fff248efde44cd1),
 first turns `91d6ca2afe114d3c99312e8758b6f964` (code),
