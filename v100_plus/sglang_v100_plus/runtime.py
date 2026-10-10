@@ -45,6 +45,7 @@ def install():
         prepare_fp8_dense,
         prepare_fp8_moe,
     )
+    from .fp16_moe import invoke_fp16_moe
     from .pipeline import (
         initialize_local_output,
         receive_output,
@@ -90,6 +91,11 @@ def install():
             raise ValueError("The enabled SM70 profile requires float16 model weights")
 
     hooks = [
+        (
+            "sglang.kernels.ops.moe.fused_moe_triton_kernels.invoke_fused_moe_kernel",
+            invoke_fp16_moe,
+            HookType.AROUND,
+        ),
         (
             "sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator._apply_token_constraints",
             require_single_session_capacity,

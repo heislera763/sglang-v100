@@ -343,5 +343,54 @@ class TestV100StrictDispatch(CustomTestCase):
                     )
 
 
+class TestFP16ExpertDispatchContract(CustomTestCase):
+    def test_upstream_positional_options_stay_aligned(self):
+        import inspect
+
+        from sglang_v100_plus.fp16_moe import _OPTIONS
+
+        from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
+            invoke_fused_moe_kernel,
+        )
+
+        self.assertEqual(
+            tuple(inspect.signature(invoke_fused_moe_kernel).parameters)[15:], _OPTIONS
+        )
+
+    def test_unqualified_fp16_epilogue_fails_before_kernel(self):
+        import triton.language as tl
+        from sglang_v100_plus.fp16_moe import invoke_fp16_moe
+
+        a = torch.zeros(1, 16, dtype=torch.float16)
+        b = torch.zeros(1, 16, 16, dtype=torch.float16)
+        output = torch.zeros(1, 16, dtype=torch.float16)
+        dummy = torch.zeros(1, dtype=torch.int32)
+        args = (
+            a,
+            b,
+            None,
+            output,
+            None,
+            None,
+            None,
+            torch.ones(1, 1),
+            dummy,
+            dummy,
+            dummy,
+            dummy,
+            False,
+            1,
+            {"BLOCK_SIZE_M": 16},
+        )
+        with envs.SGLANG_DEBUG_V100_STRICT_DISPATCH.override(True):
+            with self.assertRaises(V100FallbackError):
+                invoke_fp16_moe(
+                    lambda *a, **kw: None,
+                    *args,
+                    compute_type=tl.float16,
+                    fuse_swiglu=True,
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

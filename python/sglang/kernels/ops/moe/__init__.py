@@ -21,6 +21,17 @@ _HIP = frozenset({CapabilityRequirement.HIP})
 
 register_kernel(
     KernelSpec(
+        op="moe.sm70_fp16_moe_gemm",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.moe.sm70_fp16:sm70_fp16_moe_gemm",
+        capabilities={CapabilityRequirement.cuda(min_sm=(7, 0), max_sm=(7, 0))},
+        format_signature=FormatSignature(supported_dtypes=("float16",), in_place=True),
+        description="TileLang-generated Volta MMA for route-major FP16 expert GEMM.",
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="moe.sm70_nvfp4_moe",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.moe.sm70_nvfp4:sm70_nvfp4_moe",
