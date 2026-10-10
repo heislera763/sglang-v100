@@ -1118,6 +1118,10 @@ class Glm5NextModel(nn.Module):
             residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
+            # The last stage needs first-stage image embeddings for MTP prefill.
+            mm_input_embeds = pp_proxy_tensors.tensors.get("mm_input_embeds")
+            if mm_input_embeds is not None:
+                forward_batch.mm_input_embeds = mm_input_embeds
             hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
                 pp_proxy_tensors, forward_batch
             )
@@ -1197,7 +1201,10 @@ class Glm5NextModel(nn.Module):
             )
 
         if not self.pp_group.is_last_rank:
-            return residual_batch.to_pp(hidden_states, forward_batch)
+            proxy_tensors = residual_batch.to_pp(hidden_states, forward_batch)
+            if forward_batch.mm_input_embeds is not None:
+                proxy_tensors["mm_input_embeds"] = forward_batch.mm_input_embeds
+            return proxy_tensors
         else:
             hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
             if not forward_batch.forward_mode.is_idle():
@@ -1297,7 +1304,10 @@ class Glm5NextForConditionalGeneration(nn.Module):
 
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
         self.visual = None
-        if not self.language_only:
+        # Decoder image/video embeddings are injected on the first PP stage.
+        if not self.language_only and (
+            self.encoder_only or self.pp_group.is_first_rank
+        ):
             self.visual = Glm5NextVisionModel(
                 config.vision_config,
                 quant_config=quant_config,
@@ -1734,7 +1744,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
             is_visual_weight = "visual" in name
             if getattr(self, "encoder_only", False) and not is_visual_weight:
                 continue
-            if getattr(self, "language_only", False) and is_visual_weight:
+            if is_visual_weight and getattr(self, "visual", None) is None:
                 continue
 
             if "language_model." in name:

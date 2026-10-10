@@ -134,7 +134,7 @@ uv run --no-project .venv/bin/python -m sglang_v100_plus "${common[@]}" \
 | Variation | Change from reference |
 | --- | --- |
 | Qwen TP8 | TP8/EP8; omit PP and unset `SGLANG_PP_LAYER_PARTITION`/metadata flag. Keep HC/chunk4352. |
-| GLM PP2 MTP | TP4/PP2/EP1; `SGLANG_PP_LAYER_PARTITION=24,21`; context **262144**, total tokens **262656**, fraction **.95**, chunk2048. Add the MTP flags below. |
+| GLM PP2 MTP | TP4/PP2/EP1; `SGLANG_PP_LAYER_PARTITION=24,21`; context **262144**, total tokens **262656**, fraction **.95**, chunk2048. Add the MTP flags below. Omit `--language-only` for images; vision weights reside on the first PP stage. |
 | MTP, either model | Add `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-num-draft-tokens 4 --speculative-eagle-topk 1 --speculative-use-rejection-sampling`. PP2 also exports `SGLANG_ENABLE_PP_SPEC=1`. |
 
 Three draft steps plus one target/bonus position; built-in MTP head, one linear branch,
@@ -234,7 +234,8 @@ rechecked Qwen request-level video configuration. These are functional, not broa
 | Feature | Coverage / configuration |
 | --- | --- |
 | Qwen1M YaRN | Ordinary PP2, HC/metadata off, `--max-mamba-cache-size 1`, `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1`; [official RoPE](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8#best-practices): factor4/original262144/theta10000000/partial.25/interleaved MRoPE[11,11,10]. Native977,312-input/512-output functional run; three separated planted codes retrieved. |
-| Images/video | Qwen `language_model_only:false`, HC/metadata off; SDPA vision. Image and short H264/base64 inputs tested. NVIDIA GLM multimodal qualification is pending. Qwen request `video_config` overrides startup values without shared mutation; native4/8/4-frame controls pass. |
+| Qwen images/video | `language_model_only:false`, HC/metadata off; SDPA vision. Historical image/H264 and request-level4/8/4-frame checks pass; current unquantized-KV qualification is pending. Request `video_config` overrides startup values without shared mutation. |
+| NVIDIA GLM images | PP2/MTP3,262K context allocation,FP16 KV,SDPA vision; omit `--language-only`. Two swapped images, repeated-image reuse and subsequent8K/512-token text inference pass. Vision weights load only on the first PP stage; image embeddings reach last-stage MTP. Full-context image requests and NVIDIA video remain unqualified. |
 | Qwen long video | Startup `--mm-process-config`:2fps/max64frames; optional size budget `{longest_edge:469762048,shortest_edge:4096}`. One-hour fixture sampled full duration; bounded functional coverage, not general video quality. |
 
 Keep original RoPE for short-context benchmarks. Frame/pixel/encoder/KV budgets are
