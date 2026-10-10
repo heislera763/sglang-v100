@@ -6,7 +6,11 @@ in two NVLink quads**. We rebuilt useful SM70 support from
 effectively rebasing it into an independent fork. Qwen3.8-Flash-Next FP8 and
 GLM-5.3-Flash NVFP4 work is consolidated on `main`.
 
-Integrated upstream: [3bffe69b](https://github.com/sgl-project/sglang/commit/3bffe69b74b1391c1735f57f9d2262a0630ef14e), pinned 2026-10-09.
+`main` contains validated changes; `dev` is the integration branch. Keep upstream
+updates and experiments on `dev`, then advance `main` after relevant checks.
+Clone remotes: `origin` is this fork; `upstream` is `sgl-project/sglang`.
+
+Integrated upstream: [3831e7e0](https://github.com/sgl-project/sglang/commit/3831e7e0918052be50ef38b3ff62154573e213d7), pinned 2026-10-10.
 Hardware adapters live in [v100_plus/sglang_v100_plus](v100_plus/sglang_v100_plus),
 reusable operators in [python/sglang/kernels/ops](python/sglang/kernels/ops), and
 build/Marlin changes in [v100_plus/aot](v100_plus/aot) and [v100_plus/patches](v100_plus/patches).
@@ -72,7 +76,7 @@ Marlin/cuBLAS/Torch CUDA backends remain valid.
 ## Build and reference launches
 
 Python 3.12, `uv`, CUDA 12.9; [setup](v100_plus/setup.sh) builds pinned SM70 AOT/Marlin
-kernels. Run each model from a fresh shell with the common block below. Device order
+kernels. Use a fresh shell and the common block below for each recipe. Device order
 must follow your topology. Local directory names are conventions; for Hub loading,
 use the checkpoint ID and full `--revision` above. These are manual single-request
 references, not installed services.
@@ -80,6 +84,7 @@ references, not installed services.
 ```bash
 git clone https://github.com/heislera763/sglang-v100-plus.git
 cd sglang-v100-plus
+git remote add upstream https://github.com/sgl-project/sglang.git
 bash v100_plus/setup.sh
 export CUDA_HOME=/usr/local/cuda-12.9 TRITON_PTXAS_PATH=/usr/local/cuda-12.9/bin/ptxas
 export PATH="$PWD/.venv/bin:$CUDA_HOME/bin:$PATH" OMP_NUM_THREADS=4
@@ -97,7 +102,11 @@ common=(
 )
 ```
 
-**Qwen FP8, TP4×PP2/EP4, ordinary** (`http://<host>:9000/v1`, key `test-only`):
+**Qwen FP8, TP4×PP2/EP4, intended ordinary recipe — currently blocked**:
+
+Strict dispatch rejects FP16 QSA KV during decode/verification. Native FP16-cache
+support must be implemented before this recipe runs; historical E5M2 paths are
+excluded from active recipes. The upstream sync leaves this existing gap unchanged.
 
 ```bash
 export SGLANG_PP_LAYER_PARTITION=24,24 SGLANG_OPT_SM70_HC_PREFILL_SP=1
@@ -190,7 +199,8 @@ E5M2 KV and are historical; the unquantized recipe needs fresh measurements. Ear
 compatible post-sync paths; NVIDIA PP2 MTP additionally uses the allocator fix
 [a85513f5](https://github.com/heislera763/sglang-v100-plus/commit/a85513f5) and exact mHC buffer reuse
 [9f057466](https://github.com/heislera763/sglang-v100-plus/commit/9f057466).
-The current PP2 MTP row includes the shared small-row sparse MLA tile policy above;
+The GLM PP2 MTP matrix was measured at [aa02d9b3](https://github.com/heislera763/sglang-v100-plus/commit/aa02d9b3),
+including the shared small-row sparse MLA tile policy above;
 its numerics and CUDA-graph coverage are in the [operator tests](test/registered/kernels/ops/attention/test_triton_sparse_mla_fp16.py).
 
 | Model / layout | MTP steps | Prefill tokens/s | Generation tokens/s |

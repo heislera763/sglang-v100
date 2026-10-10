@@ -2117,7 +2117,7 @@ requires-dist = [
     { name = "sentencepiece", specifier = "==0.2.1" },
     { name = "setproctitle" },
     { name = "sgl-deep-ep", specifier = "==0.1.2.post1" },
-    { name = "sgl-deep-gemm", specifier = "==0.2.1.post1" },
+    { name = "sgl-deep-gemm", specifier = "==0.2.2" },
     { name = "sgl-eval", marker = "extra == 'test'", specifier = "==0.1.2" },
     { name = "sglang", extras = ["diffusion"], marker = "extra == 'all'" },
     { name = "sglang", extras = ["fastokens"], marker = "extra == 'test'" },
