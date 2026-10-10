@@ -188,6 +188,19 @@ def _sparse_mla_block_k(kv: torch.Tensor) -> int:
     )
 
 
+def _sm70_sparse_mla_small_rows(q_nope, q_rope, kv, d_v: int) -> bool:
+    """Bound the live KV tile for FP16 Volta decode/verification geometry."""
+    return (
+        1 <= q_nope.shape[0] <= 4
+        and q_nope.shape[1] in (8, 16)
+        and d_v == kv.shape[-1] == 512
+        and q_rope.shape[-1] == 0
+        and q_nope.dtype == kv.dtype == torch.float16
+        and torch.version.hip is None
+        and torch.cuda.get_device_capability(kv.device) == (7, 0)
+    )
+
+
 def _kv_splits_heuristic(
     T: int,
     H: int,
@@ -1181,6 +1194,11 @@ def _triton_sparse_mla_fwd_splitk(
             num_stages=2,
         )
         return out.unsqueeze(0)
+
+    if _sm70_sparse_mla_small_rows(q_nope, q_rope, kv, d_v):
+        # Keep the split cap and padded-head storage; a narrower live tile
+        # reduces scalar-path spills for both decode and target verification.
+        BLOCK_K = min(BLOCK_K, 16)
 
     tiles_per_split = (topk + kv_splits * BLOCK_K - 1) // (kv_splits * BLOCK_K)
     active_splits = (topk + tiles_per_split * BLOCK_K - 1) // (

@@ -27,6 +27,7 @@ from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
     _page_offsets_fit_i32,
     _reduce_d_chunk,
     _row_strides,
+    _sm70_sparse_mla_small_rows,
     _sparse_mla_block_k,
     _sparse_mla_reduce_kernel,
     _validate_input_dtypes,
@@ -558,10 +559,9 @@ def triton_sparse_mla_decode_splitk(
         and torch.version.hip is None
         and torch.cuda.get_device_capability(kv.device) == (7, 0)
     )
-    if sm70_glm_decode:
-        # GLM TP8: a 64-row tile spills ~2400 registers on Volta. A 16-row
-        # tile cuts local-memory traffic while retaining the same split cap
-        # and indexed softmax/value computation, including invalid slots.
+    if _sm70_sparse_mla_small_rows(q_nope, q_rope, kv, d_v):
+        # Share the small-row policy with target verification; retain the
+        # separate qualified eight-head logical/storage geometry below.
         BLOCK_K = min(BLOCK_K, 16)
     n_head_blocks = (H + BLOCK_H - 1) // BLOCK_H
     h_padded = n_head_blocks * BLOCK_H

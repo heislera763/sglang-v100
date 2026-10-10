@@ -3,14 +3,17 @@
 import pytest
 import torch
 
-from sglang.kernels.ops.attention.dsa.triton_sparse_mla import triton_sparse_mla_fwd
+from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
+    _triton_sparse_mla_fwd_splitk,
+    triton_sparse_mla_fwd,
+)
 from sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode import (
     _get_splitk_bufs,
     triton_sparse_mla_decode_splitk,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=60, stage="jit-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.version.hip is not None,
     reason="CUDA FP16 kernel coverage",
@@ -79,29 +82,31 @@ def test_fp16_sparse_mla_matches_reference(mode, seq, heads, topk, tail_dim):
 
 
 @pytest.mark.parametrize("kv_splits", [None, 1, 3])
-def test_glm_decode_graph_replays_sparse_and_empty_indices(kv_splits):
+@pytest.mark.parametrize(
+    "mode,seq,heads",
+    [("decode", 1, 8), ("decode", 1, 16), ("decode", 4, 16), ("verify", 4, 16)],
+)
+def test_glm_decode_graph_replays_sparse_and_empty_indices(kv_splits, mode, seq, heads):
     """Tile changes must preserve padded/strided queries and live graph indices."""
     generator = torch.Generator().manual_seed(735)
-    heads, dim, topk = 8, 512, 2051
+    dim, topk = 512, 2051
     # A larger packed row leaves noncontiguous head strides, as model views do.
-    packed = torch.randn(1, heads, dim + 64, generator=generator).half()
+    packed = torch.randn(seq, heads, dim + 64, generator=generator).half()
     kv = torch.randn(4099, dim, generator=generator).half()
     q = packed.cuda()
     cache = kv.cuda().unsqueeze(1)
-    indices = torch.full((1, 1, topk), -1, dtype=torch.int32, device="cuda")
+    indices = torch.full((seq, 1, topk), -1, dtype=torch.int32, device="cuda")
     scale = dim**-0.5
     workspace = []
 
     def run():
+        args = (q[:, :, :dim], q[:, :, dim:dim], cache, indices, scale, dim)
+        if mode == "verify":
+            if kv_splits is None:
+                return triton_sparse_mla_fwd(*args)
+            return _triton_sparse_mla_fwd_splitk(*args, kv_splits=kv_splits)
         return triton_sparse_mla_decode_splitk(
-            q[:, :, :dim],
-            q[:, :, dim:dim],
-            cache,
-            indices,
-            scale,
-            dim,
-            kv_splits=kv_splits,
-            workspace=workspace,
+            *args, kv_splits=kv_splits, workspace=workspace
         )
 
     stream = torch.cuda.Stream()
@@ -112,24 +117,29 @@ def test_glm_decode_graph_replays_sparse_and_empty_indices(kv_splits):
         with torch.cuda.graph(graph, stream=stream):
             actual = run()
         for count in (0, 1, 65, 128, 2048, 2051, 0):
-            ids = torch.full((topk,), -1, dtype=torch.int32)
-            positions = torch.randperm(topk, generator=generator)[:count]
-            ids[positions] = torch.randperm(kv.shape[0], generator=generator)[
-                :count
-            ].int()
-            indices.copy_(ids.reshape(1, 1, topk))
+            ids = torch.full((seq, topk), -1, dtype=torch.int32)
+            for row in range(seq):
+                valid_count = max(0, count - row * 16)
+                positions = torch.randperm(topk, generator=generator)[:valid_count]
+                ids[row, positions] = torch.randperm(kv.shape[0], generator=generator)[
+                    :valid_count
+                ].int()
+            packed.normal_(generator=generator)
+            q.copy_(packed)
+            indices.copy_(ids.unsqueeze(1))
             graph.replay()
             stream.synchronize()
-            expected = torch.zeros(heads, dim)
-            if count:
-                selected = kv[ids[ids >= 0].long()].float()
-                probabilities = (
-                    packed[0, :, :dim].float() @ selected.T * scale
-                ).softmax(-1)
-                expected = probabilities @ selected
+            expected = torch.zeros(seq, heads, dim)
+            for row in range(seq):
+                selected = kv[ids[row][ids[row] >= 0].long()].float()
+                if selected.numel():
+                    probabilities = (
+                        packed[row, :, :dim].float() @ selected.T * scale
+                    ).softmax(-1)
+                    expected[row] = probabilities @ selected
             assert torch.isfinite(actual).all()
             torch.testing.assert_close(
-                actual[0, 0].float().cpu(), expected, rtol=0.01, atol=0.001
+                actual[0].float().cpu(), expected, rtol=0.01, atol=0.001
             )
             if count == 0:
                 assert torch.count_nonzero(actual) == 0

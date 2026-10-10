@@ -10,7 +10,7 @@ Integrated upstream: [3bffe69b](https://github.com/sgl-project/sglang/commit/3bf
 Hardware adapters live in [v100_plus/sglang_v100_plus](v100_plus/sglang_v100_plus),
 reusable operators in [python/sglang/kernels/ops](python/sglang/kernels/ops), and
 build/Marlin changes in [v100_plus/aot](v100_plus/aot) and [v100_plus/patches](v100_plus/patches).
-[Provenance](v100_plus/provenance.json) and [27 recorded core changes](v100_plus/core-patches.json)
+[Provenance](v100_plus/provenance.json) and [28 recorded core changes](v100_plus/core-patches.json)
 make upstream updates auditable. Services, benchmark clients, traces and project notes
 stay outside Git. This assumes familiarity with SGLang.
 
@@ -56,7 +56,7 @@ in software; it does not imply native arithmetic in those formats.
 | NVFP4 GEMMs | [marlin_v100](https://github.com/zhinianqin/marlin_v100) at `6d72a499` plus local patches: W4A16, FP16 WMMA with FP32 accumulation; block/global scales remain distinct. Unused alternate-backend MoE scale buffers alias active scales, saving17.72GiB across GLM's8GPUs. |
 | Block-FP8 GEMMs | Patched Marlin and small-row vector kernels: W8A16, complete 128×128 scale blocks. Qwen EP4/EP8 preserves whole experts. |
 | Qwen QSA/GDN/HC | Masked FP16 sparse attention, SM70 GDN and gated-residual kernels; HC eager prefill partitions within each quad, including TP8. |
-| GLM sparse MLA / indexer | FP16 Triton attention, software FP8 indexer/scoring, request-owned pool4 compression cache; private FP32 score-buffer reuse and history-dependent query batches bound scoring workspace. Optional two-query sparse sharing preserves support masks. |
+| GLM sparse MLA / indexer | FP16 Triton attention; shared 16-row KV tiles for SM70 latent512/no-tail,1–4query,H8/H16 split attention; software FP8 indexer/scoring, request-owned pool4 compression cache; private FP32 score-buffer reuse and history-dependent query batches bound scoring workspace. Optional two-query sparse sharing preserves support masks. |
 | GLM KDA / mHC | Range-safe KDA; FP32 mHC projection/RMS/Sinkhorn, private prefill buffer reused for square/mean (~128MiB lower peak at2048rows). BF16-to-FP16 conversion needs operation-specific range handling. |
 | Storage | Unquantized FP16 attention KV for both models; Qwen FP16 QSA index, GLM's separate model-native FP8 indexer. KV-cache quantization is excluded from the project recipes. FP16 recurrent state is retained. |
 | Cold module loading | Return idle Torch allocator blocks to CUDA when first-use Triton loads have little headroom; leave live tensors unchanged. Skip capture/custom arenas; steady kernel replay has no callback. |
@@ -179,16 +179,19 @@ These are implementation gaps, not unused free speed flags.
 
 ## Performance and checks
 
-Fresh qualification screens: three uncached coherent near8K requests/profile,512 sampled
-output tokens, one request, eager prefill/full decode graphs. Seed531 does not guarantee
+Three uncached coherent near8K requests/profile,512 sampled output tokens, one request,
+eager prefill/full decode graphs. GLM PP2 MTP uses two fresh processes, images enabled
+and262K context; other rows are earlier one-process screens. Seed531 does not guarantee
 sampled determinism. PP = input tokens/native prefill seconds; TG = output tokens
 excluding the first/native decode seconds. Warmups and profiling are excluded.
-These are preliminary screens, not a repeated speed-win claim. Qwen figures used
-E5M2 KV and are historical; the unquantized recipe needs fresh measurements. Source:
+These are preliminary throughput measurements. Qwen figures used
+E5M2 KV and are historical; the unquantized recipe needs fresh measurements. Earlier rows:
 [ce60d8c9](https://github.com/heislera763/sglang-v100-plus/commit/ce60d8c91c7a0b1c92b1c35059f0bfb7e492d8da)
 compatible post-sync paths; NVIDIA PP2 MTP additionally uses the allocator fix
 [a85513f5](https://github.com/heislera763/sglang-v100-plus/commit/a85513f5) and exact mHC buffer reuse
 [9f057466](https://github.com/heislera763/sglang-v100-plus/commit/9f057466).
+The current PP2 MTP row includes the shared small-row sparse MLA tile policy above;
+its numerics and CUDA-graph coverage are in the [operator tests](test/registered/kernels/ops/attention/test_triton_sparse_mla_fp16.py).
 
 | Model / layout | MTP steps | Prefill tokens/s | Generation tokens/s |
 | --- | ---: | ---: | ---: |
@@ -196,18 +199,18 @@ compatible post-sync paths; NVIDIA PP2 MTP additionally uses the allocator fix
 | Qwen FP8 TP4×PP2/EP4 | 3 | 7,632 | 71.1 |
 | NVIDIA GLM TP8/EP1 | 3 | 1,366 | 42.7 |
 | NVIDIA GLM TP4×PP2/EP1 | Off | 1,882 | 28.2 |
-| NVIDIA GLM TP4×PP2/EP1 | 3 | 1,729 | 35.6 |
+| NVIDIA GLM TP4×PP2/EP1 | 3 | 1,714 | 42.5 |
 
-MTP3 categories (one request/category; PP/TG tokens/s):
+MTP3 categories (PP/TG tokens/s; GLM PP2 averages two processes, others one):
 
 | Model / category | TP8 PP | TP8 TG | PP2 PP | PP2 TG |
 | --- | ---: | ---: | ---: | ---: |
 | Qwen coding | 4,798 | 86.4 | 7,717 | 78.0 |
 | Qwen book continuation | 4,800 | 75.7 | 7,619 | 69.6 |
 | Qwen document briefing | 4,789 | 85.5 | 7,561 | 66.6 |
-| NVIDIA GLM coding | 1,370 | 48.6 | 1,725 | 41.2 |
-| NVIDIA GLM book continuation | 1,367 | 37.6 | 1,729 | 31.9 |
-| NVIDIA GLM document briefing | 1,360 | 43.2 | 1,734 | 34.8 |
+| NVIDIA GLM coding | 1,370 | 48.6 | 1,711 | 46.7 |
+| NVIDIA GLM book continuation | 1,367 | 37.6 | 1,713 | 38.2 |
+| NVIDIA GLM document briefing | 1,360 | 43.2 | 1,717 | 42.6 |
 
 Inputs: [SPEED-Bench throughput_8k](https://huggingface.co/datasets/nvidia/SPEED-Bench/tree/454f88454792dfa3ccfd7ef15fff248efde44cd1),
 first turns `91d6ca2afe114d3c99312e8758b6f964` (code),
@@ -219,6 +222,14 @@ Earlier six-request Qwen ordinary/MTP matrices at
 [38f5a0f0](https://github.com/heislera763/sglang-v100-plus/commit/38f5a0f0806883ec88da23ca3c91a46bec7ce12b)
 measured TP8 5002/4850PP and50.8/80.2TG; PP2 8078/7619PP and61.9/72.3TG.
 Those are pre-sync results, separate from this screen.
+
+Matched independent-process A/B/B/A against [f0245fb0](https://github.com/heislera763/sglang-v100-plus/commit/f0245fb0)
+raises GLM PP2 MTP generation 32.2→42.5tokens/s on average: coding+30%,book+30%,
+briefing+36%. Prefill is unchanged; speculative cycles are~23% shorter.
+
+The small-row tile changes FP16 reduction rounding; independent FP64 probes found
+max absolute error0.00044 versus the reference, old/new difference0.00049. It preserves
+selected sparse support and is not bit-exact to the wider tile.
 
 Independent operator bounds plus exact state/payload/RNG checks where specified;
 native strict dispatch and EOS/logprob/penalty/cancel/reuse checks supplement them.
