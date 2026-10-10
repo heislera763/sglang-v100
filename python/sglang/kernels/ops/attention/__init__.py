@@ -192,6 +192,16 @@ del _fn
 
 register_kernel(
     KernelSpec(
+        op="attention.sparse_mla_decode_sm70",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dsa.sm70_sparse_decode:sparse_mla_decode_sm70",
+        description="Volta MMA split-K decode/verification; FP16 latent512 and partials.",
+        capabilities={CapabilityRequirement.cuda(min_sm=(7, 0), max_sm=(7, 0))},
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="attention.sparse_mla_prefill_sm70",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.attention.dsa.sm70_sparse_prefill:sparse_mla_prefill_sm70",

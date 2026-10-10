@@ -392,5 +392,22 @@ class TestFP16ExpertDispatchContract(CustomTestCase):
                 )
 
 
+class TestSparseDecodeDispatchContract(CustomTestCase):
+    def test_decode_adapter_signature_tracks_upstream(self):
+        """A new upstream option must not disappear across the SM70 adapter."""
+        import inspect
+
+        from sglang_v100_plus.glm_dsa import sparse_decode
+
+        from sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode import (
+            triton_sparse_mla_decode_splitk,
+        )
+
+        self.assertEqual(
+            tuple(inspect.signature(sparse_decode).parameters)[1:],
+            tuple(inspect.signature(triton_sparse_mla_decode_splitk).parameters),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

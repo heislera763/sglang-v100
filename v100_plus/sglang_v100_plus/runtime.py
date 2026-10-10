@@ -74,6 +74,7 @@ def install():
         sm70_dsa_cache_default,
         sm70_dsa_constraints,
         sm70_glm_kv_cache_dtype,
+        sparse_decode,
         sparse_prefill,
     )
     from .glm_kda import SM70KDAKernel
@@ -251,6 +252,11 @@ def install():
         (
             "sglang.kernels.ops.attention.dsa.triton_sparse_mla.triton_sparse_mla_fwd",
             sparse_prefill,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode.triton_sparse_mla_decode_splitk",
+            sparse_decode,
             HookType.AROUND,
         ),
         (

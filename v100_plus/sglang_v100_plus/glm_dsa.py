@@ -60,7 +60,21 @@ def sm70_glm_kv_cache_dtype(original, **kwargs):
 
 
 def sparse_prefill(original, q_nope, q_rope, kv, indices, sm_scale, d_v=512, **kwargs):
-    """Use explicit Volta Tensor Cores for large FP16 latent-only prefill."""
+    """Use Volta MMA for qualified FP16 latent-only prefill/verification."""
+    from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
+        _sm70_sparse_mla_small_rows,
+        _validate_input_dtypes,
+    )
+
+    if _sm70_sparse_mla_small_rows(q_nope, q_rope, kv, d_v):
+        _validate_input_dtypes(q_nope, q_rope, kv)
+        from sglang.kernels.ops.attention.dsa.sm70_sparse_decode import (
+            sparse_mla_decode_sm70,
+        )
+
+        return sparse_mla_decode_sm70(
+            q_nope, kv, indices, sm_scale, topk_length=kwargs.get("topk_length")
+        )
     if (
         q_nope.shape[0] >= 128
         and q_nope.shape[1] in (8, 16)
@@ -77,6 +91,44 @@ def sparse_prefill(original, q_nope, q_rope, kv, indices, sm_scale, d_v=512, **k
             q_nope, kv, indices, sm_scale, kwargs.get("topk_length")
         )
     return original(q_nope, q_rope, kv, indices, sm_scale, d_v, **kwargs)
+
+
+def sparse_decode(
+    original,
+    q_nope,
+    q_rope,
+    kv,
+    indices,
+    sm_scale,
+    d_v=512,
+    kv_splits=None,
+    workspace=None,
+):
+    """Keep backend-owned decode workspace while replacing the SM70 math."""
+    from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
+        _sm70_sparse_mla_small_rows,
+        _validate_input_dtypes,
+    )
+
+    if _sm70_sparse_mla_small_rows(q_nope, q_rope, kv, d_v):
+        _validate_input_dtypes(q_nope, q_rope, kv)
+        from sglang.kernels.ops.attention.dsa.sm70_sparse_decode import (
+            sparse_mla_decode_sm70,
+        )
+
+        return sparse_mla_decode_sm70(
+            q_nope, kv, indices, sm_scale, kv_splits=kv_splits, workspace=workspace
+        )
+    return original(
+        q_nope,
+        q_rope,
+        kv,
+        indices,
+        sm_scale,
+        d_v,
+        kv_splits=kv_splits,
+        workspace=workspace,
+    )
 
 
 def sm70_dsa_cache_default(original, view):

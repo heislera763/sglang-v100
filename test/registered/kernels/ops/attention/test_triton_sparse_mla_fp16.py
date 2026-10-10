@@ -13,7 +13,7 @@ from sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=240, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.version.hip is not None,
     reason="CUDA FP16 kernel coverage",
@@ -307,6 +307,134 @@ def test_sparse_length_scan_handles_ragged_width_and_empty_rows(topk):
         [1, 1, topk, min(65, topk - 1) + 1], dtype=torch.int32, device="cuda"
     )
     torch.testing.assert_close(q8kv8_topk_length_from_indices(indices), expected)
+
+
+@pytest.mark.parametrize(
+    "rows,heads,topk,splits,use_lengths,owned_workspace",
+    [
+        (1, 8, 2051, None, False, True),
+        (1, 16, 2051, None, False, True),
+        (4, 16, 2051, None, False, False),
+        (3, 16, 67, 3, True, True),
+        (2, 8, 67, 1, True, False),
+        (4, 16, 2051, 3, True, True),
+    ],
+)
+def test_sm70_tensorcore_decode_reference_graph_and_workspace(
+    rows, heads, topk, splits, use_lengths, owned_workspace
+):
+    """Split partials must retain sparse support, stride and live graph inputs."""
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("Volta Tensor Core sparse decode")
+    from sglang.kernels.ops.attention.dsa.sm70_sparse_decode import (
+        sparse_mla_decode_sm70,
+    )
+
+    torch.manual_seed(743)
+    pages = 262273 if topk == 2051 else 257
+    packed = torch.randn(rows, heads, 576, device="cuda", dtype=torch.float16)
+    if rows == 4 and not use_lengths:
+        # BMM-derived queries can be head-major after a transpose, not merely
+        # a head-strided view of a token-major tensor.
+        packed = packed.transpose(0, 1).contiguous().transpose(0, 1)
+    q = packed[:, :, :512]
+    kv = torch.randn(pages, 1, 512, device="cuda", dtype=torch.float16)
+    ids = torch.full((rows, 1, topk), -1, device="cuda", dtype=torch.int32)
+    lengths = (
+        torch.zeros(rows, device="cuda", dtype=torch.int32) if use_lengths else None
+    )
+    workspace = [] if owned_workspace else None
+    scale = 256**-0.5
+
+    def run():
+        return sparse_mla_decode_sm70(q, kv, ids, scale, splits, workspace, lengths)
+
+    for _ in range(3):
+        run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = run()
+    old_buffers = [(lse.data_ptr(), acc.data_ptr()) for lse, acc in (workspace or [])]
+    for update, count in enumerate((0, 1, 65, 2048, 2051, 0)):
+        packed.normal_()
+        kv.normal_()
+        ids.fill_(-1)
+        for row in range(rows):
+            valid = min(topk, max(0, count - row * 16))
+            if valid:
+                selected = torch.randint(
+                    pages, (valid,), device="cuda", dtype=torch.int32
+                )
+                columns = torch.randperm(topk, device="cuda")[:valid]
+                ids[row, 0, columns] = selected
+                ids[row, 0, -1] = pages - 1
+                # Invalid upper slot plus duplicate selection and an interior hole.
+                ids[row, 0, :3] = torch.tensor(
+                    [pages, pages - 1, pages - 1], device="cuda"
+                )
+                ids[row, 0, 16:32] = -1
+        if use_lengths:
+            lengths.copy_(
+                torch.tensor(
+                    [
+                        -1 if count == 0 else min(topk + 7, count - row * 16)
+                        for row in range(rows)
+                    ],
+                    device="cuda",
+                    dtype=torch.int32,
+                )
+            )
+        before = ids.clone()
+        graph.replay()
+        eager = run()
+        expected = torch.zeros_like(q, dtype=torch.float64)
+        for row in range(rows):
+            limit = topk if lengths is None else min(topk, max(0, int(lengths[row])))
+            selected_ids = ids[row, 0, :limit]
+            selected_ids = selected_ids[(selected_ids >= 0) & (selected_ids < pages)]
+            selected = kv[selected_ids.long(), 0].double()
+            if selected.numel():
+                expected[row] = (q[row].double() @ selected.T * scale).softmax(
+                    -1
+                ) @ selected
+        for output in (actual, eager):
+            assert output.dtype == torch.float16 and output.shape == (
+                1,
+                rows,
+                heads,
+                512,
+            )
+            assert torch.isfinite(output).all()
+            torch.testing.assert_close(
+                output[0].double(), expected, rtol=0.01, atol=0.001
+            )
+            if count == 0:
+                assert torch.count_nonzero(output) == 0
+        assert torch.equal(ids, before)
+        assert torch.equal(actual.view(torch.uint8), eager.view(torch.uint8))
+        assert old_buffers == [
+            (lse.data_ptr(), acc.data_ptr()) for lse, acc in (workspace or [])
+        ]
+
+
+@pytest.mark.parametrize("misaligned", ["q", "kv"])
+def test_sm70_tensorcore_decode_rejects_unaligned_storage_views(misaligned):
+    """A contiguous view can still violate the vector-load pointer alignment."""
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("Volta Tensor Core sparse decode")
+    from sglang.kernels.ops.attention.dsa.sm70_sparse_decode import (
+        sparse_mla_decode_sm70,
+    )
+
+    q = torch.zeros(1, 8, 512, device="cuda", dtype=torch.float16)
+    kv = torch.zeros(65, 512, device="cuda", dtype=torch.float16)
+    ids = torch.zeros(1, 1, 67, device="cuda", dtype=torch.int32)
+    if misaligned == "q":
+        q = torch.empty(q.numel() + 1, device="cuda", dtype=q.dtype)[1:].view_as(q)
+    else:
+        kv = torch.empty(kv.numel() + 1, device="cuda", dtype=kv.dtype)[1:].view_as(kv)
+    with pytest.raises(ValueError, match="SM70 sparse decode requires"):
+        sparse_mla_decode_sm70(q, kv, ids, 0.0625)
 
 
 if __name__ == "__main__":
