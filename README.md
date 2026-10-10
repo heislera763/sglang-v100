@@ -36,11 +36,11 @@ state and execution scratch:
 
 | Model | Native tokens | TP8 main KV + index / GPU | PP2 largest main KV + index / GPU |
 | --- | ---: | ---: | ---: |
-| Qwen FP8 | 262,144 | 1.69 GiB | 0.84 GiB |
+| Qwen FP8 weights, FP16 KV | 262,144 | 3.19 GiB | 1.59 GiB |
 | NVIDIA GLM | 1,048,576 | 11.35 GiB | 6.19 GiB |
 
-Qwen MTP adds about0.14GiB on its owning stage. GLM's FP16 latent KV is replicated
-across TP ranks; its native1M pool cannot fit the current weight/workspace layout.
+Qwen MTP adds about0.27GiB on its owning stage. GLM's FP16 latent KV is replicated
+across TP ranks; native1M with MTP still needs weight/workspace or sharding work.
 The GLM launch below remains a bounded12K test reference, not a native-context
 configuration. Compact/sharded KV support is required before claiming1M support.
 
@@ -51,12 +51,12 @@ in software; it does not imply native arithmetic in those formats.
 
 | Operation | Implementation / contract |
 | --- | --- |
-| NVFP4 GEMMs | [marlin_v100](https://github.com/zhinianqin/marlin_v100) at `6d72a499` plus local patches: W4A16, FP16 WMMA with FP32 accumulation; block/global scales remain distinct. |
+| NVFP4 GEMMs | [marlin_v100](https://github.com/zhinianqin/marlin_v100) at `6d72a499` plus local patches: W4A16, FP16 WMMA with FP32 accumulation; block/global scales remain distinct. Unused alternate-backend MoE scale buffers alias active scales, saving17.72GiB across GLM's8GPUs. |
 | Block-FP8 GEMMs | Patched Marlin and small-row vector kernels: W8A16, complete 128×128 scale blocks. Qwen EP4/EP8 preserves whole experts. |
 | Qwen QSA/GDN/HC | Masked FP16 sparse attention, SM70 GDN and gated-residual kernels; HC eager prefill partitions within each quad, including TP8. |
 | GLM sparse MLA / indexer | FP16 Triton attention, software FP8 indexer/scoring, request-owned pool4 compression cache; optional two-query sparse sharing preserves support masks. |
 | GLM KDA / mHC | Range-safe KDA; FP32 mHC projection/RMS/Sinkhorn, private prefill buffer reused for square/mean (~128MiB lower peak at2048rows). BF16-to-FP16 conversion needs operation-specific range handling. |
-| Storage | Qwen software E5M2 KV and FP16 QSA index; GLM FP16 sparse KV plus separate FP8 indexer. FP16 recurrent state is the tested recommendation. |
+| Storage | Unquantized FP16 attention KV for both models; Qwen FP16 QSA index, GLM's separate model-native FP8 indexer. KV-cache quantization is excluded from the project recipes. FP16 recurrent state is retained. |
 | Cold module loading | Return idle Torch allocator blocks to CUDA when first-use Triton loads have little headroom; leave live tensors unchanged. Skip capture/custom arenas; steady kernel replay has no callback. |
 | Vision / DFlash2 | SDPA vision. [DFlash2](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2/tree/bf582e4eacc1810f76656d1811693ff6c6737d2a) FP16/local W8A16 have prior experimental coverage; NVIDIA-target qualification is pending. |
 
@@ -107,7 +107,7 @@ uv run --no-project .venv/bin/python -m sglang_v100_plus "${common[@]}" \
   --context-length 262144 --max-total-tokens 262272 \
   --chunked-prefill-size 4352 --attention-backend triton \
   --linear-attn-prefill-backend tilelang_v100 --linear-attn-decode-backend triton \
-  --page-size 64 --kv-cache-dtype fp8_e5m2 --qsa-indexer-dtype float16 \
+  --page-size 64 --kv-cache-dtype auto --qsa-indexer-dtype float16 \
   --ple-offload-embedding --mamba-radix-cache-strategy extra_buffer \
   --default-chat-template-kwargs '{"enable_thinking":true,"preserve_thinking":true,"reasoning_effort":"xhigh"}' \
   --preferred-sampling-params '{"temperature":1.0,"top_p":0.95,"top_k":20,"min_p":0.0,"presence_penalty":0.0,"frequency_penalty":0.0,"repetition_penalty":1.0}'
@@ -148,7 +148,7 @@ classical sampled rejection. Lab sampling sources: [Qwen](https://huggingface.co
 | NCCL PHB/NVLS0, OMP4 | Retained host policy; removing PHB did not help the fresh Qwen screen. NVLS is unavailable on SM70. No universal-optimum claim. |
 | Max1/serialized/radix off | Qualified graph/scratch/state ownership and uncached timing. Overlap/concurrency is separate work. |
 | Eager prefill/full decode graphs | Qualified native paths; earlier Qwen prefill-graph screens lost. Chunk4352/2048 are measured per-model choices. |
-| Context and pool capacity | Qwen reserves its native262144-token context plus128slots: page-rounded prompt admission, one reserved page and MTP lookahead. These do not increase usable context. Explicit uncached max1 reservations fail instead of shrinking. Full-length quality is separate from capacity qualification. |
+| Context and pool capacity | Qwen targets native262144 plus128page/workspace slots. Earlier boundary qualification used E5M2; unquantized native-capacity requalification is pending. Explicit uncached max1 reservations fail instead of shrinking. |
 | Static fraction/state pool | Qwen uses the automatic fraction estimate. GLMTP8.92/NVIDIAPP2MTP.95 are short-context fit settings. With radix off/max1, state slots derive from the request count; a state-memory ratio is redundant. Host PLE saves device memory. |
 | GLM mHC flags0 | Select supported mHC paths; fused DSA top-k retains its default1. |
 | CPU-only tests | `CUDA_VISIBLE_DEVICES=""`; numeric/disabled/UUID port allocation is supported. No999 workaround. |
@@ -181,7 +181,8 @@ Fresh qualification screens: three uncached coherent near8K requests/profile,512
 output tokens, one request, eager prefill/full decode graphs. Seed531 does not guarantee
 sampled determinism. PP = input tokens/native prefill seconds; TG = output tokens
 excluding the first/native decode seconds. Warmups and profiling are excluded.
-These are preliminary screens, not a repeated speed-win claim. Source:
+These are preliminary screens, not a repeated speed-win claim. Qwen figures used
+E5M2 KV and are historical; the unquantized recipe needs fresh measurements. Source:
 [ce60d8c9](https://github.com/heislera763/sglang-v100-plus/commit/ce60d8c91c7a0b1c92b1c35059f0bfb7e492d8da)
 compatible post-sync paths; NVIDIA PP2 MTP additionally uses the allocator fix
 [a85513f5](https://github.com/heislera763/sglang-v100-plus/commit/a85513f5) and exact mHC buffer reuse

@@ -2,7 +2,9 @@
 
 import sys
 import unittest
+import weakref
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -16,7 +18,11 @@ maybe_stub_sgl_kernel()
 with patch.object(
     sys, "path", [str(Path(__file__).resolve().parents[4] / "v100_plus"), *sys.path]
 ):
-    from sglang_v100_plus.quantization import pad_nvfp4_expert_width
+    from sglang_v100_plus.quantization import (
+        pad_nvfp4_expert_width,
+        prepare_nvfp4_moe,
+        sm70_nvfp4_marlin_process_scales,
+    )
 
 
 def checkpoint(width):
@@ -37,6 +43,57 @@ def checkpoint(width):
 
 
 class TestV100NVFP4Padding(CustomTestCase):
+    def test_marlin_releases_unused_backend_scale_storage(self):
+        """Unused swizzled scales retained 17.72GiB across an eight-GPU GLM."""
+        layer = checkpoint(160)
+        layer.params_dtype = torch.float16
+        layer.quant_config = SimpleNamespace(group_size=16)
+        dead = []
+        expected = {}
+        for prefix in ("w13", "w2"):
+            scales = getattr(layer, prefix + "_weight_scale")
+            # All non-negative finite E4M3 encodings, including zero/subnormals.
+            scales.data = (
+                (torch.arange(scales.numel()) % 127)
+                .to(torch.uint8)
+                .reshape(scales.shape)
+                .view(torch.float8_e4m3fn)
+            )
+            expected[prefix] = sm70_nvfp4_marlin_process_scales(
+                scales.transpose(1, 2).contiguous(), torch.float16
+            )[0].view(torch.uint8)
+            layer.register_parameter(
+                prefix + "_weight_scale_2",
+                torch.nn.Parameter(torch.ones(2), requires_grad=False),
+            )
+            swizzled = torch.nn.Parameter(scales.clone(), requires_grad=False)
+            setattr(layer, prefix + "_blockscale_swizzled", swizzled)
+            dead.append(weakref.ref(swizzled))
+        del swizzled
+        with (
+            patch(
+                "torch.cuda.get_device_properties",
+                return_value=SimpleNamespace(multi_processor_count=80),
+            ),
+            patch(
+                "sglang_v100_plus.quantization._dense_repack",
+                lambda weight: weight.view(torch.int32).clone(),
+            ),
+        ):
+            prepare_nvfp4_moe(None, layer)
+        for prefix, old in zip(("w13", "w2"), dead):
+            self.assertIsNone(old(), "Unused backend Parameter must be released")
+            self.assertTrue(
+                torch.equal(
+                    getattr(layer, prefix + "_weight_scale").view(torch.uint8),
+                    expected[prefix],
+                )
+            )
+            self.assertIs(
+                getattr(layer, prefix + "_blockscale_swizzled"),
+                getattr(layer, prefix + "_weight_scale"),
+            )
+
     def test_each_half_and_fc2_scale_group_preserves_checkpoint_bytes(self):
         layer = checkpoint(80)
         originals = {

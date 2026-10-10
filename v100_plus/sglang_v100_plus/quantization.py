@@ -236,6 +236,13 @@ def prepare_nvfp4_moe(original, layer):
         copy_or_rebind_param(
             layer, prefix + "_weight_scale_2", global_scales.contiguous()
         )
+        # ModelOpt allocates a separate swizzled scale buffer for other MoE
+        # backends. Marlin reads only weight_scale; keep the unused attribute
+        # as an alias (also following primary-Parameter reloads), not a second
+        # allocation. On GLM this releases 2.21 GiB per TP4/PP2 rank.
+        swizzled_name = prefix + "_blockscale_swizzled"
+        if hasattr(layer, swizzled_name):
+            setattr(layer, swizzled_name, getattr(layer, prefix + "_weight_scale"))
 
 
 def marlin_gemm(original, *args, **kwargs):
