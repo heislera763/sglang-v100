@@ -368,8 +368,17 @@ class SM70IndexerKPool(IndexerKPool):
                 )
                 # Larger batches are qualified at <=8K. Preserve the previous
                 # temporary-score bound for longer pooled histories.
+                # Bound the private FP32 [query, head, history] scores to
+                # 128 MiB as history grows. Use power-of-two batches so the
+                # qualified GEMM shapes stay stable; every causal row and all
+                # pooled history are still scored.
+                score_row_bytes = self.n_heads * max(max_pools, 1) * 4
+                score_rows = max(1, (128 << 20) // score_row_bytes)
+                score_rows = 1 << (score_rows.bit_length() - 1)
                 query_chunk = min(
-                    self._prefill_query_chunk_size, 128 if seq_len <= 8192 else 32
+                    self._prefill_query_chunk_size,
+                    128 if seq_len <= 8192 else 32,
+                    score_rows,
                 )
                 for start in range(0, count, query_chunk):
                     stop = min(start + query_chunk, count)

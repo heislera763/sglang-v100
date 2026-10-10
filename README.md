@@ -30,9 +30,8 @@ module-load OOM is handled by cold-load allocator reclamation, without changing
 checkpoint, arithmetic or workload limits. NVIDIA Qwen NVFP4 remains deferred;
 full GLM FP8 routed weights alone need roughly 283.5 GiB.
 
-Single-session target: the checkpoint's native context, with only required page,
-sentinel and speculative workspace overhead. GPU cache estimates exclude weights,
-state and execution scratch:
+At checkpoint-native context, cache estimates below exclude weights, state,
+execution scratch and required page/sentinel/speculative overhead:
 
 | Model | Native tokens | TP8 main KV + index / GPU | PP2 largest main KV + index / GPU |
 | --- | ---: | ---: | ---: |
@@ -40,9 +39,12 @@ state and execution scratch:
 | NVIDIA GLM | 1,048,576 | 11.35 GiB | 6.19 GiB |
 
 Qwen MTP adds about0.27GiB on its owning stage. GLM's FP16 latent KV is replicated
-across TP ranks; native1M with MTP still needs weight/workspace or sharding work.
-The GLM launch below remains a bounded12K test reference, not a native-context
-configuration. Compact/sharded KV support is required before claiming1M support.
+across TP ranks. The current GLM PP2/MTP3 session limit is **262,144** with a
+262,656-slot pool (~1.55GiB/GPU including target/draft KV and index storage).
+A 262,106-input/32-output sampled capacity probe and subsequent request reuse passed;
+this is functional capacity coverage, not a long-context quality claim. Larger
+MTP windows and native1M remain unqualified. The TP8 launch below is a short-context
+reference; the PP2 variation gives the working session configuration.
 
 ## SM70 execution
 
@@ -54,7 +56,7 @@ in software; it does not imply native arithmetic in those formats.
 | NVFP4 GEMMs | [marlin_v100](https://github.com/zhinianqin/marlin_v100) at `6d72a499` plus local patches: W4A16, FP16 WMMA with FP32 accumulation; block/global scales remain distinct. Unused alternate-backend MoE scale buffers alias active scales, saving17.72GiB across GLM's8GPUs. |
 | Block-FP8 GEMMs | Patched Marlin and small-row vector kernels: W8A16, complete 128×128 scale blocks. Qwen EP4/EP8 preserves whole experts. |
 | Qwen QSA/GDN/HC | Masked FP16 sparse attention, SM70 GDN and gated-residual kernels; HC eager prefill partitions within each quad, including TP8. |
-| GLM sparse MLA / indexer | FP16 Triton attention, software FP8 indexer/scoring, request-owned pool4 compression cache; optional two-query sparse sharing preserves support masks. |
+| GLM sparse MLA / indexer | FP16 Triton attention, software FP8 indexer/scoring, request-owned pool4 compression cache; private FP32 score-buffer reuse and history-dependent query batches bound scoring workspace. Optional two-query sparse sharing preserves support masks. |
 | GLM KDA / mHC | Range-safe KDA; FP32 mHC projection/RMS/Sinkhorn, private prefill buffer reused for square/mean (~128MiB lower peak at2048rows). BF16-to-FP16 conversion needs operation-specific range handling. |
 | Storage | Unquantized FP16 attention KV for both models; Qwen FP16 QSA index, GLM's separate model-native FP8 indexer. KV-cache quantization is excluded from the project recipes. FP16 recurrent state is retained. |
 | Cold module loading | Return idle Torch allocator blocks to CUDA when first-use Triton loads have little headroom; leave live tensors unchanged. Skip capture/custom arenas; steady kernel replay has no callback. |
@@ -132,7 +134,7 @@ uv run --no-project .venv/bin/python -m sglang_v100_plus "${common[@]}" \
 | Variation | Change from reference |
 | --- | --- |
 | Qwen TP8 | TP8/EP8; omit PP and unset `SGLANG_PP_LAYER_PARTITION`/metadata flag. Keep HC/chunk4352. |
-| GLM PP2 | TP4/PP2/EP1; `SGLANG_PP_LAYER_PARTITION=24,21`. For MTP use static fraction **.95**; retain chunk2048 and split24,21. |
+| GLM PP2 MTP | TP4/PP2/EP1; `SGLANG_PP_LAYER_PARTITION=24,21`; context **262144**, total tokens **262656**, fraction **.95**, chunk2048. Add the MTP flags below. |
 | MTP, either model | Add `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-num-draft-tokens 4 --speculative-eagle-topk 1 --speculative-use-rejection-sampling`. PP2 also exports `SGLANG_ENABLE_PP_SPEC=1`. |
 
 Three draft steps plus one target/bonus position; built-in MTP head, one linear branch,
@@ -149,7 +151,7 @@ classical sampled rejection. Lab sampling sources: [Qwen](https://huggingface.co
 | Max1/serialized/radix off | Qualified graph/scratch/state ownership and uncached timing. Overlap/concurrency is separate work. |
 | Eager prefill/full decode graphs | Qualified native paths; earlier Qwen prefill-graph screens lost. Chunk4352/2048 are measured per-model choices. |
 | Context and pool capacity | Qwen targets native262144 plus128page/workspace slots. Earlier boundary qualification used E5M2; unquantized native-capacity requalification is pending. Explicit uncached max1 reservations fail instead of shrinking. |
-| Static fraction/state pool | Qwen uses the automatic fraction estimate. GLMTP8.92/NVIDIAPP2MTP.95 are short-context fit settings. With radix off/max1, state slots derive from the request count; a state-memory ratio is redundant. Host PLE saves device memory. |
+| Static fraction/state pool | Qwen uses the automatic fraction estimate. GLMTP8.92 is the short reference; GLMPP2MTP.95 qualifies the262K session. The fraction is a profiled allowance, not a physical VRAM allocation or speed setting. With radix off/max1, state slots derive from the request count; a state-memory ratio is redundant. Host PLE saves device memory. |
 | GLM mHC flags0 | Select supported mHC paths; fused DSA top-k retains its default1. |
 | CPU-only tests | `CUDA_VISIBLE_DEVICES=""`; numeric/disabled/UUID port allocation is supported. No999 workaround. |
 

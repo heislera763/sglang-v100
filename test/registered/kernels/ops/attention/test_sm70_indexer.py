@@ -25,7 +25,7 @@ def reference_quantize(x, round_scale):
     return (x / scale).clamp(-448, 448).to(torch.float8_e4m3fn), scale
 
 
-@pytest.mark.parametrize("query_chunk", [32, 64, 128])
+@pytest.mark.parametrize("query_chunk", [4, 8, 16, 32, 64, 128])
 def test_scoring_query_batches_preserve_causality_and_head_reduction(query_chunk):
     """Larger launches must not expose a future pool or mix query/head rows."""
     torch.manual_seed(739)
@@ -67,6 +67,89 @@ def test_scoring_query_batches_preserve_causality_and_head_reduction(query_chunk
         ]
     ).cpu()
     assert torch.equal(actual, baseline)
+
+
+@pytest.mark.parametrize("batched", [False, True])
+def test_scoring_private_buffer_reuse_is_exact_and_preserves_inputs(batched):
+    torch.manual_seed(741)
+    rows, heads, history = (4, 32, 521) if batched else (32, 32, 521)
+    query, _ = fp8_quantize_sm70(torch.randn(rows, heads, 128, device="cuda"))
+    keys = torch.randn(
+        *((rows, history, 128) if batched else (history, 128)),
+        device="cuda",
+        dtype=torch.float16,
+    )
+    scales = torch.rand(*((rows, history) if batched else (history, 1)), device="cuda")
+    weights = torch.randn(rows, heads, device="cuda")
+    lengths = torch.arange(rows, device="cuda", dtype=torch.int32) + history - rows
+    lengths[0] = 0
+    inputs = (query, keys, scales, weights, lengths)
+    saved = [x.clone() for x in inputs]
+    if batched:
+        dots = torch.bmm(query.half(), keys.transpose(1, 2), out_dtype=torch.float32)
+    else:
+        dots = torch.mm(
+            query.half().reshape(-1, 128), keys.half().T, out_dtype=torch.float32
+        ).reshape(rows, heads, -1)
+    expected = (dots.relu() * weights.float().unsqueeze(-1)).sum(1)
+    expected *= scales if batched else scales.reshape(1, -1)
+    expected.masked_fill_(
+        torch.arange(history, device="cuda")[None, :] >= lengths[:, None],
+        float("-inf"),
+    )
+    actual = mqa_logits_sm70(*inputs)
+    assert torch.equal(actual.view(torch.int32), expected.view(torch.int32))
+    for original, snapshot in zip(inputs, saved):
+        dtype = torch.uint8 if original.dtype == torch.float8_e4m3fn else original.dtype
+        assert torch.equal(original.view(dtype), snapshot.view(dtype))
+
+
+@pytest.mark.parametrize("chunk", [4, 8, 16])
+def test_long_history_scoring_batches_preserve_exact_logits(chunk):
+    # Smaller history-dependent query batches must preserve the same per-row
+    # GEMM and head reduction at the384Ki-token pool4 history size.
+    torch.manual_seed(745)
+    rows, heads, history = 32, 32, 98304
+    query = torch.randn(rows, heads, 128, device="cuda", dtype=torch.float16)
+    keys = torch.randn(history, 128, device="cuda", dtype=torch.float16)
+    scales = torch.rand(history, 1, device="cuda")
+    weights = torch.randn(rows, heads, device="cuda")
+    lengths = torch.arange(rows, device="cuda", dtype=torch.int32) + history - rows
+    expected = mqa_logits_sm70(query, keys, scales, weights, lengths)
+    actual = torch.cat(
+        [
+            mqa_logits_sm70(
+                query[i : i + chunk],
+                keys,
+                scales,
+                weights[i : i + chunk],
+                lengths[i : i + chunk],
+            )
+            for i in range(0, rows, chunk)
+        ]
+    )
+    assert torch.equal(actual.view(torch.int32), expected.view(torch.int32))
+
+
+def test_scoring_workspace_does_not_duplicate_full_head_scores():
+    # Each redundant full-size intermediate adds64MiB for this shape.
+    # Warm the same GEMM first so a lazy library workspace is not the contract.
+    rows, heads, history = 32, 32, 16384
+    query = torch.ones(rows, heads, 128, device="cuda", dtype=torch.float16)
+    keys = torch.ones(history, 128, device="cuda", dtype=torch.float16)
+    scales = torch.ones(history, 1, device="cuda")
+    weights = torch.ones(rows, heads, device="cuda")
+    lengths = torch.full((rows,), history, device="cuda", dtype=torch.int32)
+    mqa_logits_sm70(query, keys, scales, weights, lengths)
+    torch.cuda.synchronize()
+    live = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    result = mqa_logits_sm70(query, keys, scales, weights, lengths)
+    torch.cuda.synchronize()
+    peak = torch.cuda.max_memory_allocated() - live
+    score_bytes = rows * heads * history * 4
+    assert peak < 2 * score_bytes, peak
+    assert torch.equal(result, torch.full_like(result, 128 * heads))
 
 
 @pytest.mark.parametrize("round_scale", [False, True])
