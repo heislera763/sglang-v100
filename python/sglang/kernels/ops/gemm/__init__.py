@@ -28,6 +28,19 @@ _KDA_PACKAGE = "sglang.kernels.kda_kernels"
 
 register_kernel(
     KernelSpec(
+        op="gemm.sm70_nvfp4_routed_gemm",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.sm70_nvfp4_routed:sm70_nvfp4_routed_gemm",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(7, 0), max_sm=(7, 0))}
+        ),
+        format_signature=FormatSignature(supported_dtypes=("float16",), in_place=True),
+        description="Volta MMA with routed Marlin NVFP4 weights and encoded scale bytes.",
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="gemm.sm70_nvfp4_gemv",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.gemm.sm70_nvfp4_gemv:sm70_nvfp4_gemv",

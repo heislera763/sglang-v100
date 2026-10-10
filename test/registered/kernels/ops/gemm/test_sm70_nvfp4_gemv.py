@@ -124,6 +124,117 @@ def test_checkpoint_reference_and_graph_replay(m, topk, n, k):
         torch.testing.assert_close(out.cpu().float(), expected, rtol=0.01, atol=0.015)
 
 
+@pytest.mark.parametrize(
+    "m,topk,n,k,mul_router",
+    [(1, 8, 128, 64, False), (3, 8, 1024, 4096, False), (32, 1, 4096, 512, True)],
+)
+def test_routed_mma_native_quant_reference_and_graph(m, topk, n, k, mul_router):
+    """Pin encoded nibble/scale ordering, scatter and graph metadata lifetime.
+
+    Reference weights decode checkpoint-native FP4/FP8 on CPU in FP64.
+    Padded expert -1 writes zero; invalid unused tail experts must never load.
+    Changing routes/inputs after capture must change results without recompiling.
+    """
+    from sglang_v100_plus.quantization import (
+        _dense_repack,
+        sm70_nvfp4_marlin_process_global_scale,
+        sm70_nvfp4_marlin_process_scales,
+    )
+
+    from sglang.kernels.ops.gemm.sm70_nvfp4_routed import sm70_nvfp4_routed_gemm
+
+    torch.manual_seed(531)
+    e, routes = 9, m * topk
+    packed = torch.randint(0, 256, (e, n, k // 2), device="cuda", dtype=torch.uint8)
+    scales_native = torch.rand(e, n, k // 16, device="cuda").to(torch.float8_e4m3fn)
+    # E4M3 positive extremes, including scales with the sign-bit position set
+    # after Marlin encoding. They must be decoded as unsigned metadata bytes.
+    scales_native.view(torch.uint8)[:, :, 1::31] = 126  # 448, largest finite
+    scales_native.view(torch.uint8)[:, :, 2::23] = 1  # smallest subnormal
+    scales_native.view(torch.uint8)[:, :, ::7] = 0
+    # Keep true weights in the same range when exercising the full FP8 scale
+    # range. Global and block scales compensate each other in NVFP4.
+    globals_native = torch.linspace(0.0625, 0.123456, e, device="cuda") / 448
+    encoded, factor = sm70_nvfp4_marlin_process_scales(
+        scales_native.transpose(1, 2).contiguous(), torch.float16
+    )
+    globals_encoded = (
+        sm70_nvfp4_marlin_process_global_scale(globals_native, torch.float16) / factor
+    )
+    weight = _dense_repack(packed)
+    codes = torch.stack((packed.cpu().long() & 15, packed.cpu().long() >> 4), -1)
+    lookup = torch.tensor(
+        [0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6],
+        dtype=torch.float64,
+    )
+    reference_weight = lookup[
+        codes.reshape(e, n, k)
+    ] * scales_native.cpu().double().repeat_interleave(16, -1)
+    a = torch.randn(m, k, device="cuda", dtype=torch.float16)
+    router = torch.linspace(0.07, 0.93, routes, device="cuda")
+    storage = torch.full((routes * n + 64,), 17.0, device="cuda", dtype=torch.float16)
+    out = storage[: routes * n].view(routes, n)
+    sorted_ids = torch.full((16 * 8,), routes, device="cuda", dtype=torch.int32)
+    expert_ids = torch.full((16,), 123456, device="cuda", dtype=torch.int32)
+    count = torch.zeros(1, device="cuda", dtype=torch.int32)
+
+    def metadata(offset):
+        selected = (torch.arange(routes) + offset) % e
+        ids = torch.full((16 * 8,), routes, dtype=torch.int32)
+        experts = torch.full((16,), 123456, dtype=torch.int32)
+        cursor = 0
+        for expert in range(e):
+            live = torch.where(selected == expert)[0].int()
+            if live.numel():
+                ids[cursor * 8 : cursor * 8 + live.numel()] = live
+                experts[cursor] = expert if expert != e - 1 else -1
+                cursor += 1
+        sorted_ids.copy_(ids)
+        expert_ids.copy_(experts)
+        count.fill_(cursor * 8)
+        return selected
+
+    def run():
+        return sm70_nvfp4_routed_gemm(
+            a,
+            out,
+            weight,
+            encoded,
+            globals_encoded,
+            sorted_ids,
+            expert_ids,
+            count,
+            router,
+            topk,
+            mul_router,
+        )
+
+    selected = metadata(0)
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for offset in (0, 2):
+        if offset:
+            selected = metadata(offset)
+            a.mul_(0.625)
+            router.copy_(router.flip(0).contiguous())
+        out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        expected = torch.zeros(routes, n, dtype=torch.float64)
+        cpu_a = a.cpu().double()
+        for row, expert in enumerate(selected.tolist()):
+            if expert != e - 1:
+                expected[row] = cpu_a[row // topk] @ reference_weight[expert].T
+                if mul_router:
+                    expected[row] *= router[row].item()
+                expected[row] *= globals_native[expert].item()
+        torch.testing.assert_close(out.cpu(), expected.half(), rtol=0.001, atol=0.0002)
+        assert torch.isfinite(out).all()
+        assert torch.equal(storage[-64:], torch.full_like(storage[-64:], 17.0))
+
+
 if __name__ == "__main__":
     import sys
 

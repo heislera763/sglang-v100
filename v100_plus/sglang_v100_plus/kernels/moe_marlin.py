@@ -307,6 +307,50 @@ def moe_wna16_marlin_gemm(
                 bn,
                 bk,
             )
+        if (
+            not _sm70_marlin_user_tuning
+            and moe_block_size == 8
+            and (
+                (1 <= size_m <= 4 and top_k == 8 and (size_n, size_k) == (1024, 4096))
+                or (
+                    size_m in (8, 16, 24, 32)
+                    and top_k == 1
+                    and (size_n, size_k) == (4096, 512)
+                )
+            )
+            and a.dtype == torch.float16
+            and b_scales.dtype == torch.float8_e4m3fn
+            and global_scale_or_none is not None
+            and b_q_type.id == get_scalar_types()[1].float4_e2m1f.id
+            and all(
+                x is None
+                for x in (b_bias_or_none, b_zeros_or_none, g_idx_or_none, perm_or_none)
+            )
+            and not is_ep
+            and is_k_full
+            and not is_zp_float
+        ):
+            from sglang.kernels.ops.gemm.sm70_nvfp4_routed import (
+                sm70_nvfp4_routed_gemm,
+            )
+
+            # Small expert groups use M16 and K-major shared decoded weights;
+            # keep the existing activation, expert sum and Half boundaries.
+            # use_atomic_add permits split-K, not accumulation into prior C;
+            # this implementation owns the full K reduction and overwrites C.
+            return sm70_nvfp4_routed_gemm(
+                a,
+                c,
+                b_q_weight,
+                b_scales,
+                global_scale_or_none,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                topk_weights,
+                top_k,
+                mul_topk_weights,
+            )
         op = _load_marlin_v100_op()
         if op is not None:
             if (

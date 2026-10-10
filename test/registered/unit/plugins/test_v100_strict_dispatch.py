@@ -342,6 +342,91 @@ class TestV100StrictDispatch(CustomTestCase):
                         actual, (x * (2 if optimized else 3)).flatten(1), rtol=0, atol=0
                     )
 
+    def test_nvfp4_routed_mma_preserves_vendor_override_and_epilogues(self):
+        """A tuned replacement must not swallow unsupported Marlin contracts.
+
+        Vendor overrides and optional bias/zero/EP semantics must still
+        reach the declared Marlin backend; otherwise shape matching silently
+        computes a different operation. GPU implementations are mock boundaries.
+        """
+        from sglang_v100_plus.kernels import moe_marlin
+
+        a = torch.zeros(4, 4096, dtype=torch.float16)
+        c = torch.empty(32, 1024, dtype=torch.float16)
+        scalar = SimpleNamespace(id=31)
+        fake_bank = SimpleNamespace(shape=(288, 256, 2048))
+        scales = SimpleNamespace(dtype=torch.float8_e4m3fn)
+        routed = SimpleNamespace(sm70_nvfp4_routed_gemm=lambda *args: args[1].fill_(7))
+        raw = lambda *args: args[1].fill_(3)
+        base = dict(
+            a=a,
+            c_or_none=c,
+            b_q_weight=fake_bank,
+            b_bias_or_none=None,
+            b_scales=scales,
+            global_scale_or_none=torch.ones(288),
+            b_zeros_or_none=None,
+            g_idx_or_none=None,
+            perm_or_none=None,
+            workspace=None,
+            sorted_token_ids=torch.empty(256, dtype=torch.int32),
+            expert_ids=torch.empty(32, dtype=torch.int32),
+            num_tokens_post_padded=torch.empty(1, dtype=torch.int32),
+            topk_weights=torch.ones(32),
+            moe_block_size=8,
+            top_k=8,
+            mul_topk_weights=False,
+            is_ep=False,
+            b_q_type=scalar,
+            size_m=4,
+            size_n=1024,
+            size_k=4096,
+        )
+        with (
+            patch.object(moe_marlin, "_IS_SM70", True),
+            patch.object(moe_marlin, "_load_marlin_v100_op", return_value=raw),
+            patch.object(moe_marlin, "_configure_sm70_nvfp4_stage"),
+            patch(
+                "sglang.srt.layers.quantization.utils.get_scalar_types",
+                return_value=(None, SimpleNamespace(float4_e2m1f=scalar)),
+            ),
+            patch.dict(
+                sys.modules, {"sglang.kernels.ops.gemm.sm70_nvfp4_routed": routed}
+            ),
+            envs.SGLANG_OPT_SM70_NVFP4_GEMV.override(False),
+        ):
+            with patch.object(moe_marlin, "_sm70_marlin_user_tuning", False):
+                torch.testing.assert_close(
+                    moe_marlin.moe_wna16_marlin_gemm(**base), torch.full_like(c, 7)
+                )
+                for change in (
+                    dict(b_bias_or_none=torch.ones(1024)),
+                    dict(b_zeros_or_none=torch.ones(1)),
+                    dict(is_ep=True),
+                    dict(is_k_full=False),
+                    dict(is_zp_float=True),
+                    dict(b_q_type=SimpleNamespace(id=17)),
+                    dict(b_scales=SimpleNamespace(dtype=torch.float16)),
+                    dict(global_scale_or_none=None),
+                    dict(moe_block_size=16),
+                    dict(size_m=8),
+                ):
+                    with self.subTest(change=tuple(change)):
+                        torch.testing.assert_close(
+                            moe_marlin.moe_wna16_marlin_gemm(**dict(base, **change)),
+                            torch.full_like(c, 3),
+                        )
+                # True permits a split-K kernel, it does not require adding
+                # into existing output. A full-K implementation is valid.
+                torch.testing.assert_close(
+                    moe_marlin.moe_wna16_marlin_gemm(**dict(base, use_atomic_add=True)),
+                    torch.full_like(c, 7),
+                )
+            with patch.object(moe_marlin, "_sm70_marlin_user_tuning", True):
+                torch.testing.assert_close(
+                    moe_marlin.moe_wna16_marlin_gemm(**base), torch.full_like(c, 3)
+                )
+
 
 class TestFP16ExpertDispatchContract(CustomTestCase):
     def test_upstream_positional_options_stay_aligned(self):

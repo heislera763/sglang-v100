@@ -58,7 +58,7 @@ in software; it does not imply native arithmetic in those formats.
 
 | Operation | Implementation / contract |
 | --- | --- |
-| NVFP4 GEMMs | [marlin_v100](https://github.com/zhinianqin/marlin_v100) at `6d72a499` plus local patches: W4A16, FP16 WMMA with FP32 accumulation; block/global scales remain distinct. Unused alternate-backend MoE scale buffers alias active scales, saving17.72GiB across GLM's8GPUs. |
+| NVFP4 GEMMs | [marlin_v100](https://github.com/zhinianqin/marlin_v100) at `6d72a499` plus local patches: W4A16, FP16 WMMA with FP32 accumulation; block/global scales remain distinct. Small routed groups use [Volta MMA](python/sglang/kernels/ops/gemm/sm70_nvfp4_routed.py) with M16 tiles and K-major decoded weights; FP16 dequantization/output and FP32 accumulation/scaling remain. Unused alternate-backend MoE scale buffers alias active scales, saving17.72GiB across GLM's8GPUs. |
 | Block-FP8 GEMMs | Patched Marlin and small-row vector kernels: W8A16, complete 128×128 scale blocks. Qwen EP4/EP8 preserves whole experts. |
 | FP16 routed experts | [Volta MMA GEMM](python/sglang/kernels/ops/moe/sm70_fp16.py), used by NVIDIA GLM's unquantized MTP experts. FP16 inputs/weights/output, FP32 accumulation and router multiply; upstream routing, activation and expert sum retained. Automatically selected by the SM70 plugin; unsupported epilogues fail under strict dispatch. |
 | Qwen QSA/GDN/HC | Direct FP16-cache sparse prefill/decode/verification, masked Tensor Core prefill, SM70 GDN and gated-residual kernels; HC eager prefill partitions within each quad, including TP8. |
@@ -213,7 +213,7 @@ Prefill implementation is unchanged (~2,548 PP); baseline prefill varies between
 processes, so no prefill gain is attributed to this decode change. Same 262K
 context, chunks and FP16 KV. The tables below use the latest paired candidate.
 [Attention tests](test/registered/kernels/ops/attention/test_triton_sparse_mla_fp16.py) and
-[expert tests](test/registered/kernels/ops/moe/test_sm70_fp16.py) and
+[expert tests](test/registered/kernels/ops/moe/test_sm70_fp16.py), [NVFP4 tests](test/registered/kernels/ops/gemm/test_sm70_nvfp4_gemv.py) and
 [indexer tests](test/registered/kernels/ops/attention/test_sm70_indexer.py) cover independent
 reference math, routing/masks and graph refresh. Precision boundaries are retained;
 MMA reduction order is not bit-exact to scalar outputs. Images, 262106-input/32-output
@@ -226,7 +226,7 @@ screen preceding these implementations.
 | Qwen FP8 TP4×PP2/EP4 | 3 | 7,588 | 72.5 |
 | NVIDIA GLM TP8/EP1 | 3 | 1,366 | 42.7 |
 | NVIDIA GLM TP4×PP2/EP1 | Off | 1,882 | 28.2 |
-| NVIDIA GLM TP4×PP2/EP1 | 3 | 2,548 | 53.2 |
+| NVIDIA GLM TP4×PP2/EP1 | 3 | 2,548 | 59.9 |
 
 MTP3 categories (PP/TG tokens/s; GLM PP2 averages two processes, others one):
 
@@ -235,9 +235,9 @@ MTP3 categories (PP/TG tokens/s; GLM PP2 averages two processes, others one):
 | Qwen coding | 4,882 | 82.3 | 7,668 | 82.2 |
 | Qwen book continuation | 4,831 | 82.6 | 7,607 | 66.3 |
 | Qwen document briefing | 4,779 | 73.3 | 7,489 | 69.0 |
-| NVIDIA GLM coding | 1,370 | 48.6 | 2,564 | 58.5 |
-| NVIDIA GLM book continuation | 1,367 | 37.6 | 2,541 | 47.2 |
-| NVIDIA GLM document briefing | 1,360 | 43.2 | 2,538 | 53.9 |
+| NVIDIA GLM coding | 1,370 | 48.6 | 2,564 | 63.9 |
+| NVIDIA GLM book continuation | 1,367 | 37.6 | 2,540 | 59.9 |
+| NVIDIA GLM document briefing | 1,360 | 43.2 | 2,538 | 55.8 |
 
 Inputs: [SPEED-Bench throughput_8k](https://huggingface.co/datasets/nvidia/SPEED-Bench/tree/454f88454792dfa3ccfd7ef15fff248efde44cd1),
 first turns `91d6ca2afe114d3c99312e8758b6f964` (code),
@@ -259,6 +259,15 @@ briefing+36%. Prefill is unchanged; speculative cycles are~23% shorter.
 The small-row tile changes FP16 reduction rounding; independent FP64 probes found
 max absolute error0.00044 versus the reference, old/new difference0.00049. It preserves
 selected sparse support and is not bit-exact to the wider tile.
+
+Small-row NVFP4 MMA adds a measured gain over [22e3cffc](https://github.com/heislera763/sglang-v100-plus/commit/22e3cffc):
+three control processes and two candidate processes average54.8→59.9generation tokens/s,
+with verification cycles6.9% shorter and mean acceptance1.8% higher. Prefill is unchanged.
+The kernel uses92registers/18KiB shared versus Marlin192/36KiB;36 captured-bank
+routing/graph controls are bit-exact. Independent native-quant FP64 tests include
+FP8 scale extremes, changing routes and zero experts; device memcheck reports0errors.
+Single-request PP decode still serializes stages; receive waiting is not extra
+transfer work. Further prefill work centers on expert GEMMs, sparse MMA and KDA.
 
 Independent operator bounds plus exact state/payload/RNG checks where specified;
 native strict dispatch and EOS/logprob/penalty/cancel/reuse checks supplement them.
