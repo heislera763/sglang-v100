@@ -752,7 +752,7 @@ def q8kv8_topk_length_backscan_kernel(
     while (found == 0) & (off > 0):
         off -= BLOCK
         idx = off + tl.arange(0, BLOCK)
-        vals = tl.load(base + idx)
+        vals = tl.load(base + idx, mask=idx >= 0, other=-1)
         pos = tl.max(tl.where(vals >= 0, idx, -1), axis=0)
         found = tl.where(pos >= 0, 1, found)
         length = tl.where(pos >= 0, pos + 1, length)

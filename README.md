@@ -61,7 +61,7 @@ in software; it does not imply native arithmetic in those formats.
 | NVFP4 GEMMs | [marlin_v100](https://github.com/zhinianqin/marlin_v100) at `6d72a499` plus local patches: W4A16, FP16 WMMA with FP32 accumulation; block/global scales remain distinct. Unused alternate-backend MoE scale buffers alias active scales, saving17.72GiB across GLM's8GPUs. |
 | Block-FP8 GEMMs | Patched Marlin and small-row vector kernels: W8A16, complete 128×128 scale blocks. Qwen EP4/EP8 preserves whole experts. |
 | Qwen QSA/GDN/HC | Direct FP16-cache sparse prefill/decode/verification, masked Tensor Core prefill, SM70 GDN and gated-residual kernels; HC eager prefill partitions within each quad, including TP8. |
-| GLM sparse MLA / indexer | FP16 Triton attention; shared 16-row KV tiles for SM70 latent512/no-tail,1–4query,H8/H16 split attention; software FP8 indexer/scoring, request-owned pool4 compression cache; private FP32 score-buffer reuse and history-dependent query batches bound scoring workspace. Optional two-query sparse sharing preserves support masks. |
+| GLM sparse MLA / indexer | Explicit Volta Tensor Core FP16 sparse prefill for128+queries/H8/H16/latent512/no-tail; direct selected-KV gather, FP32 reductions and FP16 probabilities. Small-row Triton split attention keeps16-row KV tiles. Software FP8 learned indexer, request-owned pool4 compression and bounded FP32 scoring workspace. |
 | GLM KDA / mHC | Range-safe KDA; FP32 mHC projection/RMS/Sinkhorn, private prefill buffer reused for square/mean (~128MiB lower peak at2048rows). BF16-to-FP16 conversion needs operation-specific range handling. |
 | Storage | Unquantized FP16 attention KV for both models; Qwen FP16 QSA index, GLM's separate model-native FP8 indexer. KV-cache quantization is excluded from the project recipes. FP16 recurrent state is retained. |
 | Cold module loading | Return idle Torch allocator blocks to CUDA when first-use Triton loads have little headroom; leave live tensors unchanged. Skip capture/custom arenas; steady kernel replay has no callback. |
@@ -129,7 +129,6 @@ uv run --no-project .venv/bin/python -m sglang_v100_plus "${common[@]}" \
 
 ```bash
 export SGLANG_OPT_USE_TILELANG_MHC_PRE=0 SGLANG_OPT_USE_TILELANG_MHC_POST=0 SGLANG_OPT_FUSE_MHC_POST_PRE=0
-export SGLANG_OPT_SM70_SPARSE_PREFILL_UNION=1
 uv run --no-project .venv/bin/python -m sglang_v100_plus "${common[@]}" \
   --model-path "$HOME/models/sglang/nvidia-GLM-5.3-Flash-NVFP4" --served-model-name glm5.3-flash --language-only \
   --quantization modelopt_fp4 --fp4-gemm-backend marlin --tensor-parallel-size 8 --expert-parallel-size 1 \
@@ -162,6 +161,7 @@ classical sampled rejection. Lab sampling sources: [Qwen](https://huggingface.co
 | Eager prefill/full decode graphs | Qualified native paths; earlier Qwen prefill-graph screens lost. Chunk4352/2048 are measured per-model choices. |
 | Context and pool capacity | Qwen targets native262144 plus128page/workspace slots. FP16 PP2/MTP3 allocation,262106-input/32-output generation and request reuse pass. Explicit uncached max1 reservations fail instead of shrinking. |
 | Static fraction/state pool | Qwen uses the automatic fraction estimate. GLMTP8.92 is the short reference; GLMPP2MTP.95 qualifies the262K session. The fraction is a profiled allowance, not a physical VRAM allocation or speed setting. With radix off/max1, state slots derive from the request count; a state-memory ratio is redundant. Host PLE saves device memory. |
+| GLM sparse prefill | The SM70 hook routes supported large FP16 rows to explicit Volta MMA under the `triton` DSA entry point; no extra flag or8K query-union restriction. Small-row decode retains its split policy. |
 | GLM mHC flags0 | Select supported mHC paths; fused DSA top-k retains its default1. |
 | CPU-only tests | `CUDA_VISIBLE_DEVICES=""`; numeric/disabled/UUID port allocation is supported. No999 workaround. |
 
@@ -170,7 +170,6 @@ classical sampled rejection. Lab sampling sources: [Qwen](https://huggingface.co
 | `SGLANG_OPT_SM70_HC_PREFILL_SP=1` | Qwen serialized text-only eager prefill, quad-local TP4/TP8/PP2. |
 | `SGLANG_ENABLE_METADATA_GLUE_GRAPH=1` | Qwen PP2 fixed EAGLE1–3 commit copies; GLM fixed chains/full KDA snapshots supported; NVIDIA speed benefit unmeasured, leave off. |
 | `SGLANG_OPT_SM70_SPEC_SAMPLE_GRAPH=1` | Qwen TP8 MTP3; leave off on PP2. Unsupported sampling features use their declared original path. |
-| `SGLANG_OPT_SM70_SPARSE_PREFILL_UNION=1` | GLM near8K two-query sharing; selected support/ownership masks preserved, reduction order differs. |
 | `SGLANG_OPT_SM70_NVFP4_MOE_GEMV=1` | GLM opt-in supports1–4 rows; prior publisher screen found no aggregate win, NVIDIA benefit unmeasured. Leave off. |
 | `SGLANG_OPT_SM70_NVFP4_GEMV`, `SGLANG_OPT_SM70_MHC_PROJECTION` | Default1 GLM paths; set0 for corresponding unfused controls. |
 
@@ -201,9 +200,15 @@ the earlier E5M2 results are historical controls. Earlier GLM rows:
 compatible post-sync paths; NVIDIA PP2 MTP additionally uses the allocator fix
 [a85513f5](https://github.com/heislera763/sglang-v100-plus/commit/a85513f5) and exact mHC buffer reuse
 [9f057466](https://github.com/heislera763/sglang-v100-plus/commit/9f057466).
-The GLM PP2 MTP matrix was measured at [aa02d9b3](https://github.com/heislera763/sglang-v100-plus/commit/aa02d9b3),
-including the shared small-row sparse MLA tile policy above;
-its numerics and CUDA-graph coverage are in the [operator tests](test/registered/kernels/ops/attention/test_triton_sparse_mla_fp16.py).
+GLM PP2 MTP now uses [explicit Volta MMA prefill](python/sglang/kernels/ops/attention/dsa/sm70_sparse_prefill.py):
+fresh A/B/B/A processes on 2026-10-10 gave 1,713 → 2,359 prefill tokens/s (+37.7%)
+with the same 262K context, 2048-token chunks and FP16 KV. Decode kernels are unchanged; sampled TG varies
+with outputs/acceptance. [Operator tests](test/registered/kernels/ops/attention/test_triton_sparse_mla_fp16.py)
+cover reference math, ragged/empty selections, large physical slots and graph refresh.
+MMA/softmax reduction order changes; this preserves support and precision boundaries,
+not bit-exact scalar outputs. Images, 262106-input/32-output capacity and reuse pass;
+full-context quality is separate. Earlier PP2 MTP at [aa02d9b3](https://github.com/heislera763/sglang-v100-plus/commit/aa02d9b3)
+was 1714 PP / 42.5 TG. TP8 below remains an earlier screen without this prefill implementation.
 
 | Model / layout | MTP steps | Prefill tokens/s | Generation tokens/s |
 | --- | ---: | ---: | ---: |
@@ -211,7 +216,7 @@ its numerics and CUDA-graph coverage are in the [operator tests](test/registered
 | Qwen FP8 TP4×PP2/EP4 | 3 | 7,588 | 72.5 |
 | NVIDIA GLM TP8/EP1 | 3 | 1,366 | 42.7 |
 | NVIDIA GLM TP4×PP2/EP1 | Off | 1,882 | 28.2 |
-| NVIDIA GLM TP4×PP2/EP1 | 3 | 1,714 | 42.5 |
+| NVIDIA GLM TP4×PP2/EP1 | 3 | 2,359 | 43.6 |
 
 MTP3 categories (PP/TG tokens/s; GLM PP2 averages two processes, others one):
 
@@ -220,9 +225,9 @@ MTP3 categories (PP/TG tokens/s; GLM PP2 averages two processes, others one):
 | Qwen coding | 4,882 | 82.3 | 7,668 | 82.2 |
 | Qwen book continuation | 4,831 | 82.6 | 7,607 | 66.3 |
 | Qwen document briefing | 4,779 | 73.3 | 7,489 | 69.0 |
-| NVIDIA GLM coding | 1,370 | 48.6 | 1,711 | 46.7 |
-| NVIDIA GLM book continuation | 1,367 | 37.6 | 1,713 | 38.2 |
-| NVIDIA GLM document briefing | 1,360 | 43.2 | 1,717 | 42.6 |
+| NVIDIA GLM coding | 1,370 | 48.6 | 2,353 | 47.1 |
+| NVIDIA GLM book continuation | 1,367 | 37.6 | 2,358 | 39.5 |
+| NVIDIA GLM document briefing | 1,360 | 43.2 | 2,365 | 44.4 |
 
 Inputs: [SPEED-Bench throughput_8k](https://huggingface.co/datasets/nvidia/SPEED-Bench/tree/454f88454792dfa3ccfd7ef15fff248efde44cd1),
 first turns `91d6ca2afe114d3c99312e8758b6f964` (code),

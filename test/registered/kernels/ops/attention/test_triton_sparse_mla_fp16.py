@@ -191,36 +191,23 @@ def test_empty_tile_prefill_replays_without_changing_valid_tile_math():
 
 
 @pytest.mark.parametrize("heads", [8, 16])
-def test_sm70_query_union_preserves_support_ragged_tail_and_graph_replay(
-    heads, monkeypatch
+@pytest.mark.parametrize("pages,seq,topk", [(257, 33, 67), (262273, 129, 2051)])
+def test_sm70_tensorcore_preserves_support_ragged_tail_and_graph_replay(
+    heads, pages, seq, topk
 ):
-    """Disjoint/empty neighbours must not receive each other's KV values."""
+    """Gather/softmax MMA tiles must preserve independent sparse query support."""
     if torch.cuda.get_device_capability() != (7, 0):
-        pytest.skip("Volta query union")
-    from sglang_v100_plus import glm_dsa
-
-    from sglang.kernels.ops.attention.dsa import sm70_sparse_prefill
+        pytest.skip("Volta Tensor Core sparse prefill")
     from sglang.kernels.ops.attention.dsa.sm70_sparse_prefill import (
         sparse_mla_prefill_sm70,
     )
 
-    # Installed hooks also wrap the ordinary API used by an odd last query.
-    # Exercise its optional d_v argument rather than bypassing that boundary.
-    monkeypatch.setattr(glm_dsa, "get_attn_backend", lambda: None)
-    monkeypatch.setattr(
-        sm70_sparse_prefill,
-        "triton_sparse_mla_fwd",
-        lambda *args, **kwargs: glm_dsa.sparse_prefill(
-            triton_sparse_mla_fwd, *args, **kwargs
-        ),
-    )
-
     torch.manual_seed(740)
     # Head-strided input, odd query count and non-power-of-two pool4 width.
-    packed = torch.randn(33, heads, 576, device="cuda", dtype=torch.float16)
+    packed = torch.randn(seq, heads, 576, device="cuda", dtype=torch.float16)
     q = packed[:, :, :512]
-    kv = torch.randn(257, 1, 512, device="cuda", dtype=torch.float16)
-    indices = torch.full((33, 1, 67), -1, device="cuda", dtype=torch.int32)
+    kv = torch.randn(pages, 1, 512, device="cuda", dtype=torch.float16)
+    indices = torch.full((seq, 1, topk), -1, device="cuda", dtype=torch.int32)
     scale = 256**-0.5
     for _ in range(3):
         sparse_mla_prefill_sm70(q, kv, indices, scale)
@@ -231,22 +218,29 @@ def test_sm70_query_union_preserves_support_ragged_tail_and_graph_replay(
         packed.normal_()
         kv.normal_()
         indices.fill_(-1)
-        for row in range(33):
+        for row in range(seq):
             if (row + update) % 5 == 0:
                 continue
-            valid = torch.randperm(257, device="cuda")[: min(67, row * 3 + 1)]
-            columns = torch.randperm(67, device="cuda")[: valid.numel()]
+            valid = torch.randperm(pages, device="cuda")[: min(topk, row * 3 + 1)]
+            columns = torch.randperm(topk, device="cuda")[: valid.numel()]
             indices[row, 0, columns] = valid.int()
         # A populated first query with an entirely empty second query guards
         # the all-masked initial tile: a finite sentinel would leak KV values.
         indices[0].fill_(-1)
         indices[0, 0, :3] = torch.tensor([5, 17, 31], device="cuda")
         indices[1].fill_(-1)
+        if topk == 2051:
+            indices.fill_(-1)
+            for row, count in enumerate((1, 65, 128, 2048, 2051)):
+                indices[row + 2, 0, :count] = torch.arange(
+                    pages - count, pages, device="cuda", dtype=torch.int32
+                )
+            indices[4, 0, 16:32] = -1
         before = indices.clone()
         graph.replay()
         eager = sparse_mla_prefill_sm70(q, kv, indices, scale)
         expected = torch.zeros_like(q, dtype=torch.float64)
-        for row in range(33):
+        for row in range(seq):
             ids = indices[row, 0]
             selected = kv[ids[ids >= 0].long(), 0].double()
             if selected.numel():
@@ -261,6 +255,58 @@ def test_sm70_query_union_preserves_support_ragged_tail_and_graph_replay(
             assert torch.count_nonzero(result[0, 1]) == 0
         assert torch.equal(indices, before)
         assert torch.equal(actual.view(torch.uint8), eager.view(torch.uint8))
+
+
+def test_sm70_tensorcore_graph_refreshes_explicit_length_bounds():
+    """Live length bounds must mask populated columns, including zero rows."""
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("Volta Tensor Core sparse prefill")
+    from sglang.kernels.ops.attention.dsa.sm70_sparse_prefill import (
+        sparse_mla_prefill_sm70,
+    )
+
+    torch.manual_seed(742)
+    q = torch.randn(3, 16, 512, device="cuda", dtype=torch.float16)
+    kv = torch.randn(257, 1, 512, device="cuda", dtype=torch.float16)
+    indices = torch.arange(67, dtype=torch.int32, device="cuda").repeat(3, 1)
+    lengths = torch.tensor([0, 1, 67], dtype=torch.int32, device="cuda")
+    scale = 512**-0.5
+
+    def run():
+        return sparse_mla_prefill_sm70(q, kv, indices, scale, lengths)
+
+    for _ in range(3):
+        run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = run()
+    for bounds in ((0, 1, 67), (100, -1, 65), (1, 67, 0)):
+        lengths.copy_(torch.tensor(bounds, dtype=torch.int32, device="cuda"))
+        graph.replay()
+        expected = torch.zeros_like(q, dtype=torch.float64)
+        for row, count in enumerate(bounds):
+            selected = kv[: min(67, max(0, count)), 0].double()
+            if selected.numel():
+                expected[row] = (q[row].double() @ selected.T * scale).softmax(
+                    -1
+                ) @ selected
+        assert torch.isfinite(actual).all()
+        torch.testing.assert_close(actual[0].double(), expected, rtol=0.01, atol=0.001)
+
+
+@pytest.mark.parametrize("topk", [67, 2051, 4096])
+def test_sparse_length_scan_handles_ragged_width_and_empty_rows(topk):
+    """The first backscan block may cross column zero, never its row boundary."""
+    from sglang.kernels.ops.kvcache.cache_ops import q8kv8_topk_length_from_indices
+
+    indices = torch.full((4, topk), -1, dtype=torch.int32, device="cuda")
+    indices[1, 0] = 7
+    indices[2, topk - 1] = 11
+    indices[3, min(65, topk - 1)] = 19
+    expected = torch.tensor(
+        [1, 1, topk, min(65, topk - 1) + 1], dtype=torch.int32, device="cuda"
+    )
+    torch.testing.assert_close(q8kv8_topk_length_from_indices(indices), expected)
 
 
 if __name__ == "__main__":

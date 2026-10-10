@@ -60,93 +60,23 @@ def sm70_glm_kv_cache_dtype(original, **kwargs):
 
 
 def sparse_prefill(original, q_nope, q_rope, kv, indices, sm_scale, d_v=512, **kwargs):
-    """Select bounded query sharing and exact empty-tile skips on SM70."""
-    backend = get_attn_backend()
-    backend = getattr(backend, "full_attn_backend", backend)
-    ranges = getattr(backend, "sm70_prefill_padding_ranges", ())
-    from sglang.srt.environ import envs
-
+    """Use explicit Volta Tensor Cores for large FP16 latent-only prefill."""
     if (
-        envs.SGLANG_OPT_SM70_SPARSE_PREFILL_UNION.get()
-        and getattr(backend, "sm70_prefill_union_max_context", 8193) <= 8192
-        and ranges
-        and ranges[-1][2] == q_nope.shape[0]
-        and q_nope.shape[0] >= 128
+        q_nope.shape[0] >= 128
         and q_nope.shape[1] in (8, 16)
         and q_nope.dtype == kv.dtype == torch.float16
-        and d_v == 512
+        and d_v == kv.shape[-1] == 512
         and q_rope.shape[-1] == 0
-        and indices.shape[-1] == 2051
         and not torch.cuda.is_current_stream_capturing()
     ):
         from sglang.kernels.ops.attention.dsa.sm70_sparse_prefill import (
             sparse_mla_prefill_sm70,
         )
 
-        if q_nope.shape[1] == 8:
-            # Two eight-head queries fill the otherwise half-empty MMA tile.
-            return sparse_mla_prefill_sm70(q_nope, kv, indices, sm_scale)
-        # A 16-head query already fills the ordinary tile. Union benefits
-        # its early causal rows; sorting/sharing full-history rows loses here.
-        outputs = []
-        for start, split, end in backend.sm70_prefill_union_ranges:
-            if split - start < 128:
-                split = start
-            if split > start:
-                outputs.append(
-                    sparse_mla_prefill_sm70(
-                        q_nope[start:split], kv, indices[start:split], sm_scale
-                    )
-                )
-            if end > split:
-                options = dict(kwargs)
-                if options.get("topk_length") is not None:
-                    options["topk_length"] = options["topk_length"][split:end]
-                outputs.append(
-                    original(
-                        q_nope[split:end],
-                        q_rope[split:end],
-                        kv,
-                        indices[split:end],
-                        sm_scale,
-                        d_v,
-                        **options,
-                    )
-                )
-        return torch.cat(outputs, dim=1) if len(outputs) > 1 else outputs[0]
-    if not (
-        ranges
-        and ranges[-1][2] == q_nope.shape[0]
-        and q_nope.dtype == kv.dtype == torch.float16
-        and d_v == 512
-        and q_rope.shape[-1] == 0
-        and indices.shape[-1] == 2051
-        and any(split - start >= 128 for start, split, _ in ranges)
-        and not torch.cuda.is_current_stream_capturing()
-    ):
-        return original(q_nope, q_rope, kv, indices, sm_scale, d_v, **kwargs)
-    outputs = []
-    for start, split, end in ranges:
-        if split - start < 128:
-            split = start
-        for lo, hi, padded in ((start, split, True), (split, end, False)):
-            if lo == hi:
-                continue
-            options = dict(kwargs, skip_empty_tiles=padded)
-            if options.get("topk_length") is not None:
-                options["topk_length"] = options["topk_length"][lo:hi]
-            outputs.append(
-                original(
-                    q_nope[lo:hi],
-                    q_rope[lo:hi],
-                    kv,
-                    indices[lo:hi],
-                    sm_scale,
-                    d_v,
-                    **options,
-                )
-            )
-    return torch.cat(outputs, dim=1) if len(outputs) > 1 else outputs[0]
+        return sparse_mla_prefill_sm70(
+            q_nope, kv, indices, sm_scale, kwargs.get("topk_length")
+        )
+    return original(q_nope, q_rope, kv, indices, sm_scale, d_v, **kwargs)
 
 
 def sm70_dsa_cache_default(original, view):
@@ -490,31 +420,6 @@ class SM70SparseAttnBackend(DeepseekSparseAttnBackend):
     needs_cpu_seq_lens = True
 
     def init_forward_metadata(self, forward_batch):
-        self.sm70_prefill_padding_ranges = ()
-        self.sm70_prefill_union_ranges = ()
-        self.sm70_prefill_union_max_context = 0
-        if forward_batch.forward_mode.is_extend_without_speculative():
-            # Full-history selected-key overlap beyond 8K is not qualified.
-            # Retain the ordinary SM70 operator for those contexts.
-            self.sm70_prefill_union_max_context = max(
-                forward_batch.seq_lens_cpu.tolist(), default=0
-            )
-            # Pool4 indexes have 2048 history and three tail positions. With
-            # <=1024 causal tokens at least half the table is invalid. Keep
-            # the ordinary compiled kernel for later/full-history rows.
-            ranges, union_ranges, offset = [], [], 0
-            for length, count in zip(
-                forward_batch.seq_lens_cpu.tolist(),
-                forward_batch.extend_seq_lens_cpu,
-            ):
-                prefix = length - count
-                padded = min(count, max(0, 1024 - prefix))
-                ranges.append((offset, offset + padded, offset + count))
-                shared = min(count, max(0, 2048 - prefix))
-                union_ranges.append((offset, offset + shared, offset + count))
-                offset += count
-            self.sm70_prefill_padding_ranges = tuple(ranges)
-            self.sm70_prefill_union_ranges = tuple(union_ranges)
         request_ids = forward_batch.req_pool_indices_cpu
         if request_ids is None:
             request_ids = forward_batch.req_pool_indices.cpu()

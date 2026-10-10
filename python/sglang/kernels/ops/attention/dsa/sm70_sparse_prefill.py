@@ -1,28 +1,106 @@
-"""FP16 sparse MLA with a shared key union for two adjacent Volta queries.
+"""Volta Tensor Core sparse MLA prefill over selected FP16 latent KV rows.
 
-Each index row must contain distinct valid KV positions, as GLM pool4 does.
-Ownership bits preserve each query's support, including tails and empty rows.
-The union changes key traversal/reduction order; it does not approximate the
-selected attention support. The 128-wide latent fragments fit Volta's 96 KiB
-shared-memory budget, unlike a monolithic 512-wide MMA.
+One CTA owns a query's local heads and reuses each gathered tile for QK and PV.
+Support/masks and FP16 probability boundaries are unchanged; MMA and online
+softmax change reduction order, so this is not bit-exact to scalar Triton.
 """
 
+import tilelang
+import tilelang.language as T
 import torch
-import triton
 
-from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
-    _sparse_mla_fused_kernel,
-    triton_sparse_mla_fwd,
-)
-from sglang.kernels.ops.attention.dsa.triton_sparse_mla_prefill import _union_dedup
+from sglang.kernels.ops.kvcache.cache_ops import q8kv8_topk_length_from_indices
+
+_PASS_CONFIGS = {
+    tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+    tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+}
 
 
-def sparse_mla_prefill_sm70(q, kv, indices, sm_scale):
-    """Return [1, tokens, heads, 512] for FP16 SM70 heads8/16, no RoPE tail.
+@tilelang.jit(out_idx=[5], pass_configs=_PASS_CONFIGS)
+def _prefill_kernel(heads):
+    bn, threads = 64, 128
+    nt = T.dynamic("nt")
+    nk = T.dynamic("nk")
+    topk = T.dynamic("topk")
+    bm = 16
+    dim = 512
 
-    Inputs share a CUDA device. Index rows are int32 with -1 padding and no
-    duplicate valid slots. Like the established sparse MLA API, callers own
-    index bounds. Ragged last queries retain the ordinary sparse implementation.
+    @T.prim_func
+    def main(
+        Q: T.Tensor([nt, heads, dim], T.float16),
+        KV: T.Tensor([nk, dim], T.float16),
+        Ids: T.Tensor([nt, topk], T.int32),
+        Lengths: T.Tensor([nt], T.int32),
+        scale: T.float32,
+        Out: T.Tensor([nt, heads, dim], T.float16),
+    ):
+        with T.Kernel(nt, threads=threads) as row:
+            qs = T.alloc_shared([bm, dim], T.float16)
+            kv = T.alloc_shared([bn, dim], T.float16)
+            ps = T.alloc_shared([bm, bn], T.float16)
+            ids = T.alloc_shared([bn], T.int32)
+            scores = T.alloc_fragment([bm, bn], T.float32)
+            o = T.alloc_fragment([bm, dim], T.float32)
+            m = T.alloc_fragment([bm], T.float32)
+            old = T.alloc_fragment([bm], T.float32)
+            l = T.alloc_fragment([bm], T.float32)
+            z = T.alloc_fragment([bm], T.float32)
+            alpha = T.alloc_fragment([bm], T.float32)
+            for h, d in T.Parallel(bm, dim):
+                qs[h, d] = T.if_then_else(h < heads, Q[row, h, d], 0)
+            T.clear(o)
+            T.fill(m, -1.0e30)
+            T.clear(l)
+            limit = T.min(topk, T.max(0, Lengths[row]))
+            for tile in T.serial(T.ceildiv(limit, bn)):
+                for n in T.Parallel(bn):
+                    ids[n] = T.if_then_else(
+                        tile * bn + n < limit, Ids[row, tile * bn + n], -1
+                    )
+                for n, d in T.Parallel(bn, dim):
+                    kv[n, d] = T.if_then_else(
+                        (ids[n] >= 0) & (ids[n] < nk), KV[ids[n], d], 0
+                    )
+                T.clear(scores)
+                T.gemm(
+                    qs, kv, scores, transpose_B=True, policy=T.GemmWarpPolicy.FullCol
+                )
+                for h, n in T.Parallel(bm, bn):
+                    scores[h, n] = T.if_then_else(
+                        (ids[n] >= 0) & (ids[n] < nk),
+                        scores[h, n] * scale * 1.4426950408889634,
+                        -1.0e30,
+                    )
+                T.copy(m, old)
+                T.reduce_max(scores, m, dim=1, clear=False)
+                for h in T.Parallel(bm):
+                    alpha[h] = T.exp2(old[h] - m[h])
+                    l[h] *= alpha[h]
+                for h, d in T.Parallel(bm, dim):
+                    o[h, d] *= alpha[h]
+                for h, n in T.Parallel(bm, bn):
+                    scores[h, n] = T.if_then_else(
+                        (ids[n] >= 0) & (ids[n] < nk), T.exp2(scores[h, n] - m[h]), 0
+                    )
+                T.reduce_sum(scores, z, dim=1)
+                for h in T.Parallel(bm):
+                    l[h] += z[h]
+                T.copy(scores, ps)
+                T.gemm(ps, kv, o, policy=T.GemmWarpPolicy.FullCol)
+            for h, d in T.Parallel(bm, dim):
+                if h < heads:
+                    Out[row, h, d] = T.cast(o[h, d] / T.max(l[h], 1.0e-30), T.float16)
+
+    return main
+
+
+def sparse_mla_prefill_sm70(q, kv, indices, sm_scale, topk_length=None):
+    """Return [1, tokens, heads8/16, 512] using FP16 inputs and FP32 reductions.
+
+    Index rows address physical KV slots, with negative padding. Optional lengths
+    bound the last valid column; otherwise a device scan derives that bound.
+    Both gathered matrices remain FP16; the KV cache is never quantized/copied.
     """
     if not (
         q.is_cuda
@@ -42,54 +120,19 @@ def sparse_mla_prefill_sm70(q, kv, indices, sm_scale):
         raise ValueError(
             "SM70 sparse prefill requires FP16 heads8/16, latent512 and CUDA int32 indices"
         )
-    q, kv = q.contiguous(), kv.reshape(-1, 512).contiguous()
-    tokens, heads, _ = q.shape
-    indices = indices.reshape(tokens, indices.shape[-1])
-    out = torch.empty_like(q)
-    main = tokens // 2 * 2
-    if main:
-        padded_k = triton.next_power_of_2(indices.shape[-1])
-        padded = torch.full((main, padded_k), -1, device=q.device, dtype=torch.int32)
-        padded[:, : indices.shape[-1]].copy_(indices[:main])
-        union, bits, lengths = _union_dedup(padded, 2)
-        # Two 8-head rows fill one Volta MMA tile. Two 16-head rows use eight
-        # warps; split latent fragments avoid the full-width shared scratch.
-        block_h = 2 * heads
-        _sparse_mla_fused_kernel[(main // 2, 1)](
-            q,
-            q,
-            kv,
-            union,
-            lengths,
-            out,
-            float(sm_scale) * 1.4426950408889634,
-            448.0,
-            topk=2 * padded_k,
-            H=2 * heads,
-            KV_DIM=512,
-            D_V=512,
-            D_TAIL=0,
-            NUM_GROUPS=4,
-            STRIDE_QN_T=q.stride(0),
-            STRIDE_QN_H=q.stride(1),
-            STRIDE_QR_T=q.stride(0),
-            STRIDE_QR_H=q.stride(1),
-            USE_FP8_DOT=False,
-            USE_TOPK_LENGTH=True,
-            BLOCK_H=block_h,
-            BLOCK_K=32,
-            USE_I64_PAGE=True,
-            PIPE_STAGES=1,
-            union_bits_ptr=bits,
-            UNION_GROUP_SIZE=2,
-            BASE_HEADS=heads,
-            num_warps=4 if heads == 8 else 8,
-            num_stages=1,
-        )
-    if main < tokens:
-        out[main:].copy_(
-            triton_sparse_mla_fwd(
-                q[main:], q[main:, :, :0], kv[:, None], indices[main:, None], sm_scale
-            )[0]
-        )
-    return out.unsqueeze(0)
+    indices = indices.reshape(q.shape[0], indices.shape[-1]).contiguous()
+    if topk_length is None:
+        topk_length = q8kv8_topk_length_from_indices(indices)
+    elif not (
+        topk_length.device == q.device
+        and topk_length.dtype == torch.int32
+        and topk_length.numel() == q.shape[0]
+    ):
+        raise ValueError("SM70 sparse prefill lengths must be one CUDA int32 per query")
+    return _prefill_kernel(q.shape[1])(
+        q.contiguous(),
+        kv.reshape(-1, 512).contiguous(),
+        indices,
+        topk_length.reshape(-1).contiguous(),
+        float(sm_scale),
+    ).unsqueeze(0)
