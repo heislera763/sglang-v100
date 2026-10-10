@@ -8,9 +8,9 @@
 #include <sgl_kernel/utils.cuh>
 
 namespace sglang::sm70_qsa_combine {
-__global__ void kernel(const half* __restrict__ partial,
-                       const float* __restrict__ lse,
-                       const int* __restrict__ lengths, half* __restrict__ out,
+__global__ void kernel(const half *__restrict__ partial,
+                       const float *__restrict__ lse,
+                       const int *__restrict__ lengths, half *__restrict__ out,
                        int splits, int selected_tokens, int tokens_per_split) {
   constexpr int NT = 128, D_TILE = 16;
   const int batch = blockIdx.z, head = blockIdx.y;
@@ -18,15 +18,18 @@ __global__ void kernel(const half* __restrict__ partial,
   const int group = threadIdx.x / D_TILE;
   const int context = min(lengths[batch], selected_tokens);
   const int active =
-      min(splits, max(1, (context + tokens_per_split - 1) / tokens_per_split));
+      min(splits, max(0, (context + tokens_per_split - 1) / tokens_per_split));
   using Reduce = cub::BlockReduce<float, NT>;
   __shared__ typename Reduce::TempStorage temp;
   __shared__ float maximum, denominator, weights[160], sums[8][D_TILE];
-  float local_max = -1073741824.f;
+  // Match the partial kernel's empty-selection LSE. A larger sentinel
+  // makes every empty weight underflow to zero and yields 0/0.
+  float local_max = -1.0e30f;
   for (int s = threadIdx.x; s < active; s += NT)
     local_max = fmaxf(local_max, lse[(batch * splits + s) * 6 + head]);
   float mx = Reduce(temp).Reduce(local_max, cub::Max());
-  if (threadIdx.x == 0) maximum = mx;
+  if (threadIdx.x == 0)
+    maximum = mx;
   __syncthreads();
   float local_sum = 0.f;
   for (int s = threadIdx.x; s < active; s += NT) {
@@ -35,7 +38,8 @@ __global__ void kernel(const half* __restrict__ partial,
     local_sum += w;
   }
   float total = Reduce(temp).Sum(local_sum);
-  if (threadIdx.x == 0) denominator = total;
+  if (threadIdx.x == 0)
+    denominator = total;
   __syncthreads();
   float accum = 0.f;
   for (int s = group; s < active; s += 8) {
@@ -49,7 +53,8 @@ __global__ void kernel(const half* __restrict__ partial,
   if (threadIdx.x < D_TILE) {
     float result = 0.f;
 #pragma unroll
-    for (int g = 0; g < 8; ++g) result += sums[g][threadIdx.x];
+    for (int g = 0; g < 8; ++g)
+      result += sums[g][threadIdx.x];
     out[(batch * 6 + head) * 256 + d] = __float2half_rn(result);
   }
 }
@@ -80,10 +85,10 @@ inline void combine(tvm::ffi::TensorView partial, tvm::ffi::TensorView lse,
   RuntimeCheck(selected_tokens > 0 && tokens_per_split > 0,
                "Invalid QSA split sizes");
   LaunchKernel(dim3(16, 6, batch.unwrap()), 128, device.unwrap())(
-      kernel, static_cast<const half*>(partial.data_ptr()),
-      static_cast<const float*>(lse.data_ptr()),
-      static_cast<const int*>(lengths.data_ptr()),
-      static_cast<half*>(out.data_ptr()), int(splits.unwrap()),
+      kernel, static_cast<const half *>(partial.data_ptr()),
+      static_cast<const float *>(lse.data_ptr()),
+      static_cast<const int *>(lengths.data_ptr()),
+      static_cast<half *>(out.data_ptr()), int(splits.unwrap()),
       int(selected_tokens), int(tokens_per_split));
 }
-}  // namespace sglang::sm70_qsa_combine
+} // namespace sglang::sm70_qsa_combine

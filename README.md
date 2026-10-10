@@ -42,7 +42,8 @@ execution scratch and required page/sentinel/speculative overhead:
 | Qwen FP8 weights, FP16 KV | 262,144 | 3.19 GiB | 1.59 GiB |
 | NVIDIA GLM | 1,048,576 | 11.35 GiB | 6.19 GiB |
 
-Qwen MTP adds about0.27GiB on its owning stage. GLM's FP16 latent KV is replicated
+Qwen MTP adds about0.27GiB on its owning stage. Native FP16 PP2/MTP3
+capacity262106input+32output and request reuse pass. GLM's FP16 latent KV is replicated
 across TP ranks. The current GLM PP2/MTP3 session limit is **262,144** with a
 262,656-slot pool (~1.55GiB/GPU including target/draft KV and index storage).
 A 262,106-input/32-output sampled capacity probe and subsequent request reuse passed;
@@ -59,7 +60,7 @@ in software; it does not imply native arithmetic in those formats.
 | --- | --- |
 | NVFP4 GEMMs | [marlin_v100](https://github.com/zhinianqin/marlin_v100) at `6d72a499` plus local patches: W4A16, FP16 WMMA with FP32 accumulation; block/global scales remain distinct. Unused alternate-backend MoE scale buffers alias active scales, saving17.72GiB across GLM's8GPUs. |
 | Block-FP8 GEMMs | Patched Marlin and small-row vector kernels: W8A16, complete 128×128 scale blocks. Qwen EP4/EP8 preserves whole experts. |
-| Qwen QSA/GDN/HC | Masked FP16 sparse attention, SM70 GDN and gated-residual kernels; HC eager prefill partitions within each quad, including TP8. |
+| Qwen QSA/GDN/HC | Direct FP16-cache sparse prefill/decode/verification, masked Tensor Core prefill, SM70 GDN and gated-residual kernels; HC eager prefill partitions within each quad, including TP8. |
 | GLM sparse MLA / indexer | FP16 Triton attention; shared 16-row KV tiles for SM70 latent512/no-tail,1–4query,H8/H16 split attention; software FP8 indexer/scoring, request-owned pool4 compression cache; private FP32 score-buffer reuse and history-dependent query batches bound scoring workspace. Optional two-query sparse sharing preserves support masks. |
 | GLM KDA / mHC | Range-safe KDA; FP32 mHC projection/RMS/Sinkhorn, private prefill buffer reused for square/mean (~128MiB lower peak at2048rows). BF16-to-FP16 conversion needs operation-specific range handling. |
 | Storage | Unquantized FP16 attention KV for both models; Qwen FP16 QSA index, GLM's separate model-native FP8 indexer. KV-cache quantization is excluded from the project recipes. FP16 recurrent state is retained. |
@@ -102,11 +103,11 @@ common=(
 )
 ```
 
-**Qwen FP8, TP4×PP2/EP4, intended ordinary recipe — currently blocked**:
+**Qwen FP8, TP4×PP2/EP4, ordinary** (`http://<host>:9000/v1`, key `test-only`):
 
-Strict dispatch rejects FP16 QSA KV during decode/verification. Native FP16-cache
-support must be implemented before this recipe runs; historical E5M2 paths are
-excluded from active recipes. The upstream sync leaves this existing gap unchanged.
+Native QSA prefill/decode/verification read FP16 KV directly. For this pinned
+checkpoint, `--dtype float16 --kv-cache-dtype auto` allocates FP16 KV; the
+indexer and recurrent state also use FP16. Strict dispatch remains enabled.
 
 ```bash
 export SGLANG_PP_LAYER_PARTITION=24,24 SGLANG_OPT_SM70_HC_PREFILL_SP=1
@@ -159,7 +160,7 @@ classical sampled rejection. Lab sampling sources: [Qwen](https://huggingface.co
 | NCCL PHB/NVLS0, OMP4 | Retained host policy; removing PHB did not help the fresh Qwen screen. NVLS is unavailable on SM70. No universal-optimum claim. |
 | Max1/serialized/radix off | Qualified graph/scratch/state ownership and uncached timing. Overlap/concurrency is separate work. |
 | Eager prefill/full decode graphs | Qualified native paths; earlier Qwen prefill-graph screens lost. Chunk4352/2048 are measured per-model choices. |
-| Context and pool capacity | Qwen targets native262144 plus128page/workspace slots. Earlier boundary qualification used E5M2; unquantized native-capacity requalification is pending. Explicit uncached max1 reservations fail instead of shrinking. |
+| Context and pool capacity | Qwen targets native262144 plus128page/workspace slots. FP16 PP2/MTP3 allocation,262106-input/32-output generation and request reuse pass. Explicit uncached max1 reservations fail instead of shrinking. |
 | Static fraction/state pool | Qwen uses the automatic fraction estimate. GLMTP8.92 is the short reference; GLMPP2MTP.95 qualifies the262K session. The fraction is a profiled allowance, not a physical VRAM allocation or speed setting. With radix off/max1, state slots derive from the request count; a state-memory ratio is redundant. Host PLE saves device memory. |
 | GLM mHC flags0 | Select supported mHC paths; fused DSA top-k retains its default1. |
 | CPU-only tests | `CUDA_VISIBLE_DEVICES=""`; numeric/disabled/UUID port allocation is supported. No999 workaround. |
@@ -190,11 +191,12 @@ These are implementation gaps, not unused free speed flags.
 
 Three uncached coherent near8K requests/profile,512 sampled output tokens, one request,
 eager prefill/full decode graphs. GLM PP2 MTP uses two fresh processes, images enabled
-and262K context; other rows are earlier one-process screens. Seed531 does not guarantee
+and262K context. Qwen MTP rows use fresh FP16-KV native-context screens;
+GLM TP8/ordinary rows remain earlier one-process screens. Seed531 does not guarantee
 sampled determinism. PP = input tokens/native prefill seconds; TG = output tokens
 excluding the first/native decode seconds. Warmups and profiling are excluded.
-These are preliminary throughput measurements. Qwen figures used
-E5M2 KV and are historical; the unquantized recipe needs fresh measurements. Earlier rows:
+These are preliminary throughput measurements. Qwen rows now use FP16 KV;
+the earlier E5M2 results are historical controls. Earlier GLM rows:
 [ce60d8c9](https://github.com/heislera763/sglang-v100-plus/commit/ce60d8c91c7a0b1c92b1c35059f0bfb7e492d8da)
 compatible post-sync paths; NVIDIA PP2 MTP additionally uses the allocator fix
 [a85513f5](https://github.com/heislera763/sglang-v100-plus/commit/a85513f5) and exact mHC buffer reuse
@@ -205,8 +207,8 @@ its numerics and CUDA-graph coverage are in the [operator tests](test/registered
 
 | Model / layout | MTP steps | Prefill tokens/s | Generation tokens/s |
 | --- | ---: | ---: | ---: |
-| Qwen FP8 TP8/EP8 | 3 | 4,796 | 82.2 |
-| Qwen FP8 TP4×PP2/EP4 | 3 | 7,632 | 71.1 |
+| Qwen FP8 TP8/EP8 | 3 | 4,831 | 79.4 |
+| Qwen FP8 TP4×PP2/EP4 | 3 | 7,588 | 72.5 |
 | NVIDIA GLM TP8/EP1 | 3 | 1,366 | 42.7 |
 | NVIDIA GLM TP4×PP2/EP1 | Off | 1,882 | 28.2 |
 | NVIDIA GLM TP4×PP2/EP1 | 3 | 1,714 | 42.5 |
@@ -215,9 +217,9 @@ MTP3 categories (PP/TG tokens/s; GLM PP2 averages two processes, others one):
 
 | Model / category | TP8 PP | TP8 TG | PP2 PP | PP2 TG |
 | --- | ---: | ---: | ---: | ---: |
-| Qwen coding | 4,798 | 86.4 | 7,717 | 78.0 |
-| Qwen book continuation | 4,800 | 75.7 | 7,619 | 69.6 |
-| Qwen document briefing | 4,789 | 85.5 | 7,561 | 66.6 |
+| Qwen coding | 4,882 | 82.3 | 7,668 | 82.2 |
+| Qwen book continuation | 4,831 | 82.6 | 7,607 | 66.3 |
+| Qwen document briefing | 4,779 | 73.3 | 7,489 | 69.0 |
 | NVIDIA GLM coding | 1,370 | 48.6 | 1,711 | 46.7 |
 | NVIDIA GLM book continuation | 1,367 | 37.6 | 1,713 | 38.2 |
 | NVIDIA GLM document briefing | 1,360 | 43.2 | 1,717 | 42.6 |
@@ -231,7 +233,9 @@ GLM7898/8116/8141, T1/P.95/K−1/max. Native metadata via
 Earlier six-request Qwen ordinary/MTP matrices at
 [38f5a0f0](https://github.com/heislera763/sglang-v100-plus/commit/38f5a0f0806883ec88da23ca3c91a46bec7ce12b)
 measured TP8 5002/4850PP and50.8/80.2TG; PP2 8078/7619PP and61.9/72.3TG.
-Those are pre-sync results, separate from this screen.
+Those used E5M2 KV and precede this FP16-cache screen. Current Qwen screens
+use HC on, PP2 metadata on, TP8 metadata off, sampling graph/tuner off;
+[FP16 QSA numerical/graph tests](test/registered/kernels/ops/attention/qsa/test_sm70_fp16_kv.py) cover the cache port.
 
 Matched independent-process A/B/B/A against [f0245fb0](https://github.com/heislera763/sglang-v100-plus/commit/f0245fb0)
 raises GLM PP2 MTP generation 32.2→42.5tokens/s on average: coding+30%,book+30%,

@@ -197,7 +197,7 @@ def qsa_masked_prefill(q, k_cache, v_cache, table, requests, indices, seq_len, s
         or k_cache.ndim != 3
         or k_cache.shape[1:] != (1, 256)
         or v_cache.shape != k_cache.shape
-        or k_cache.dtype != torch.float8_e5m2
+        or k_cache.dtype not in (torch.float16, torch.float8_e5m2)
         or v_cache.dtype != k_cache.dtype
         or requests.numel() != 1
         or indices.ndim != 2

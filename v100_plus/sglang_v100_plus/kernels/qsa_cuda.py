@@ -55,6 +55,15 @@ def _load_sm70_cuda_decode_ops():
     return _EXT
 
 
+def _cache_storage(cache):
+    """Retain FP16 elements; reinterpret only the legacy E5M2 byte storage."""
+    if cache.dtype == torch.float16:
+        return cache.contiguous()
+    if cache.dtype == torch.float8_e5m2:
+        return cache.view(torch.uint8).contiguous()
+    raise ValueError("SM70 QSA cache storage must be FP16 or E5M2")
+
+
 def sm70_cuda_qsa_prefill(
     q,
     k_cache,
@@ -65,15 +74,15 @@ def sm70_cuda_qsa_prefill(
     seq_lens,
     softmax_scale,
 ):
-    """Run exact-shape QSA chunk-prefill directly from the E5M2 cache."""
+    """Run exact-shape QSA chunk-prefill directly from FP16 or legacy E5M2 cache."""
     ext = _load_sm70_cuda_decode_ops()
     if ext is None:
         raise RuntimeError("SM70 CUDA QSA prefill extension is unavailable.")
     output = torch.empty_like(q)
     ext.sm70_qsa_prefill(
         q.contiguous(),
-        k_cache.view(torch.uint8).contiguous(),
-        v_cache.view(torch.uint8).contiguous(),
+        _cache_storage(k_cache),
+        _cache_storage(v_cache),
         req_to_token.to(dtype=torch.int32).contiguous(),
         req_indices.to(dtype=torch.int32).contiguous(),
         indices.to(dtype=torch.int32).contiguous(),
@@ -94,7 +103,7 @@ def sm70_cuda_qsa_decode(
     seq_lens,
     softmax_scale,
 ):
-    """Run QSA split-KV decode directly from selected E5M2 cache rows."""
+    """Run QSA split-KV decode directly from selected FP16 or legacy E5M2 cache rows."""
     ext = _load_sm70_cuda_decode_ops()
     if ext is None:
         raise RuntimeError("SM70 CUDA QSA decode extension is unavailable.")
@@ -110,8 +119,8 @@ def sm70_cuda_qsa_decode(
     indices = indices.to(dtype=torch.int32).contiguous()
     ext.sm70_qsa_decode(
         q.contiguous(),
-        k_cache.view(torch.uint8).contiguous(),
-        v_cache.view(torch.uint8).contiguous(),
+        _cache_storage(k_cache),
+        _cache_storage(v_cache),
         req_to_token.to(dtype=torch.int32).contiguous(),
         req_indices.to(dtype=torch.int32).contiguous(),
         indices,

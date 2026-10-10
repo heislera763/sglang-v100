@@ -66,7 +66,7 @@ def _decode_combine_kernel(
             active_splits = T.min(
                 max_splits,
                 T.max(
-                    1,
+                    0,
                     T.ceildiv(context, min_tokens_per_split),
                 ),
             )
@@ -74,9 +74,9 @@ def _decode_combine_kernel(
                 lse[split] = T.if_then_else(
                     split < active_splits,
                     PartialLSE[batch_id, split, head],
-                    -(2**30),
+                    -1.0e30,
                 )
-            T.fill(max_lse, -(2**30))
+            T.fill(max_lse, -1.0e30)
             for split in T.serial(max_splits):
                 max_lse[0] = T.max(max_lse[0], lse[split])
             T.fill(sum_lse, 0)
@@ -97,6 +97,7 @@ def _decode_combine_kernel(
 
     return main
 
+
 """Exact dense-prefix D256 prefill kernel for SM70.
 
 Long paged prefixes are gathered into logical order before this kernel is
@@ -104,7 +105,6 @@ called.  The attention body keeps the existing TileLang N32 reduction order
 while removing page-table lookup, integer divide, and scattered-page address
 resolution from every K/V element load.
 """
-
 
 
 _LOG2_E = 1.4426950408889634

@@ -67,7 +67,7 @@ class QwenSparseAttnBackend(BaseQSA):
             and topk_indices.ndim == 2
             and topk_indices.shape[0] == q.shape[0]
             and topk_indices.shape[1] > 0
-            and k_buffer.dtype == torch.float8_e5m2
+            and k_buffer.dtype in (torch.float16, torch.float8_e5m2)
             and v_buffer.dtype == k_buffer.dtype
             and k_buffer.ndim == 3
             and v_buffer.shape == k_buffer.shape
@@ -101,7 +101,7 @@ class QwenSparseAttnBackend(BaseQSA):
             and topk_indices.ndim == 2
             and topk_indices.shape[0] == q.shape[0]
             and topk_indices.shape[1] > 0
-            and k_buffer.dtype == torch.float8_e5m2
+            and k_buffer.dtype in (torch.float16, torch.float8_e5m2)
             and v_buffer.dtype == k_buffer.dtype
             and k_buffer.ndim == 3
             and v_buffer.shape == k_buffer.shape
@@ -207,7 +207,7 @@ class QwenSparseAttnBackend(BaseQSA):
             reject_fallback(
                 "qsa.prefill",
                 "neither native dense no-prefix prefill nor single-request "
-                "SM70 FP16 QSA prefill with E5M2 cache is supported",
+                "SM70 FP16 QSA prefill with FP16/E5M2 cache is supported",
                 query=q3,
                 key_cache=kb,
                 value_cache=vb,
@@ -244,7 +244,7 @@ class QwenSparseAttnBackend(BaseQSA):
         reject_fallback(
             "qsa.paged_attention",
             "native decode/verify requires SM70 FP16 [rows, 3|6, 256], "
-            "matching row metadata/indices and E5M2 [pages, 1, 256] cache",
+            "matching row metadata/indices and FP16/E5M2 [pages, 1, 256] cache",
             query=q,
             key_cache=kb,
             value_cache=vb,
